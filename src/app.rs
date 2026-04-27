@@ -985,16 +985,16 @@ impl eframe::App for CampusNetApp {
                 ui.add_space(8.0);
                 self.render_user_list(ui);
                 ui.add_space(8.0);
-                self.render_settings(ui);
-                ui.add_space(8.0);
-                self.render_log(ui);
-                ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     ui.hyperlink_to(
                         "github.com/uchihazzj/campus_net",
                         "https://github.com/uchihazzj/campus_net",
                     );
                 });
+                ui.add_space(8.0);
+                self.render_settings(ui);
+                ui.add_space(8.0);
+                self.render_log(ui);
                 ui.add_space(4.0);
             });
         });
