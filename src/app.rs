@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use egui::{Color32, RichText, ScrollArea};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::core::srun::SrunClient;
@@ -65,14 +65,15 @@ pub fn create_window_icon() -> egui::IconData {
     }
 }
 
+enum TrayCommand {
+    ShowWindow,
+    Quit,
+}
+
 pub struct CampusNetApp {
     state: SharedState,
     _tray_icon: TrayIcon,
-    _show_id: MenuId,
-    _login_all_id: MenuId,
-    _logout_all_id: MenuId,
-    _quit_id: MenuId,
-    tray_rx: &'static Receiver<MenuEvent>,
+    tray_cmd_rx: Receiver<TrayCommand>,
     quit_requested: bool,
     // UI edit state
     editing_user_idx: Option<usize>,
@@ -109,13 +110,81 @@ impl CampusNetApp {
         let logout_all_id = logout_all_item.id().clone();
         let quit_id = quit_item.id().clone();
 
+        tracing::info!(
+            "Tray menu IDs — show={:?}, login_all={:?}, logout_all={:?}, quit={:?}",
+            show_id, login_all_id, logout_all_id, quit_id
+        );
+
         let menu = Menu::new();
         menu.append(&show_item);
         menu.append(&login_all_item);
         menu.append(&logout_all_item);
         menu.append(&quit_item);
 
-        let tray_rx = MenuEvent::receiver();
+        // ── Dedicated tray event listener thread ──────────
+        // Uses blocking recv() instead of try_recv() polling to ensure
+        // events are never missed due to frame timing. LoginAll/LogoutAll
+        // are handled directly from this thread; ShowWindow/Quit are
+        // deferred to the main loop via a TrayCommand channel.
+        let tokio_handle = tokio::runtime::Handle::current();
+        let state_for_listener = state.clone();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<TrayCommand>();
+
+        std::thread::spawn(move || {
+            let event_rx = MenuEvent::receiver();
+            tracing::info!("[TrayListener] Thread started, blocking on MenuEvent::receiver()...");
+
+            loop {
+                match event_rx.recv() {
+                    Ok(event) => {
+                        let id = event.id;
+                        tracing::info!("[TrayListener] Received event id={:?}", id);
+
+                        if id == show_id {
+                            tracing::info!("[TrayListener] → ShowWindow");
+                            {
+                                let mut s = state_for_listener.lock().unwrap();
+                                s.add_log("[INFO] Tray menu: show window".to_string());
+                            }
+                            let _ = cmd_tx.send(TrayCommand::ShowWindow);
+                        } else if id == login_all_id {
+                            tracing::info!("[TrayListener] → LoginAll");
+                            {
+                                let mut s = state_for_listener.lock().unwrap();
+                                s.add_log("[INFO] Tray menu: login all — starting...".to_string());
+                            }
+                            let st = state_for_listener.clone();
+                            tokio_handle.spawn(async move {
+                                auth::do_login_all(st).await;
+                            });
+                        } else if id == logout_all_id {
+                            tracing::info!("[TrayListener] → LogoutAll");
+                            {
+                                let mut s = state_for_listener.lock().unwrap();
+                                s.add_log("[INFO] Tray menu: logout all — starting...".to_string());
+                            }
+                            let st = state_for_listener.clone();
+                            tokio_handle.spawn(async move {
+                                auth::do_logout_all(st).await;
+                            });
+                        } else if id == quit_id {
+                            tracing::info!("[TrayListener] → Quit");
+                            {
+                                let mut s = state_for_listener.lock().unwrap();
+                                s.add_log("[INFO] Tray menu: quit".to_string());
+                            }
+                            let _ = cmd_tx.send(TrayCommand::Quit);
+                        } else {
+                            tracing::warn!("[TrayListener] Unknown event id={:?}", id);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvError) => {
+                        tracing::info!("[TrayListener] Menu event channel disconnected, exiting");
+                        break;
+                    }
+                }
+            }
+        });
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -123,6 +192,8 @@ impl CampusNetApp {
             .with_tooltip(t.tray_tooltip)
             .build()
             .expect("Failed to create tray icon");
+
+        tracing::info!("Tray icon created successfully");
 
         {
             let s = state.lock().unwrap();
@@ -134,11 +205,7 @@ impl CampusNetApp {
         Self {
             state,
             _tray_icon: tray_icon,
-            _show_id: show_id,
-            _login_all_id: login_all_id,
-            _logout_all_id: logout_all_id,
-            _quit_id: quit_id,
-            tray_rx,
+            tray_cmd_rx: cmd_rx,
             quit_requested: false,
             editing_user_idx: None,
             edit_username: String::new(),
@@ -164,44 +231,19 @@ impl CampusNetApp {
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.tray_rx.try_recv() {
-            let id = event.id;
-            tracing::info!("Tray menu event received: id={:?}", id);
-            if id == self._show_id {
-                tracing::info!("[INFO] Tray menu: show window");
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("[INFO] Tray menu: show window".to_string());
+        while let Ok(cmd) = self.tray_cmd_rx.try_recv() {
+            match cmd {
+                TrayCommand::ShowWindow => {
+                    tracing::info!("[MainLoop] Processing ShowWindow command");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if id == self._login_all_id {
-                tracing::info!("[INFO] Tray menu: login all");
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("[INFO] Tray menu: login all".to_string());
+                TrayCommand::Quit => {
+                    tracing::info!("[MainLoop] Processing Quit command");
+                    self.quit_requested = true;
+                    ctx.request_repaint();
                 }
-                let state = self.state.clone();
-                tokio::spawn(async move { auth::do_login_all(state).await });
-            } else if id == self._logout_all_id {
-                tracing::info!("[INFO] Tray menu: logout all");
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("[INFO] Tray menu: logout all".to_string());
-                }
-                let state = self.state.clone();
-                tokio::spawn(async move { auth::do_logout_all(state).await });
-            } else if id == self._quit_id {
-                tracing::info!("[INFO] Tray menu: quit");
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("[INFO] Tray menu: quit".to_string());
-                }
-                self.quit_requested = true;
-                ctx.request_repaint();
-            } else {
-                tracing::warn!("[WARN] Tray menu: unknown event id={:?}", id);
             }
         }
     }
@@ -793,6 +835,7 @@ impl eframe::App for CampusNetApp {
         self.handle_tray_events(ctx);
 
         if self.quit_requested {
+            tracing::info!("[MainLoop] quit_requested=true, sending Close");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -813,12 +856,15 @@ impl eframe::App for CampusNetApp {
                 s.config.minimize_to_tray
             };
             if minimize {
+                tracing::info!("[MainLoop] Close requested → hiding to tray (Visible(false))");
                 {
                     let mut s = self.state.lock().unwrap();
                     s.add_log("[INFO] Minimizing to tray (hiding window)".to_string());
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                tracing::info!("[MainLoop] Close requested → real quit (minimize_to_tray=false)");
             }
         }
 
