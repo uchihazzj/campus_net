@@ -6,10 +6,61 @@ mod platform;
 mod service;
 mod ui;
 
+use std::fs::OpenOptions;
+use std::io;
 use std::sync::{Arc, Mutex};
+
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use service::config::read_config;
 use service::SharedState;
+
+/// Owned writer that holds an Arc<Mutex<File>>. Each call to write()
+/// acquires the lock, writes, and releases.
+struct FileWriterGuard {
+    inner: Arc<Mutex<std::fs::File>>,
+}
+
+impl io::Write for FileWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+/// Thread-safe MakeWriter for tracing layers. Clones the inner Arc on
+/// each make_writer() call, returning an owned FileWriterGuard.
+#[derive(Clone)]
+struct FileWriter {
+    inner: Arc<Mutex<std::fs::File>>,
+}
+
+impl FileWriter {
+    fn new(path: &str) -> Self {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("Failed to open app.log");
+        Self {
+            inner: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for FileWriter {
+    type Writer = FileWriterGuard;
+
+    fn make_writer(&self) -> Self::Writer {
+        FileWriterGuard {
+            inner: self.inner.clone(),
+        }
+    }
+}
 
 fn load_cjk_font() -> Option<egui::FontData> {
     let font_paths = [
@@ -30,12 +81,24 @@ fn load_cjk_font() -> Option<egui::FontData> {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let log_file = FileWriter::new("app.log");
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(io::stderr);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(log_file);
+
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "campus_net_client=info".into()),
         )
-        .with_target(false)
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
 
     tracing::info!("Starting Campus Net Client...");
@@ -82,7 +145,6 @@ fn main() -> anyhow::Result<()> {
         "Campus Net Client",
         native_options,
         Box::new(move |cc| {
-            // Load CJK font for Chinese text support
             if let Some(font_data) = load_cjk_font() {
                 let mut fonts = egui::FontDefinitions::default();
                 fonts

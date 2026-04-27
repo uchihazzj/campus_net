@@ -1,9 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
 use egui::{Color32, RichText, ScrollArea};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::core::srun::SrunClient;
 use crate::core::utils::get_network_interfaces;
@@ -14,6 +15,73 @@ use crate::service::config::{write_config, StoredUser};
 
 use crate::service::{Ipv4InternetStatus, LoginState, SharedState};
 use crate::ui::l10n::{self, Lang, UiText};
+
+// ── Windows native window handle ───────────────────────
+static MAIN_HWND: OnceLock<isize> = OnceLock::new();
+static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+
+fn capture_main_hwnd() {
+    if MAIN_HWND.get().is_some() {
+        return;
+    }
+    // Find the main window by title. winit/eframe uses this title.
+    let title: Vec<u16> = "Campus Net Client\0".encode_utf16().collect();
+    let hwnd = unsafe { FindWindowW(std::ptr::null_mut(), title.as_ptr()) };
+    if hwnd != 0 {
+        let _ = MAIN_HWND.set(hwnd);
+        tracing::info!("[Native] Captured main window HWND={}", hwnd);
+    }
+}
+
+fn native_show_window() {
+    if let Some(&hwnd) = MAIN_HWND.get() {
+        tracing::info!("[Native] ShowWindow: hwnd={}", hwnd);
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    } else {
+        tracing::warn!("[Native] ShowWindow failed: no HWND captured yet");
+    }
+}
+
+fn native_force_quit(state: &SharedState) {
+    tracing::info!("[Native] Force quit from tray");
+    // Save config before exiting
+    if let Ok(mut s) = state.lock() {
+        let _ = write_config("config.json", &s.config);
+        s.add_log("[INFO] Quit from tray menu".to_string());
+        tracing::info!("[Native] Config saved, initiating quit");
+    }
+    FORCE_QUIT.store(true, Ordering::SeqCst);
+    if let Some(&hwnd) = MAIN_HWND.get() {
+        tracing::info!("[Native] Posting WM_CLOSE to hwnd={}", hwnd);
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+    }
+    // Fallback: if event loop doesn't respond, force exit after 2s
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(2));
+        tracing::info!("[Native] Fallback: calling process::exit(0)");
+        std::process::exit(0);
+    });
+}
+
+// ── Windows FFI (no extra dependencies) ────────────────
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+const SW_SHOW: i32 = 5;
+#[cfg(target_os = "windows")]
+const SW_RESTORE: i32 = 9;
+#[cfg(target_os = "windows")]
+const WM_CLOSE: u32 = 0x0010;
 
 fn create_tray_icon_rgba() -> Icon {
     let size = 32u32;
@@ -65,15 +133,9 @@ pub fn create_window_icon() -> egui::IconData {
     }
 }
 
-enum TrayCommand {
-    ShowWindow,
-    Quit,
-}
-
 pub struct CampusNetApp {
     state: SharedState,
     _tray_icon: TrayIcon,
-    tray_cmd_rx: Receiver<TrayCommand>,
     quit_requested: bool,
     // UI edit state
     editing_user_idx: Option<usize>,
@@ -86,7 +148,6 @@ pub struct CampusNetApp {
     edit_original_if_name: String,
     show_add_dialog: bool,
     log_scroll_to_bottom: bool,
-    // Reusable text cache
     cached_lang: Lang,
 }
 
@@ -121,66 +182,107 @@ impl CampusNetApp {
         menu.append(&logout_all_item);
         menu.append(&quit_item);
 
-        // ── Dedicated tray event listener thread ──────────
-        // Uses blocking recv() instead of try_recv() polling to ensure
-        // events are never missed due to frame timing. LoginAll/LogoutAll
-        // are handled directly from this thread; ShowWindow/Quit are
-        // deferred to the main loop via a TrayCommand channel.
+        // ── Tray event listener thread ──────────────────
+        // Uses blocking select! on both MenuEvent and TrayIconEvent channels.
+        // ALL actions handled directly with native Windows API or tokio spawn —
+        // no dependency on eframe update() loop for tray operations.
         let tokio_handle = tokio::runtime::Handle::current();
         let state_for_listener = state.clone();
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<TrayCommand>();
 
         std::thread::spawn(move || {
-            let event_rx = MenuEvent::receiver();
-            tracing::info!("[TrayListener] Thread started, blocking on MenuEvent::receiver()...");
+            let menu_rx = MenuEvent::receiver();
+            let tray_rx = TrayIconEvent::receiver();
+            tracing::info!("[TrayListener] Thread started, listening for MenuEvent + TrayIconEvent...");
 
             loop {
-                match event_rx.recv() {
-                    Ok(event) => {
-                        let id = event.id;
-                        tracing::info!("[TrayListener] Received event id={:?}", id);
+                crossbeam_channel::select! {
+                    recv(menu_rx) -> result => {
+                        match result {
+                            Ok(event) => {
+                                let id = event.id;
+                                tracing::info!("[TrayListener] MenuEvent id={:?}", id);
 
-                        if id == show_id {
-                            tracing::info!("[TrayListener] → ShowWindow");
-                            {
-                                let mut s = state_for_listener.lock().unwrap();
-                                s.add_log("[INFO] Tray menu: show window".to_string());
+                                if id == show_id {
+                                    tracing::info!("[TrayListener] → ShowWindow");
+                                    {
+                                        let mut s = state_for_listener.lock().unwrap();
+                                        s.add_log("[INFO] Tray menu: show window".to_string());
+                                    }
+                                    native_show_window();
+                                } else if id == login_all_id {
+                                    tracing::info!("[TrayListener] → LoginAll");
+                                    {
+                                        let mut s = state_for_listener.lock().unwrap();
+                                        s.add_log("[INFO] Tray menu: login all — starting...".to_string());
+                                    }
+                                    let st = state_for_listener.clone();
+                                    tokio_handle.spawn(async move {
+                                        tracing::info!("[TrayListener] do_login_all task started");
+                                        auth::do_login_all(st).await;
+                                        tracing::info!("[TrayListener] do_login_all task completed");
+                                    });
+                                } else if id == logout_all_id {
+                                    tracing::info!("[TrayListener] → LogoutAll");
+                                    {
+                                        let mut s = state_for_listener.lock().unwrap();
+                                        s.add_log("[INFO] Tray menu: logout all — starting...".to_string());
+                                    }
+                                    let st = state_for_listener.clone();
+                                    tokio_handle.spawn(async move {
+                                        tracing::info!("[TrayListener] do_logout_all task started");
+                                        auth::do_logout_all(st.clone()).await;
+                                        tracing::info!("[TrayListener] do_logout_all task completed");
+                                    });
+                                } else if id == quit_id {
+                                    tracing::info!("[TrayListener] → Quit");
+                                    native_force_quit(&state_for_listener);
+                                } else {
+                                    tracing::warn!("[TrayListener] Unknown MenuEvent id={:?}", id);
+                                }
                             }
-                            let _ = cmd_tx.send(TrayCommand::ShowWindow);
-                        } else if id == login_all_id {
-                            tracing::info!("[TrayListener] → LoginAll");
-                            {
-                                let mut s = state_for_listener.lock().unwrap();
-                                s.add_log("[INFO] Tray menu: login all — starting...".to_string());
+                            Err(crossbeam_channel::RecvError) => {
+                                tracing::info!("[TrayListener] MenuEvent channel disconnected");
+                                break;
                             }
-                            let st = state_for_listener.clone();
-                            tokio_handle.spawn(async move {
-                                auth::do_login_all(st).await;
-                            });
-                        } else if id == logout_all_id {
-                            tracing::info!("[TrayListener] → LogoutAll");
-                            {
-                                let mut s = state_for_listener.lock().unwrap();
-                                s.add_log("[INFO] Tray menu: logout all — starting...".to_string());
-                            }
-                            let st = state_for_listener.clone();
-                            tokio_handle.spawn(async move {
-                                auth::do_logout_all(st).await;
-                            });
-                        } else if id == quit_id {
-                            tracing::info!("[TrayListener] → Quit");
-                            {
-                                let mut s = state_for_listener.lock().unwrap();
-                                s.add_log("[INFO] Tray menu: quit".to_string());
-                            }
-                            let _ = cmd_tx.send(TrayCommand::Quit);
-                        } else {
-                            tracing::warn!("[TrayListener] Unknown event id={:?}", id);
                         }
                     }
-                    Err(crossbeam_channel::RecvError) => {
-                        tracing::info!("[TrayListener] Menu event channel disconnected, exiting");
-                        break;
+                    recv(tray_rx) -> result => {
+                        match result {
+                            Ok(event) => {
+                                tracing::info!("[TrayListener] TrayIconEvent: {:?}", event);
+                                match &event {
+                                    TrayIconEvent::Click { button, button_state, .. } => {
+                                        if matches!(button, tray_icon::MouseButton::Left)
+                                           && matches!(button_state, tray_icon::MouseButtonState::Up)
+                                        {
+                                            tracing::info!("[TrayListener] Left-click → show window");
+                                            {
+                                                let mut s = state_for_listener.lock().unwrap();
+                                                s.add_log("[INFO] Tray left-click: show window".to_string());
+                                            }
+                                            native_show_window();
+                                        }
+                                    }
+                                    TrayIconEvent::DoubleClick { button, .. } => {
+                                        if matches!(button, tray_icon::MouseButton::Left) {
+                                            tracing::info!("[TrayListener] Left double-click → show window");
+                                            {
+                                                let mut s = state_for_listener.lock().unwrap();
+                                                s.add_log("[INFO] Tray double-click: show window".to_string());
+                                            }
+                                            native_show_window();
+                                        }
+                                    }
+                                    _ => {
+                                        // Enter/Move/Leave — no action needed
+                                    }
+                                }
+                            }
+                            Err(crossbeam_channel::RecvError) => {
+                                tracing::info!("[TrayListener] TrayIconEvent channel disconnected");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -205,7 +307,6 @@ impl CampusNetApp {
         Self {
             state,
             _tray_icon: tray_icon,
-            tray_cmd_rx: cmd_rx,
             quit_requested: false,
             editing_user_idx: None,
             edit_username: String::new(),
@@ -230,24 +331,6 @@ impl CampusNetApp {
         l10n::get_text(lang)
     }
 
-    fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(cmd) = self.tray_cmd_rx.try_recv() {
-            match cmd {
-                TrayCommand::ShowWindow => {
-                    tracing::info!("[MainLoop] Processing ShowWindow command");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayCommand::Quit => {
-                    tracing::info!("[MainLoop] Processing Quit command");
-                    self.quit_requested = true;
-                    ctx.request_repaint();
-                }
-            }
-        }
-    }
-
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
@@ -261,12 +344,10 @@ impl CampusNetApp {
                     )
                 };
 
-                // Campus IPv4
                 let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
                 let ip_color = if campus_ip.is_some() { Color32::GREEN } else { Color32::GRAY };
                 ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
 
-                // IPv4 Internet
                 let (inet_color, inet_text) = match ipv4_internet {
                     Ipv4InternetStatus::Reachable => (Color32::GREEN, t.ipv4_internet_reachable),
                     Ipv4InternetStatus::CaptivePortal => (Color32::YELLOW, t.ipv4_internet_captive),
@@ -340,7 +421,6 @@ impl CampusNetApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Delete button
                     if ui
                         .button(t.btn_delete)
                         .on_hover_text(t.hint_delete)
@@ -356,7 +436,6 @@ impl CampusNetApp {
                         return;
                     }
 
-                    // Edit button
                     if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
                         let s = self.state.lock().unwrap();
                         if user_idx < s.config.users.len() {
@@ -468,7 +547,6 @@ impl CampusNetApp {
                 self.edit_original_username.clear();
                 self.edit_original_ip.clear();
                 self.edit_original_if_name.clear();
-                // Auto-fill with 10.* IP if available, otherwise first private IP
                 let ifaces = get_network_interfaces();
                 let preferred = ifaces
                     .iter()
@@ -554,13 +632,9 @@ impl CampusNetApp {
 
                 ui.add_space(8.0);
 
-                // Determine if Save should be enabled
                 let can_save = if is_new_user {
-                    // New user: must have username and password
                     !self.edit_username.is_empty() && !self.edit_password.is_empty()
                 } else {
-                    // Editing existing: username required; password optional
-                    // At least one field must have changed
                     !self.edit_username.is_empty()
                         && (self.edit_username != self.edit_original_username
                             || !self.edit_password.is_empty()
@@ -577,7 +651,6 @@ impl CampusNetApp {
                     let save_btn = egui::Button::new(t.btn_save);
                     if ui.add_enabled(can_save, save_btn).clicked() {
                         let encrypted = if self.edit_password.is_empty() {
-                            // Keep existing password when editing and password not changed
                             if let Some(idx) = self.editing_user_idx {
                                 let s = self.state.lock().unwrap();
                                 s.config.users[idx].encrypted_password.clone()
@@ -671,7 +744,6 @@ impl CampusNetApp {
 
             let mut changed = false;
 
-            // Language selector
             ui.horizontal(|ui| {
                 ui.label(t.label_language);
                 if ui
@@ -832,16 +904,17 @@ impl CampusNetApp {
 
 impl eframe::App for CampusNetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_tray_events(ctx);
+        // Capture HWND on first frame
+        capture_main_hwnd();
 
-        if self.quit_requested {
-            tracing::info!("[MainLoop] quit_requested=true, sending Close");
+        if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
+            tracing::info!("[MainLoop] quit_requested={}, FORCE_QUIT={} — sending Close",
+                self.quit_requested, FORCE_QUIT.load(Ordering::SeqCst));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Save current window size before closing
             if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
                 let size = rect.size();
                 let mut s = self.state.lock().unwrap();
