@@ -171,9 +171,35 @@ pub fn spawn_monitor(state: SharedState) {
                             all_indices.len()
                         ));
                     }
+                    let mut any_success = false;
                     for idx in &all_indices {
                         do_login(state.clone(), *idx).await;
+                        let success = {
+                            let s = state.lock().unwrap();
+                            s.user_statuses
+                                .get(*idx)
+                                .map(|us| us.state == LoginState::Online)
+                                .unwrap_or(false)
+                        };
+                        if success {
+                            any_success = true;
+                            break;
+                        }
                     }
+                    if any_success {
+                        let mut s = state.lock().unwrap();
+                        s.reconnect_targets.clear();
+                        s.add_log("[OK] Auto-reconnect succeeded".to_string());
+                        backoff_secs = interval;
+                    } else {
+                        let mut s = state.lock().unwrap();
+                        s.add_log(format!(
+                            "[WARN] Auto-reconnect failed, will retry in {}s",
+                            (backoff_secs * 2).min(MAX_BACKOFF_SECS)
+                        ));
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    }
+                    continue;
                 }
                 backoff_secs = interval;
                 continue;
@@ -226,19 +252,22 @@ pub fn spawn_monitor(state: SharedState) {
                     let mut s = state.lock().unwrap();
                     s.add_log(log_msg);
                 }
+                let mut any_success = false;
                 for idx in &targets {
                     do_login(state.clone(), *idx).await;
-                }
-                let success = {
-                    let s = state.lock().unwrap();
-                    targets.iter().any(|&i| {
+                    let success = {
+                        let s = state.lock().unwrap();
                         s.user_statuses
-                            .get(i)
+                            .get(*idx)
                             .map(|us| us.state == LoginState::Online)
                             .unwrap_or(false)
-                    })
-                };
-                if success {
+                    };
+                    if success {
+                        any_success = true;
+                        break;
+                    }
+                }
+                if any_success {
                     let mut s = state.lock().unwrap();
                     s.reconnect_targets.clear();
                     s.add_log("[OK] Auto-reconnect succeeded".to_string());

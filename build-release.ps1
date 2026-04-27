@@ -54,11 +54,10 @@ $cargoArgs = @("build", "--release")
 if ($Check) {
     $cargoArgs = @("check", "--release")
 }
-
-$cmd = "cmd /c `"`"$vcvars`" && cd /d `"$PSScriptRoot`" && cargo $cargoArgs`""
+$cargoArgsStr = $cargoArgs -join " "
 
 Write-Host "Building..." -ForegroundColor Cyan
-Invoke-Expression $cmd
+cmd /c "`"$vcvars`" && cd /d `"$PSScriptRoot`" && cargo $cargoArgsStr"
 
 if ($LASTEXITCODE -eq 0) {
     if (-not $Check) {
