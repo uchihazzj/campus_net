@@ -147,6 +147,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             let uname = s.config.users[user_idx].username.clone();
             s.user_statuses[user_idx].state = LoginState::LoggedOut;
             s.user_statuses[user_idx].current_ip.clear();
+            s.reconnect_targets.retain(|&i| i != user_idx);
             s.add_log(format!("[OK] {}: Logout success", uname));
         }
         Err(e) => {
@@ -155,6 +156,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             let err = e.to_string();
             s.user_statuses[user_idx].state = LoginState::Error;
             s.user_statuses[user_idx].last_error = err.clone();
+            s.reconnect_targets.retain(|&i| i != user_idx);
             s.add_log(format!("[ERROR] {}: Logout failed - {}", uname, err));
         }
     }

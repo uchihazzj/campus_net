@@ -78,6 +78,10 @@ pub struct AppState {
     // Consecutive failure counters
     pub auth_fail_count: u32,
     pub internet_fail_count: u32,
+    /// User indices to reconnect on next auto-reconnect cycle.
+    /// Populated on first trouble detection, cleared on success
+    /// or when user manually logs out.
+    pub reconnect_targets: Vec<usize>,
 }
 
 impl AppState {
@@ -93,6 +97,7 @@ impl AppState {
             ipv4_internet: Ipv4InternetStatus::Checking,
             auth_fail_count: 0,
             internet_fail_count: 0,
+            reconnect_targets: Vec::new(),
         }
     }
 
