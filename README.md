@@ -5,10 +5,11 @@
 ## 功能
 
 - **深澜 / srun 校园网认证**：登录 / 登出，支持多用户管理
-- **三层网络状态检测（仅 IPv4）**：
+- **四层网络状态检测（仅 IPv4）**：
   - Layer 1 — 校园网 IPv4 检测：枚举 `10.*.*.*` 地址
-  - Layer 2 — 认证状态检测：通过 HTTP 重定向判断是否已登录
-  - Layer 3 — IPv4 外网可达性：多端点 HTTP/HTTPS 检测，强制绑定 IPv4
+  - Layer 2 — 认证服务器可达性：检测 srun 认证服务器是否响应
+  - Layer 3 — 认证状态检测：通过 HTTP 重定向判断是否已登录
+  - Layer 4 — IPv4 外网可达性：多端点 HTTP/HTTPS 检测，强制绑定 IPv4
 - **IPv4-only 检测**：所有网络检测通过 `local_address` 绑定到校园网 IPv4 地址，避免 IPv6 可访问导致的误判
 - **断网自动重连**：连续确认后触发，支持指数退避
 - **系统托盘**：最小化到托盘，右键菜单快捷操作
@@ -26,8 +27,7 @@
 │  校园网客户端                                     │
 │  服务器: [http://10.0.0.55_______________]        │
 ├──────────────────────────────────────────────────┤
-│  校园网 IPv4: 10.x.x.x  认证状态: 已登录          │
-│  IPv4 外网: 可访问               在线: 1/2        │
+│  校园网 IPv4: 10.x.x.x  IPv4 外网: 可访问          │
 ├──────────────────────────────────────────────────┤
 │  ┌ user1 ───────────────────────── 编辑 删除     │
 │  │ ● 在线   用户: user1   IP: 10.x.x.x           │
@@ -45,7 +45,7 @@
 
 ## 网络检测机制
 
-软件采用三层检测，**全程仅使用 IPv4 HTTP/HTTPS，不使用 ICMP ping**，适配 Clash TUN mode、双栈网络等环境。
+软件采用四层检测，**全程仅使用 IPv4 HTTP/HTTPS，不使用 ICMP ping**，适配 Clash TUN mode、双栈网络等环境。
 
 ### 检测前提
 
@@ -55,17 +55,18 @@
 - 必须强制使用 IPv4 进行所有外网可达性检测
 - 校园网认证状态必须独立判断，不能用公网可达性替代
 
-### 三层检测详解
+### 四层检测详解
 
 | 层级 | 检测内容 | 检测方式 | 说明 |
 |------|---------|---------|------|
 | **Layer 1** | 校园网 IPv4 | 枚举所有 IPv4 地址，匹配 `10.*.*.*` | 未检测到 10 段 IP 时停止后续检测和自动重连 |
-| **Layer 2** | 校园网认证 | HTTP GET `baidu.com`，禁用自动跳转 | 被 portal 劫持重定向 → Not logged in |
-| **Layer 3** | IPv4 外网 | 多 URL 串行检测，强制绑定校园网 IPv4 | 连续失败 2 次才判定 Unreachable |
+| **Layer 2** | 认证服务器 | HTTP GET `{server}/cgi-bin/get_challenge` | 任何 HTTP 响应 = Reachable；连接失败 = Unreachable |
+| **Layer 3** | 校园网认证 | HTTP GET `baidu.com`，禁用自动跳转 | 被 portal 劫持重定向 → Not logged in |
+| **Layer 4** | IPv4 外网 | 多 URL 串行检测，强制绑定校园网 IPv4 | 连续失败 2 次才判定 Unreachable |
 
 ### IPv4 强制绑定
 
-Layer 2 和 Layer 3 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_address()` 绑定到检测到的校园网 IPv4 地址（即 `10.*.*.*`），确保：
+Layer 2、Layer 3 和 Layer 4 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_address()` 绑定到检测到的校园网 IPv4 地址（即 `10.*.*.*`），确保：
 
 - HTTP 流量走 IPv4 而不是 IPv6
 - 流量走校园网物理接口而不是 TUN 虚拟接口
@@ -73,7 +74,16 @@ Layer 2 和 Layer 3 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_addr
 
 同时启用 `no_proxy()` 避免应用层 HTTP 代理干扰。
 
-### Layer 2 — 认证状态检测
+### Layer 2 — 认证服务器可达性检测
+
+向认证服务器的 `/cgi-bin/get_challenge` 发起 HTTP GET 请求：
+
+| 响应 | 判断 |
+|------|------|
+| 任何 HTTP 响应（200 / 4xx / 5xx） | `Reachable` |
+| 连接失败 / 超时 | `Unreachable` |
+
+### Layer 3 — 认证状态检测
 
 向 `http://www.baidu.com` 发起 HTTP GET 请求，不跟随重定向：
 
@@ -82,9 +92,9 @@ Layer 2 和 Layer 3 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_addr
 | 200 OK | `Logged in` |
 | 30x 重定向到 portal（含 `srun_portal` / `ac_id=` / `wlanuserip` 等） | `Not logged in` |
 | 30x 重定向到非 portal URL（如 http→https 升级） | `Logged in` |
-| 连接失败 / 超时 | `Server Unreachable` |
+| 连接失败 / 超时 | `Unknown` |
 
-### Layer 3 — IPv4 外网可达性检测
+### Layer 4 — IPv4 外网可达性检测
 
 串行检测多个端点，**任意一个成功即判定为 Reachable**：
 
@@ -103,10 +113,13 @@ Layer 2 和 Layer 3 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_addr
 
 - 检测间隔：**15 秒**（基础）
 - 无校园网 IPv4 时：**不自动重连**
-- `Campus Auth` 为 `Not logged in` 且开启自动重连：**连续 2 次确认后触发重连**
-- `Campus Auth` 为 `Logged in` 但 `IPv4 Internet` 为 `Unreachable`：**连续 2 次确认后触发重连**
+- 触发条件（任一满足且连续 2 次确认）：
+  - `IPv4 Internet` 为 `CaptivePortal`（IPv4 被门户劫持）
+  - `Campus Auth` 为 `NotLoggedIn`（认证已丢失）
+  - `LoggedIn` 但 `IPv4 Internet` 为 `Unreachable`（已登录但外网不通）
+- 重连目标：首次检测到问题时快照所有 Online 用户；若没有 Online 用户则重连全部配置的用户
 - 重连失败后采用**指数退避**：15s → 30s → 60s → 120s → 240s → 300s（最大）
-- 重连成功后重置为 15s
+- 重连成功后重置为 15s，清空重连目标
 
 ## 编译
 
@@ -154,9 +167,9 @@ cargo build --release
   "retry_delay": 1000,
   "retry_times": 3,
   "monitor_interval_secs": 30,
-  "auto_reconnect": false,
+  "auto_reconnect": true,
   "minimize_to_tray": true,
-  "auto_start": false,
+  "auto_start": true,
   "language": "zh",
   "users": [
     {
@@ -185,9 +198,9 @@ cargo build --release
 | `retry_delay` | int | `1000` | 登录重试间隔（毫秒） |
 | `retry_times` | int | `3` | 登录重试次数 |
 | `monitor_interval_secs` | int | `30` | 监控检测间隔（秒），当前实现固定 15 秒 |
-| `auto_reconnect` | bool | `false` | 断网自动重连 |
+| `auto_reconnect` | bool | `true` | 断网自动重连 |
 | `minimize_to_tray` | bool | `true` | 关闭窗口时最小化到托盘 |
-| `auto_start` | bool | `false` | 开机自启 |
+| `auto_start` | bool | `true` | 开机自启 |
 | `language` | string | `zh` | 语言：`zh` 中文 / `en` English |
 | `window_width` | float | — | 上次窗口宽度（自动保存） |
 | `window_height` | float | — | 上次窗口高度（自动保存） |
@@ -222,7 +235,7 @@ src/
 ├── service/
 │   ├── auth.rs          # 异步登录 / 登出
 │   ├── config.rs        # 配置读写
-│   ├── detection.rs     # 三层网络检测（IPv4-only）
+│   ├── detection.rs     # 四层网络检测（IPv4-only）
 │   ├── monitor.rs       # 后台监控 + 自动重连 + 指数退避
 │   └── mod.rs           # AppState / SharedState / 状态枚举
 ├── platform/
