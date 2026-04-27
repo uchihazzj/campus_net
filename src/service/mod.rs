@@ -1,6 +1,24 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service::config::AppConfig;
+
+// ── UI repaint signal ──────────────────────────────────
+// Stored egui::Context for triggering immediate repaints
+// from background threads (e.g. tray listener → auth task).
+static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// Called once from the main thread to store the egui context.
+pub fn set_egui_ctx(ctx: egui::Context) {
+    let _ = EGUI_CTX.set(ctx);
+}
+
+/// Trigger an immediate UI repaint. Safe to call from any thread.
+/// No-op if set_egui_ctx hasn't been called yet.
+pub fn request_ui_repaint() {
+    if let Some(ctx) = EGUI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
 
 pub mod auth;
 pub mod config;

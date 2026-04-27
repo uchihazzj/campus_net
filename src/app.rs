@@ -219,10 +219,23 @@ impl CampusNetApp {
                                     native_show_window();
                                 } else if id == login_all_id {
                                     tracing::info!("[TrayListener] → OneClickLogin");
+                                    // Set first user to LoggingIn immediately for UI feedback,
+                                    // then spawn the task which handles the actual login.
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] Tray: one-click login — starting...".to_string());
+                                        s.add_log("[INFO] One-click login requested from tray".to_string());
+                                        let count = s.config.users.len();
+                                        if count > 0 {
+                                            // Reset all non-Online users first
+                                            for i in 0..count {
+                                                if s.user_statuses[i].state != LoginState::Online {
+                                                    s.user_statuses[i].state = LoginState::LoggedOut;
+                                                    s.user_statuses[i].last_error.clear();
+                                                }
+                                            }
+                                        }
                                     }
+                                    crate::service::request_ui_repaint();
                                     let st = state_for_listener.clone();
                                     tokio_handle.spawn(async move {
                                         tracing::info!("[OneClickLogin] Task started from tray");
@@ -231,10 +244,17 @@ impl CampusNetApp {
                                     });
                                 } else if id == logout_all_id {
                                     tracing::info!("[TrayListener] → OneClickLogout");
+                                    // Set Online users to LoggingOut immediately for UI feedback.
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] Tray: one-click logout — starting...".to_string());
+                                        s.add_log("[INFO] One-click logout requested from tray".to_string());
+                                        for us in &mut s.user_statuses {
+                                            if us.state == LoginState::Online {
+                                                us.state = LoginState::LoggingOut;
+                                            }
+                                        }
                                     }
+                                    crate::service::request_ui_repaint();
                                     let st = state_for_listener.clone();
                                     tokio_handle.spawn(async move {
                                         tracing::info!("[OneClickLogout] Task started from tray");
@@ -912,8 +932,9 @@ impl CampusNetApp {
 
 impl eframe::App for CampusNetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Capture HWND on first frame
+        // Capture HWND + egui context on first frame
         capture_main_hwnd();
+        crate::service::set_egui_ctx(ctx.clone());
 
         // Sync eframe visibility state after native_show_window() was called
         // from the listener thread. Without this, eframe/winit still thinks the

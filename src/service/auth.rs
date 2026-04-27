@@ -201,6 +201,7 @@ pub async fn do_one_click_login(state: SharedState) {
         let mut s = state.lock().unwrap();
         s.add_log("[INFO] One-click login: starting...".to_string());
     }
+    crate::service::request_ui_repaint();
     tracing::info!("[OneClickLogin] Starting with {} user(s)", user_count);
 
     for idx in 0..user_count {
@@ -214,6 +215,7 @@ pub async fn do_one_click_login(state: SharedState) {
             let mut s = state.lock().unwrap();
             s.add_log(format!("[INFO] One-click login: trying {}...", username));
         }
+        crate::service::request_ui_repaint();
 
         do_login(state.clone(), idx).await;
 
@@ -232,6 +234,7 @@ pub async fn do_one_click_login(state: SharedState) {
                 let mut s = state.lock().unwrap();
                 s.add_log(format!("[OK] One-click login: {} succeeded", username));
             }
+            crate::service::request_ui_repaint();
             return;
         } else {
             let error = {
@@ -243,6 +246,7 @@ pub async fn do_one_click_login(state: SharedState) {
                 let mut s = state.lock().unwrap();
                 s.add_log(format!("[ERROR] One-click login: {} failed — {}", username, error));
             }
+            crate::service::request_ui_repaint();
         }
     }
 
@@ -251,6 +255,7 @@ pub async fn do_one_click_login(state: SharedState) {
         let mut s = state.lock().unwrap();
         s.add_log("[ERROR] One-click login: all configured users failed".to_string());
     }
+    crate::service::request_ui_repaint();
 }
 
 /// Log out the currently online user(s). Typically only one user is online
@@ -284,8 +289,14 @@ pub async fn do_one_click_logout(state: SharedState) {
             online_indices.len()
         ));
     }
+    crate::service::request_ui_repaint();
 
-    for idx in online_indices {
+    for &idx in &online_indices {
+        let username = {
+            let s = state.lock().unwrap();
+            s.config.users.get(idx).map(|u| u.username.clone()).unwrap_or_default()
+        };
+        tracing::info!("[OneClickLogout] Logging out user: {}", username);
         do_logout(state.clone(), idx).await;
     }
 
@@ -294,4 +305,5 @@ pub async fn do_one_click_logout(state: SharedState) {
         let mut s = state.lock().unwrap();
         s.add_log("[OK] One-click logout: completed".to_string());
     }
+    crate::service::request_ui_repaint();
 }
