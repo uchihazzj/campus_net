@@ -261,6 +261,8 @@ pub async fn do_one_click_login(state: SharedState) {
 /// Log out the currently online user(s). Typically only one user is online
 /// at a time; if multiple show as Online (stale state), log out all of them.
 pub async fn do_one_click_logout(state: SharedState) {
+    // ── Step 1: find Online users BEFORE changing any state ──
+    // This must run first; otherwise LoggingOut users won't match.
     let online_indices: Vec<usize> = {
         let s = state.lock().unwrap();
         s.user_statuses
@@ -273,30 +275,62 @@ pub async fn do_one_click_logout(state: SharedState) {
 
     if online_indices.is_empty() {
         let mut s = state.lock().unwrap();
-        s.add_log("[INFO] One-click logout: no online user to logout".to_string());
+        s.add_log("[WARN] One-click logout: no online user to logout".to_string());
         tracing::info!("[OneClickLogout] No online user found");
         return;
     }
+
+    // ── Step 2: collect usernames, then set to LoggingOut ──
+    {
+        let mut s = state.lock().unwrap();
+        let names: Vec<String> = online_indices
+            .iter()
+            .map(|&idx| {
+                s.config.users
+                    .get(idx)
+                    .map(|u| u.username.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (i, &idx) in online_indices.iter().enumerate() {
+            if let Some(us) = s.user_statuses.get_mut(idx) {
+                us.state = LoginState::LoggingOut;
+                us.last_error.clear();
+                tracing::info!("[OneClickLogout] {} state -> LoggingOut", names[i]);
+                s.add_log(format!("[INFO] {}: Logging out...", names[i]));
+            }
+        }
+    }
+    crate::service::request_ui_repaint();
 
     tracing::info!(
         "[OneClickLogout] Logging out {} online user(s)",
         online_indices.len()
     );
-    {
-        let mut s = state.lock().unwrap();
-        s.add_log(format!(
-            "[INFO] One-click logout: logging out {} user(s)...",
-            online_indices.len()
-        ));
-    }
-    crate::service::request_ui_repaint();
 
+    // ── Step 3: actually log out each user ──
     for &idx in &online_indices {
-        let username = {
+        let (username, ip) = {
             let s = state.lock().unwrap();
-            s.config.users.get(idx).map(|u| u.username.clone()).unwrap_or_default()
+            let uname = s.config.users.get(idx)
+                .map(|u| u.username.clone())
+                .unwrap_or_default();
+            let ip = s.user_statuses.get(idx)
+                .map(|us| us.current_ip.clone())
+                .unwrap_or_default();
+            (uname, ip)
         };
-        tracing::info!("[OneClickLogout] Logging out user: {}", username);
+
+        tracing::info!("[OneClickLogout] Sending logout: user={} ip={}", username, ip);
+        {
+            let mut s = state.lock().unwrap();
+            s.add_log(format!(
+                "[INFO] One-click logout: sending logout for {} (ip={})...",
+                username, ip
+            ));
+        }
+        crate::service::request_ui_repaint();
+
         do_logout(state.clone(), idx).await;
     }
 

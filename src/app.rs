@@ -244,15 +244,9 @@ impl CampusNetApp {
                                     });
                                 } else if id == logout_all_id {
                                     tracing::info!("[TrayListener] → OneClickLogout");
-                                    // Set Online users to LoggingOut immediately for UI feedback.
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
                                         s.add_log("[INFO] One-click logout requested from tray".to_string());
-                                        for us in &mut s.user_statuses {
-                                            if us.state == LoginState::Online {
-                                                us.state = LoginState::LoggingOut;
-                                            }
-                                        }
                                     }
                                     crate::service::request_ui_repaint();
                                     let st = state_for_listener.clone();
