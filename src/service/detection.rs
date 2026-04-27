@@ -194,8 +194,6 @@ fn is_portal_url(url: &str) -> bool {
 struct ReachabilityCheck {
     url: &'static str,
     success: SuccessCondition,
-    /// Prefer this endpoint for unbound fallback (more stable domestically)
-    preferred: bool,
 }
 
 enum SuccessCondition {
@@ -203,27 +201,22 @@ enum SuccessCondition {
     Status204,
 }
 
-/// Ordered by domestic stability. Preferred endpoints tried first in unbound fallback.
 static REACHABILITY_CHECKS: &[ReachabilityCheck] = &[
     ReachabilityCheck {
         url: "http://www.baidu.com",
         success: SuccessCondition::Status200MinLen(1000),
-        preferred: true,
     },
     ReachabilityCheck {
         url: "http://connect.rom.miui.com/generate_204",
         success: SuccessCondition::Status204,
-        preferred: true,
     },
     ReachabilityCheck {
         url: "http://www.msftconnecttest.com/connecttest.txt",
         success: SuccessCondition::Status200MinLen(0),
-        preferred: false,
     },
     ReachabilityCheck {
         url: "http://cp.cloudflare.com/",
         success: SuccessCondition::Status200MinLen(0),
-        preferred: false,
     },
 ];
 
@@ -231,8 +224,9 @@ static REACHABILITY_CHECKS: &[ReachabilityCheck] = &[
 ///
 /// Strategy:
 /// 1. Bound probe: bind client to campus_ipv4 via local_address.
-/// 2. If all bound probes fail, attempt unbound IPv4 probe as fallback.
-/// 3. Log every endpoint result for diagnostics.
+/// 2. If bound probe fails, unbound fallback only trusts CaptivePortal
+///    (portal redirect is genuine on any IP version); Reachable is treated
+///    as ProbeFailed to avoid false positives from IPv6.
 ///
 /// Returns `ProbeFailed` if the client can't be built at all.
 pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetStatus {
@@ -255,16 +249,25 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
     }
 
     // ── Unbound fallback ───────────────────────────────
-    // Try without local_address, preferring domestic endpoints.
-    // Request still goes over whatever route the system chooses;
-    // in a dual-stack environment this may go over IPv6, so a
-    // "Reachable" here is less trustworthy.
+    // Bound probe failed. Try without local_address to see if the network
+    // is completely down or just IPv4-isolated. Only trust CaptivePortal
+    // (portal redirect is genuine on any IP version). Treat Reachable as
+    // ProbeFailed because it may have succeeded via IPv6 — false positive.
     tracing::info!("[IPv4] Running unbound fallback probe...");
     let unbound_result = run_reachability_probes(None).await;
-    if matches!(unbound_result, Ipv4InternetStatus::Reachable) {
-        tracing::info!("[IPv4] Unbound probe succeeded (may have used IPv6!)");
+    match unbound_result {
+        Ipv4InternetStatus::CaptivePortal => {
+            tracing::info!("[IPv4] Unbound probe confirms captive portal");
+            Ipv4InternetStatus::CaptivePortal
+        }
+        Ipv4InternetStatus::Reachable => {
+            tracing::warn!(
+                "[IPv4] Unbound probe succeeded but cannot confirm IPv4 — treating as ProbeFailed"
+            );
+            Ipv4InternetStatus::ProbeFailed
+        }
+        other => other,
     }
-    unbound_result
 }
 
 /// Run the full set of reachability checks with an optional local_address binding.

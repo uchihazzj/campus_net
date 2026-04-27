@@ -96,18 +96,20 @@ Layer 2、Layer 3 和 Layer 4 的 HTTP 客户端通过 `reqwest::ClientBuilder::
 
 ### Layer 4 — IPv4 外网可达性检测
 
-串行检测多个端点，**任意一个成功即判定为 Reachable**：
+先绑定校园网 IPv4 探测，全部失败后执行 unbound fallback：
 
 | 检测 URL | 成功条件 |
 |----------|---------|
-| `https://www.baidu.com` | 200 且 body ≥ 1000 字节 |
-| `http://cp.cloudflare.com/` | 200 OK |
-| `http://www.gstatic.com/generate_204` | 204 No Content |
+| `http://www.baidu.com` | 200 且 body ≥ 1000 字节 |
 | `http://connect.rom.miui.com/generate_204` | 204 No Content |
+| `http://www.msftconnecttest.com/connecttest.txt` | 200 OK |
+| `http://cp.cloudflare.com/` | 200 OK |
 
-对 30x 响应：检查 `Location` 头，若指向认证 portal 则判定为 `Captive portal`，否则继续检测下一个端点。
+**Bound probe**：HTTP 客户端绑定校园网 IPv4，任意端点成功 → `Reachable`，portal 重定向 → `CaptivePortal`，全部失败 → 进入 fallback。
 
-所有端点均失败后，等待连续 2 次确认才更新 UI 为 `Unreachable`，避免网络抖动误报。
+**Unbound fallback**：仅信任 `CaptivePortal`（portal 重定向在任何 IP 协议上都是真实的）。若 unbound 返回 `Reachable`，视为 `ProbeFailed`——因为无法确认是否经由 IPv6 到达，避免误报。
+
+连续 2 次确认后更新 UI 状态。
 
 ### 自动重连逻辑
 
