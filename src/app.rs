@@ -166,18 +166,42 @@ impl CampusNetApp {
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.tray_rx.try_recv() {
             let id = event.id;
+            tracing::info!("Tray menu event received: id={:?}", id);
             if id == self._show_id {
+                tracing::info!("[INFO] Tray menu: show window");
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.add_log("[INFO] Tray menu: show window".to_string());
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if id == self._login_all_id {
+                tracing::info!("[INFO] Tray menu: login all");
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.add_log("[INFO] Tray menu: login all".to_string());
+                }
                 let state = self.state.clone();
                 tokio::spawn(async move { auth::do_login_all(state).await });
             } else if id == self._logout_all_id {
+                tracing::info!("[INFO] Tray menu: logout all");
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.add_log("[INFO] Tray menu: logout all".to_string());
+                }
                 let state = self.state.clone();
                 tokio::spawn(async move { auth::do_logout_all(state).await });
             } else if id == self._quit_id {
+                tracing::info!("[INFO] Tray menu: quit");
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.add_log("[INFO] Tray menu: quit".to_string());
+                }
                 self.quit_requested = true;
                 ctx.request_repaint();
+            } else {
+                tracing::warn!("[WARN] Tray menu: unknown event id={:?}", id);
             }
         }
     }
@@ -789,8 +813,12 @@ impl eframe::App for CampusNetApp {
                 s.config.minimize_to_tray
             };
             if minimize {
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.add_log("[INFO] Minimizing to tray (hiding window)".to_string());
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
 
