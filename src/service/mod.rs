@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::service::config::AppConfig;
-use crate::service::detection::{CampusAuthStatus, ReachabilityResult};
+use crate::service::detection::CampusAuthStatus;
 
 pub mod auth;
 pub mod config;
@@ -18,11 +18,11 @@ pub enum LoginState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum InternetStatus {
-    Unknown,
-    Online,
+pub enum Ipv4InternetStatus {
+    Checking,
+    Reachable,
     CaptivePortal,
-    Offline,
+    Unreachable,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ pub struct AppState {
     // Three-layer detection state
     pub campus_ip: Option<String>,
     pub campus_auth: CampusAuthStatus,
-    pub internet_status: InternetStatus,
+    pub ipv4_internet: Ipv4InternetStatus,
     // Consecutive failure counters
     pub auth_fail_count: u32,
     pub internet_fail_count: u32,
@@ -64,7 +64,7 @@ impl AppState {
             log_messages: Vec::new(),
             campus_ip: None,
             campus_auth: CampusAuthStatus::Unknown,
-            internet_status: InternetStatus::Unknown,
+            ipv4_internet: Ipv4InternetStatus::Checking,
             auth_fail_count: 0,
             internet_fail_count: 0,
         }

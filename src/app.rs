@@ -12,7 +12,7 @@ use crate::platform::secure_store;
 use crate::service::auth;
 use crate::service::config::{write_config, StoredUser};
 use crate::service::detection::CampusAuthStatus;
-use crate::service::{InternetStatus, LoginState, SharedState};
+use crate::service::{Ipv4InternetStatus, LoginState, SharedState};
 use crate::ui::l10n::{self, Lang, UiText};
 
 fn create_tray_icon_rgba() -> Icon {
@@ -187,7 +187,7 @@ impl CampusNetApp {
         ui.horizontal(|ui| {
             ui.heading(RichText::new(t.window_title).size(20.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let (campus_ip, campus_auth, internet, online_count, total) = {
+                let (campus_ip, campus_auth, ipv4_internet, online_count, total) = {
                     let s = self.state.lock().unwrap();
                     let online = s.user_statuses
                         .iter()
@@ -196,16 +196,16 @@ impl CampusNetApp {
                     (
                         s.campus_ip.clone(),
                         s.campus_auth.clone(),
-                        s.internet_status.clone(),
+                        s.ipv4_internet.clone(),
                         online,
                         s.config.users.len(),
                     )
                 };
 
-                // Campus IP
-                let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ip_none);
+                // Campus IPv4
+                let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
                 let ip_color = if campus_ip.is_some() { Color32::GREEN } else { Color32::GRAY };
-                ui.colored_label(ip_color, format!("{} {}", t.campus_ip_label, ip_text));
+                ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
 
                 // Campus Auth
                 let (auth_color, auth_text) = match campus_auth {
@@ -216,14 +216,14 @@ impl CampusNetApp {
                 };
                 ui.colored_label(auth_color, format!("{} {}", t.campus_auth_label, auth_text));
 
-                // Internet
-                let (inet_color, inet_text) = match internet {
-                    InternetStatus::Online => (Color32::GREEN, t.internet_online),
-                    InternetStatus::CaptivePortal => (Color32::YELLOW, t.internet_captive),
-                    InternetStatus::Offline => (Color32::RED, t.internet_offline),
-                    InternetStatus::Unknown => (Color32::GRAY, t.internet_unknown),
+                // IPv4 Internet
+                let (inet_color, inet_text) = match ipv4_internet {
+                    Ipv4InternetStatus::Reachable => (Color32::GREEN, t.ipv4_internet_reachable),
+                    Ipv4InternetStatus::CaptivePortal => (Color32::YELLOW, t.ipv4_internet_captive),
+                    Ipv4InternetStatus::Unreachable => (Color32::RED, t.ipv4_internet_unreachable),
+                    Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
                 };
-                ui.colored_label(inet_color, format!("{} {}", t.internet_label, inet_text));
+                ui.colored_label(inet_color, format!("{} {}", t.ipv4_internet_label, inet_text));
 
                 // User count
                 ui.label(format!("{} {}/{}", t.online_count, online_count, total));
@@ -238,8 +238,9 @@ impl CampusNetApp {
                 s.config.server.clone()
             };
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut server).hint_text(t.server_hint),
-            );
+                egui::TextEdit::singleline(&mut server)
+                    .hint_text(t.server_hint),
+            ).on_hover_text(t.server_tooltip);
             if resp.changed() {
                 let normalized = SrunClient::normalize_server_url(&server);
                 let mut s = self.state.lock().unwrap();
@@ -419,6 +420,16 @@ impl CampusNetApp {
                 self.edit_original_username.clear();
                 self.edit_original_ip.clear();
                 self.edit_original_if_name.clear();
+                // Auto-fill with 10.* IP if available, otherwise first private IP
+                let ifaces = get_network_interfaces();
+                let preferred = ifaces
+                    .iter()
+                    .find(|(_, ip)| ip.is_ipv4() && ip.to_string().starts_with("10."))
+                    .or_else(|| ifaces.iter().find(|(_, ip)| ip.is_ipv4() && !ip.is_loopback()));
+                if let Some((name, ip)) = preferred {
+                    self.edit_ip = ip.to_string();
+                    self.edit_if_name = name.clone();
+                }
                 self.show_add_dialog = true;
             }
 
@@ -465,10 +476,11 @@ impl CampusNetApp {
                 ui.text_edit_singleline(&mut self.edit_username);
 
                 ui.label(t.field_password);
+                let pwd_hint = if is_new_user { t.field_password_hint } else { t.field_password_hint_edit };
                 ui.add(
                     egui::TextEdit::singleline(&mut self.edit_password)
                         .password(true)
-                        .hint_text(t.field_password_hint),
+                        .hint_text(pwd_hint),
                 );
 
                 ui.label(t.field_ip);
@@ -481,14 +493,15 @@ impl CampusNetApp {
 
                 let interfaces = get_network_interfaces();
                 if !interfaces.is_empty() {
-                    ui.collapsing(t.available_interfaces, |ui| {
-                        for (name, ip) in &interfaces {
-                            if ui.button(format!("{} ({})", name, ip)).clicked() {
-                                self.edit_ip = ip.to_string();
-                                self.edit_if_name.clone_from(name);
-                            }
+                    ui.label(t.available_interfaces);
+                    for (name, ip) in &interfaces {
+                        if ui.button(format!("  {} — {}", name, ip)).clicked() {
+                            self.edit_ip = ip.to_string();
+                            self.edit_if_name.clone_from(name);
                         }
-                    });
+                    }
+                } else {
+                    ui.colored_label(Color32::YELLOW, "No network interfaces detected");
                 }
 
                 ui.add_space(8.0);

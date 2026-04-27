@@ -1,8 +1,10 @@
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use crate::core::utils::get_network_interfaces;
+use crate::service::Ipv4InternetStatus;
 
-// ── Campus IP Detection ─────────────────────────────────────────
+// ── Campus IPv4 Detection ──────────────────────────────────────────
 
 pub fn detect_campus_ip() -> Option<String> {
     get_network_interfaces()
@@ -12,7 +14,7 @@ pub fn detect_campus_ip() -> Option<String> {
         .find(|ip| ip.starts_with("10."))
 }
 
-// ── Campus Auth Status (via portal redirect detection) ──────────
+// ── Campus Auth Status ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CampusAuthStatus {
@@ -22,21 +24,30 @@ pub enum CampusAuthStatus {
     Unknown,
 }
 
-/// Check if logged in by sending an HTTP request to an external URL.
-/// If the campus gateway redirects to the portal → NotLoggedIn.
-/// If the request succeeds → LoggedIn.
-pub async fn check_auth_status() -> CampusAuthStatus {
-    let client = match reqwest::Client::builder()
+/// Check campus auth by sending an HTTP request via the campus IPv4 interface.
+/// Binds to `campus_ipv4` to force IPv4, avoiding IPv6 false-positive.
+pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(4))
         .no_brotli()
         .no_gzip()
         .no_deflate()
-        .build()
-    {
+        .no_proxy();
+
+    if let Some(ip) = campus_ipv4 {
+        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+            builder = builder.local_address(std::net::IpAddr::V4(addr));
+        }
+    }
+
+let client = match builder.build() {
         Ok(c) => c,
-        Err(_) => return CampusAuthStatus::Unknown,
+        Err(e) => {
+            tracing::warn!("Failed to build auth check client: {}", e);
+            return CampusAuthStatus::Unknown;
+        }
     };
 
     match client.get("http://www.baidu.com").send().await {
@@ -55,7 +66,6 @@ pub async fn check_auth_status() -> CampusAuthStatus {
                         return CampusAuthStatus::NotLoggedIn;
                     }
                 }
-                // Redirect to non-portal URL (e.g., baidu redirects to https)
                 return CampusAuthStatus::LoggedIn;
             }
             CampusAuthStatus::Unknown
@@ -78,14 +88,7 @@ fn is_portal_url(url: &str) -> bool {
         || lower.contains("login")
 }
 
-// ── Internet Reachability ───────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReachabilityResult {
-    Reachable,
-    CaptivePortal,
-    Unreachable,
-}
+// ── IPv4 Internet Reachability ─────────────────────────────────────
 
 struct ReachabilityCheck {
     url: &'static str,
@@ -93,11 +96,8 @@ struct ReachabilityCheck {
 }
 
 enum SuccessCondition {
-    /// Exact status code
     Status(u16),
-    /// Status 200 + body must be >= N bytes
     Status200MinLen(usize),
-    /// Status 204 (No Content) — specific to generate_204 endpoints
     Status204,
 }
 
@@ -120,29 +120,47 @@ static REACHABILITY_CHECKS: &[ReachabilityCheck] = &[
     },
 ];
 
-pub async fn check_internet_reachability() -> ReachabilityResult {
-    let client = match reqwest::Client::builder()
+/// Check IPv4 internet reachability by forcing the HTTP client to bind
+/// to the campus IPv4 address. This ensures the traffic goes over IPv4
+/// and is not routed via IPv6 (which may be unfiltered).
+///
+/// Returns `Ipv4InternetStatus::Reachable` if any check URL succeeds,
+/// `CaptivePortal` if a portal redirect is detected,
+/// `Unreachable` if all checks fail.
+pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetStatus {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(3))
         .no_brotli()
         .no_gzip()
         .no_deflate()
-        .build()
-    {
+        .no_proxy();
+
+    // Force IPv4 by binding to the campus IPv4 address
+    if let Some(ip) = campus_ipv4 {
+        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+            builder = builder.local_address(std::net::IpAddr::V4(addr));
+        }
+    }
+
+    let client = match builder.build() {
         Ok(c) => c,
-        Err(_) => return ReachabilityResult::Unreachable,
+        Err(e) => {
+            tracing::warn!("Failed to build IPv4 check client: {}", e);
+            return Ipv4InternetStatus::Unreachable;
+        }
     };
 
     for check in REACHABILITY_CHECKS {
         match try_reachability_check(&client, check).await {
-            Ok(()) => return ReachabilityResult::Reachable,
-            Err(CheckError::CaptivePortal) => return ReachabilityResult::CaptivePortal,
+            Ok(()) => return Ipv4InternetStatus::Reachable,
+            Err(CheckError::CaptivePortal) => return Ipv4InternetStatus::CaptivePortal,
             Err(CheckError::Failed) => continue,
         }
     }
 
-    ReachabilityResult::Unreachable
+    Ipv4InternetStatus::Unreachable
 }
 
 enum CheckError {
@@ -158,11 +176,13 @@ async fn try_reachability_check(
         .get(check.url)
         .send()
         .await
-        .map_err(|_| CheckError::Failed)?;
+        .map_err(|e| {
+            tracing::debug!("IPv4 check {} failed: {}", check.url, e);
+            CheckError::Failed
+        })?;
 
     let status = resp.status();
 
-    // Check for captive portal redirects
     if status.is_redirection() {
         if let Some(location) = resp
             .headers()
@@ -173,8 +193,6 @@ async fn try_reachability_check(
                 return Err(CheckError::CaptivePortal);
             }
         }
-        // Non-portal redirect — could be http→https upgrade, treat as not an error
-        // but we need to check the success condition
     }
 
     match check.success {
@@ -199,10 +217,7 @@ async fn try_reachability_check(
             if min_len == 0 {
                 return Ok(());
             }
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|_| CheckError::Failed)?;
+            let body = resp.bytes().await.map_err(|_| CheckError::Failed)?;
             if body.len() >= min_len {
                 Ok(())
             } else {
@@ -213,7 +228,7 @@ async fn try_reachability_check(
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -222,18 +237,20 @@ mod tests {
     #[test]
     fn test_detect_campus_ip() {
         let ip = detect_campus_ip();
-        println!("Campus IP: {:?}", ip);
+        println!("Campus IPv4: {:?}", ip);
     }
 
     #[tokio::test]
     async fn test_check_auth_status() {
-        let status = check_auth_status().await;
+        let ip = detect_campus_ip();
+        let status = check_auth_status(ip.as_deref()).await;
         println!("Auth status: {:?}", status);
     }
 
     #[tokio::test]
-    async fn test_check_internet_reachability() {
-        let result = check_internet_reachability().await;
-        println!("Reachability: {:?}", result);
+    async fn test_check_ipv4_reachability() {
+        let ip = detect_campus_ip();
+        let result = check_ipv4_reachability(ip.as_deref()).await;
+        println!("IPv4 reachability: {:?}", result);
     }
 }

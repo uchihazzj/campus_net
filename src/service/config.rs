@@ -39,7 +39,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            server: String::new(),
+            server: "http://10.0.0.55".to_string(),
             detect_ip: false,
             strict_bind: false,
             double_stack: false,
@@ -91,19 +91,30 @@ impl AppConfig {
 }
 
 pub fn read_config(path: &str) -> anyhow::Result<AppConfig> {
-    match std::fs::read_to_string(path) {
+    let mut config = match std::fs::read_to_string(path) {
         Ok(content) => {
-            let config: AppConfig = serde_json::from_str(&content)?;
-            Ok(config)
+            let c: AppConfig = serde_json::from_str(&content)?;
+            c
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("Config file not found, using defaults");
-            let config = AppConfig::default();
-            write_config(path, &config)?;
-            Ok(config)
+            AppConfig::default()
         }
         Err(e) => anyhow::bail!("Failed to read config: {}", e),
+    };
+
+    // Fill in defaults for empty required fields
+    let mut updated = false;
+    if config.server.is_empty() {
+        config.server = AppConfig::default().server;
+        updated = true;
     }
+
+    if updated {
+        write_config(path, &config)?;
+    }
+
+    Ok(config)
 }
 
 pub fn write_config(path: &str, config: &AppConfig) -> anyhow::Result<()> {

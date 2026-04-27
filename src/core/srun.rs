@@ -217,6 +217,12 @@ impl SrunClient {
     pub async fn detect_ip(&mut self) -> anyhow::Result<()> {
         self.time = unix_second().saturating_sub(2);
         let client = build_http_client(self.strict_bind, &self.ip)?;
+
+        // Validate server URL
+        if !self.auth_server.starts_with("http://") && !self.auth_server.starts_with("https://") {
+            anyhow::bail!("Invalid server URL: '{}'. Must start with http:// or https://", self.auth_server);
+        }
+
         let url = format!("{}{}", self.auth_server, PATH_GET_CHALLENGE);
         let time_str = self.time.to_string();
         let query = [
@@ -229,13 +235,41 @@ impl SrunClient {
             fetch_json(&client, &url, &query).await?;
         if !challenge.online_ip.is_empty() {
             self.client_ip = challenge.online_ip;
+            return Ok(());
         }
-        Ok(())
+
+        // Fallback: enumerate local private addresses (10.x, 172.16-31.x, 192.168.x)
+        let ifaces = crate::core::utils::get_network_interfaces();
+        for (_, ip) in &ifaces {
+            if ip.is_ipv4() {
+                let s = ip.to_string();
+                if s.starts_with("10.")
+                    || (s.starts_with("172.") && {
+                        let second: u32 = s[4..].split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                        second >= 16 && second <= 31
+                    })
+                    || s.starts_with("192.168.")
+                {
+                    self.client_ip = s;
+                    return Ok(());
+                }
+            }
+        }
+
+        // No private IP found — list all available IPs in error
+        let all_ips: Vec<String> = ifaces.iter().map(|(_, ip)| ip.to_string()).collect();
+        anyhow::bail!(
+            "Cannot detect campus IP. Available local IPs: [{}]. Please configure IP manually or set if_name.",
+            all_ips.join(", ")
+        )
     }
 
     pub async fn get_token(&mut self) -> anyhow::Result<String> {
         if self.client_ip.is_empty() {
-            anyhow::bail!("IP undefined, cannot get challenge token");
+            anyhow::bail!(
+                "IP is empty — server didn't return online_ip and no local private IP found. \
+                 Please configure a static IP for this user in settings."
+            );
         }
         self.time = unix_second().saturating_sub(2);
         let client = build_http_client(self.strict_bind, &self.ip)?;
