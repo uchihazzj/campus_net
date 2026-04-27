@@ -181,3 +181,117 @@ pub async fn do_logout_all(state: SharedState) {
         do_logout(state.clone(), idx).await;
     }
 }
+
+/// Try users in order, stop at the first successful login.
+/// Only one user should be online at a time.
+pub async fn do_one_click_login(state: SharedState) {
+    let user_count = {
+        let s = state.lock().unwrap();
+        s.config.users.len()
+    };
+
+    if user_count == 0 {
+        let mut s = state.lock().unwrap();
+        s.add_log("[INFO] One-click login: no users configured".to_string());
+        tracing::info!("[OneClickLogin] No users configured");
+        return;
+    }
+
+    {
+        let mut s = state.lock().unwrap();
+        s.add_log("[INFO] One-click login: starting...".to_string());
+    }
+    tracing::info!("[OneClickLogin] Starting with {} user(s)", user_count);
+
+    for idx in 0..user_count {
+        let username = {
+            let s = state.lock().unwrap();
+            s.config.users.get(idx).map(|u| u.username.clone()).unwrap_or_default()
+        };
+
+        tracing::info!("[OneClickLogin] Trying user {}: {}", idx, username);
+        {
+            let mut s = state.lock().unwrap();
+            s.add_log(format!("[INFO] One-click login: trying {}...", username));
+        }
+
+        do_login(state.clone(), idx).await;
+
+        let success = {
+            let s = state.lock().unwrap();
+            if let Some(us) = s.user_statuses.get(idx) {
+                us.state == LoginState::Online
+            } else {
+                false
+            }
+        };
+
+        if success {
+            tracing::info!("[OneClickLogin] {} succeeded, stopping", username);
+            {
+                let mut s = state.lock().unwrap();
+                s.add_log(format!("[OK] One-click login: {} succeeded", username));
+            }
+            return;
+        } else {
+            let error = {
+                let s = state.lock().unwrap();
+                s.user_statuses.get(idx).map(|us| us.last_error.clone()).unwrap_or_default()
+            };
+            tracing::info!("[OneClickLogin] {} failed: {}", username, error);
+            {
+                let mut s = state.lock().unwrap();
+                s.add_log(format!("[ERROR] One-click login: {} failed — {}", username, error));
+            }
+        }
+    }
+
+    tracing::info!("[OneClickLogin] All users failed");
+    {
+        let mut s = state.lock().unwrap();
+        s.add_log("[ERROR] One-click login: all configured users failed".to_string());
+    }
+}
+
+/// Log out the currently online user(s). Typically only one user is online
+/// at a time; if multiple show as Online (stale state), log out all of them.
+pub async fn do_one_click_logout(state: SharedState) {
+    let online_indices: Vec<usize> = {
+        let s = state.lock().unwrap();
+        s.user_statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, us)| us.state == LoginState::Online)
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    if online_indices.is_empty() {
+        let mut s = state.lock().unwrap();
+        s.add_log("[INFO] One-click logout: no online user to logout".to_string());
+        tracing::info!("[OneClickLogout] No online user found");
+        return;
+    }
+
+    tracing::info!(
+        "[OneClickLogout] Logging out {} online user(s)",
+        online_indices.len()
+    );
+    {
+        let mut s = state.lock().unwrap();
+        s.add_log(format!(
+            "[INFO] One-click logout: logging out {} user(s)...",
+            online_indices.len()
+        ));
+    }
+
+    for idx in online_indices {
+        do_logout(state.clone(), idx).await;
+    }
+
+    tracing::info!("[OneClickLogout] Completed");
+    {
+        let mut s = state.lock().unwrap();
+        s.add_log("[OK] One-click logout: completed".to_string());
+    }
+}

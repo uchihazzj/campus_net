@@ -19,6 +19,10 @@ use crate::ui::l10n::{self, Lang, UiText};
 // ── Windows native window handle ───────────────────────
 static MAIN_HWND: OnceLock<isize> = OnceLock::new();
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+/// Set by native_show_window() — signals the next update() to sync
+/// eframe's viewport visibility state via Visible(true). This is
+/// needed because native ShowWindow bypasses eframe/winit state tracking.
+static SYNC_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 fn capture_main_hwnd() {
     if MAIN_HWND.get().is_some() {
@@ -41,6 +45,8 @@ fn native_show_window() {
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         }
+        // Signal the next update() to sync eframe visibility state
+        SYNC_VISIBLE.store(true, Ordering::SeqCst);
     } else {
         tracing::warn!("[Native] ShowWindow failed: no HWND captured yet");
     }
@@ -80,6 +86,8 @@ extern "system" {
 const SW_SHOW: i32 = 5;
 #[cfg(target_os = "windows")]
 const SW_RESTORE: i32 = 9;
+#[cfg(target_os = "windows")]
+const SW_HIDE: i32 = 0;
 #[cfg(target_os = "windows")]
 const WM_CLOSE: u32 = 0x0010;
 
@@ -210,28 +218,28 @@ impl CampusNetApp {
                                     }
                                     native_show_window();
                                 } else if id == login_all_id {
-                                    tracing::info!("[TrayListener] → LoginAll");
+                                    tracing::info!("[TrayListener] → OneClickLogin");
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] Tray menu: login all — starting...".to_string());
+                                        s.add_log("[INFO] Tray: one-click login — starting...".to_string());
                                     }
                                     let st = state_for_listener.clone();
                                     tokio_handle.spawn(async move {
-                                        tracing::info!("[TrayListener] do_login_all task started");
-                                        auth::do_login_all(st).await;
-                                        tracing::info!("[TrayListener] do_login_all task completed");
+                                        tracing::info!("[OneClickLogin] Task started from tray");
+                                        auth::do_one_click_login(st).await;
+                                        tracing::info!("[OneClickLogin] Task completed");
                                     });
                                 } else if id == logout_all_id {
-                                    tracing::info!("[TrayListener] → LogoutAll");
+                                    tracing::info!("[TrayListener] → OneClickLogout");
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] Tray menu: logout all — starting...".to_string());
+                                        s.add_log("[INFO] Tray: one-click logout — starting...".to_string());
                                     }
                                     let st = state_for_listener.clone();
                                     tokio_handle.spawn(async move {
-                                        tracing::info!("[TrayListener] do_logout_all task started");
-                                        auth::do_logout_all(st.clone()).await;
-                                        tracing::info!("[TrayListener] do_logout_all task completed");
+                                        tracing::info!("[OneClickLogout] Task started from tray");
+                                        auth::do_one_click_logout(st).await;
+                                        tracing::info!("[OneClickLogout] Task completed");
                                     });
                                 } else if id == quit_id {
                                     tracing::info!("[TrayListener] → Quit");
@@ -569,11 +577,11 @@ impl CampusNetApp {
 
                 if ui.add_enabled(!any_busy, egui::Button::new(t.btn_login_all)).clicked() {
                     let state = self.state.clone();
-                    tokio::spawn(async move { auth::do_login_all(state).await });
+                    tokio::spawn(async move { auth::do_one_click_login(state).await });
                 }
                 if ui.add_enabled(!any_busy, egui::Button::new(t.btn_logout_all)).clicked() {
                     let state = self.state.clone();
-                    tokio::spawn(async move { auth::do_logout_all(state).await });
+                    tokio::spawn(async move { auth::do_one_click_logout(state).await });
                 }
             });
         });
@@ -907,6 +915,15 @@ impl eframe::App for CampusNetApp {
         // Capture HWND on first frame
         capture_main_hwnd();
 
+        // Sync eframe visibility state after native_show_window() was called
+        // from the listener thread. Without this, eframe/winit still thinks the
+        // window is invisible, so the next Visible(false) is a no-op.
+        if SYNC_VISIBLE.swap(false, Ordering::SeqCst) {
+            tracing::info!("[MainLoop] Syncing eframe visibility state after native show");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
+
         if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
             tracing::info!("[MainLoop] quit_requested={}, FORCE_QUIT={} — sending Close",
                 self.quit_requested, FORCE_QUIT.load(Ordering::SeqCst));
@@ -936,6 +953,10 @@ impl eframe::App for CampusNetApp {
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                // Also native hide to ensure symmetry with native_show_window()
+                if let Some(&hwnd) = MAIN_HWND.get() {
+                    unsafe { ShowWindow(hwnd, SW_HIDE); }
+                }
             } else {
                 tracing::info!("[MainLoop] Close requested → real quit (minimize_to_tray=false)");
             }
