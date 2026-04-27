@@ -1,6 +1,6 @@
 # Campus Net Client
 
-基于 [srun](https://github.com/zu1k/srun) 协议的 Windows 桌面校园网认证客户端。
+基于 srun 协议的 Windows 桌面校园网认证客户端。
 
 ## 功能
 

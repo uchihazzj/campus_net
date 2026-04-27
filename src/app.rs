@@ -12,7 +12,7 @@ use crate::platform::secure_store;
 use crate::service::auth;
 use crate::service::config::{write_config, StoredUser};
 
-use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState};
+use crate::service::{Ipv4InternetStatus, LoginState, SharedState};
 use crate::ui::l10n::{self, Lang, UiText};
 
 fn create_tray_icon_rgba() -> Icon {
@@ -187,19 +187,11 @@ impl CampusNetApp {
         ui.horizontal(|ui| {
             ui.heading(RichText::new(t.window_title).size(20.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let (campus_ip, auth_server, campus_auth, ipv4_internet, online_count, total) = {
+                let (campus_ip, ipv4_internet) = {
                     let s = self.state.lock().unwrap();
-                    let online = s.user_statuses
-                        .iter()
-                        .filter(|us| us.state == LoginState::Online)
-                        .count();
                     (
                         s.campus_ip.clone(),
-                        s.auth_server.clone(),
-                        s.campus_auth.clone(),
                         s.ipv4_internet.clone(),
-                        online,
-                        s.config.users.len(),
                     )
                 };
 
@@ -207,22 +199,6 @@ impl CampusNetApp {
                 let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
                 let ip_color = if campus_ip.is_some() { Color32::GREEN } else { Color32::GRAY };
                 ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
-
-                // Auth Server
-                let (srv_color, srv_text) = match auth_server {
-                    AuthServerStatus::Reachable => (Color32::GREEN, t.auth_server_reachable),
-                    AuthServerStatus::Unreachable => (Color32::RED, t.auth_server_unreachable),
-                    AuthServerStatus::Unknown => (Color32::GRAY, t.auth_server_unknown),
-                };
-                ui.colored_label(srv_color, format!("{} {}", t.auth_server_label, srv_text));
-
-                // Campus Auth
-                let (auth_color, auth_text) = match campus_auth {
-                    CampusAuthStatus::LoggedIn => (Color32::GREEN, t.campus_auth_logged_in),
-                    CampusAuthStatus::NotLoggedIn => (Color32::RED, t.campus_auth_not_logged_in),
-                    CampusAuthStatus::Unknown => (Color32::GRAY, t.campus_auth_unknown),
-                };
-                ui.colored_label(auth_color, format!("{} {}", t.campus_auth_label, auth_text));
 
                 // IPv4 Internet
                 let (inet_color, inet_text) = match ipv4_internet {
@@ -233,9 +209,6 @@ impl CampusNetApp {
                     Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
                 };
                 ui.colored_label(inet_color, format!("{} {}", t.ipv4_internet_label, inet_text));
-
-                // User count
-                ui.label(format!("{} {}/{}", t.online_count, online_count, total));
             });
         });
         ui.separator();

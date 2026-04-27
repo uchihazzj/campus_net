@@ -344,7 +344,8 @@ impl SrunClient {
         let time_str = self.time.to_string();
 
         let mut result = PortalResponse::default();
-        for ti in 1..=self.retry_times {
+        let retries = if self.retry_times == 0 { 1 } else { self.retry_times };
+        for ti in 1..=retries {
             let client = build_http_client(self.strict_bind, &self.ip)?;
             let url = format!("{}{}", self.auth_server, PATH_PORTAL);
             let query = [
@@ -370,7 +371,7 @@ impl SrunClient {
                 tracing::info!(
                     "Login success: attempt {}/{} access_token={}",
                     ti,
-                    self.retry_times,
+                    retries,
                     result.access_token
                 );
                 return Ok(());
@@ -379,7 +380,7 @@ impl SrunClient {
             tracing::warn!(
                 "Login attempt {}/{} failed: {}",
                 ti,
-                self.retry_times,
+                retries,
                 result.error_msg
             );
             tokio::time::sleep(Duration::from_millis(self.retry_delay as u64)).await;
