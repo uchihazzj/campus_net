@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use crate::service::auth::do_login;
-use crate::service::detection::{check_auth_status, check_ipv4_reachability, detect_campus_ip, CampusAuthStatus};
-use crate::service::{Ipv4InternetStatus, LoginState, SharedState};
+use crate::service::detection::{
+    check_auth_server, check_auth_status, check_ipv4_reachability, detect_campus_ip,
+};
+use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState};
 
 const BASE_INTERVAL_SECS: u64 = 15;
 const MAX_BACKOFF_SECS: u64 = 300;
@@ -22,9 +24,9 @@ pub fn spawn_monitor(state: SharedState) {
                 s.campus_ip = campus_ipv4.clone();
             }
 
-            // No campus IPv4 → skip detection and auto-reconnect
             if campus_ipv4.is_none() {
                 let mut s = state.lock().unwrap();
+                s.auth_server = AuthServerStatus::Unknown;
                 s.campus_auth = CampusAuthStatus::Unknown;
                 s.ipv4_internet = Ipv4InternetStatus::Checking;
                 backoff_secs = BASE_INTERVAL_SECS;
@@ -32,19 +34,40 @@ pub fn spawn_monitor(state: SharedState) {
             }
             let ip = campus_ipv4.as_deref();
 
-            // ── Layer 2: Campus Auth ────────────────────
+            // ── Layer 2: Auth Server Reachability ───────
+            let server = {
+                let s = state.lock().unwrap();
+                s.config.server.clone()
+            };
+            let auth_server = check_auth_server(&server, ip).await;
+            {
+                let mut s = state.lock().unwrap();
+                if s.auth_server != auth_server {
+                    s.add_log(format!(
+                        "[INFO] Auth server {}: {:?}",
+                        server, auth_server
+                    ));
+                }
+                s.auth_server = auth_server;
+            }
+
+            // ── Layer 3: Captive Portal Probe (Auth Status)
             let auth_status = check_auth_status(ip).await;
             {
                 let mut s = state.lock().unwrap();
                 s.campus_auth = auth_status.clone();
             }
 
-            // ── Layer 3: IPv4 Internet ──────────────────
+            // ── Layer 4: IPv4 Internet ──────────────────
             let ipv4_status = check_ipv4_reachability(ip).await;
             {
                 let mut s = state.lock().unwrap();
                 if matches!(ipv4_status, Ipv4InternetStatus::Reachable) {
+                    s.internet_fail_count = 0;
                     s.ipv4_internet = Ipv4InternetStatus::Reachable;
+                } else if matches!(ipv4_status, Ipv4InternetStatus::CaptivePortal) {
+                    s.internet_fail_count = 0;
+                    s.ipv4_internet = Ipv4InternetStatus::CaptivePortal;
                 } else {
                     s.internet_fail_count += 1;
                     if s.internet_fail_count >= FAILURE_THRESHOLD {
@@ -70,7 +93,7 @@ pub fn spawn_monitor(state: SharedState) {
                 )
             };
 
-            if !auto_reconnect {
+            if !auto_reconnect || online_indices.is_empty() {
                 backoff_secs = BASE_INTERVAL_SECS;
                 continue;
             }
@@ -78,29 +101,27 @@ pub fn spawn_monitor(state: SharedState) {
             let mut should_reconnect = false;
             let mut log_msg = String::new();
 
-            // Case 1: Campus auth not logged in → re-login
-            if auth == CampusAuthStatus::NotLoggedIn && !online_indices.is_empty() {
+            // Only reconnect when auth status is definitively NotLoggedIn
+            if auth == CampusAuthStatus::NotLoggedIn {
                 let mut s = state.lock().unwrap();
                 s.auth_fail_count += 1;
                 if s.auth_fail_count >= FAILURE_THRESHOLD {
                     s.auth_fail_count = 0;
-                    log_msg = "[WARN] Campus auth lost, reconnecting...".to_string();
+                    log_msg = "[WARN] Campus auth lost (NotLoggedIn), reconnecting...".to_string();
                     should_reconnect = true;
                 }
-            }
-
-            // Case 2: Logged in but IPv4 internet unreachable
-            if !should_reconnect
-                && auth == CampusAuthStatus::LoggedIn
-                && !online_indices.is_empty()
+            } else if auth == CampusAuthStatus::LoggedIn
                 && matches!(inet, Ipv4InternetStatus::Unreachable)
                 && fail_count >= FAILURE_THRESHOLD
             {
                 let mut s = state.lock().unwrap();
                 s.internet_fail_count = 0;
-                log_msg = "[WARN] IPv4 internet lost, reconnecting...".to_string();
+                log_msg = "[WARN] IPv4 internet unreachable despite LoggedIn, reconnecting...".to_string();
                 should_reconnect = true;
             }
+
+            // Do NOT reconnect when auth is Unknown — we can't determine state.
+            // Wait for the next detection cycle.
 
             if should_reconnect {
                 {
@@ -110,14 +131,15 @@ pub fn spawn_monitor(state: SharedState) {
                 for idx in &online_indices {
                     do_login(state.clone(), *idx).await;
                 }
-                // Check if any came back online
                 let success = {
                     let s = state.lock().unwrap();
                     online_indices.iter().any(|&i| {
-                        s.user_statuses.get(i).map(|us| us.state == LoginState::Online).unwrap_or(false)
+                        s.user_statuses
+                            .get(i)
+                            .map(|us| us.state == LoginState::Online)
+                            .unwrap_or(false)
                     })
                 };
-                // Backoff: double on failure, reset on success
                 if success {
                     backoff_secs = BASE_INTERVAL_SECS;
                 } else {

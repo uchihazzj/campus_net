@@ -2,9 +2,9 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use crate::core::utils::get_network_interfaces;
-use crate::service::Ipv4InternetStatus;
+use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 
-// ── Campus IPv4 Detection ──────────────────────────────────────────
+// ── Campus IPv4 ────────────────────────────────────────────────────
 
 pub fn detect_campus_ip() -> Option<String> {
     get_network_interfaces()
@@ -14,19 +14,20 @@ pub fn detect_campus_ip() -> Option<String> {
         .find(|ip| ip.starts_with("10."))
 }
 
-// ── Campus Auth Status ─────────────────────────────────────────────
+// ── Auth Server Reachability ───────────────────────────────────────
+// Only reflects whether the configured Srun auth server (e.g.
+// http://10.0.0.55) is reachable. Does NOT probe the public internet.
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum CampusAuthStatus {
-    LoggedIn,
-    NotLoggedIn,
-    ServerUnreachable,
-    Unknown,
-}
+/// Probe the actual Srun auth server by calling its /cgi-bin/get_challenge
+/// endpoint. Any HTTP response (including JSON error) counts as reachable.
+/// Only a TCP connection failure means the server is unreachable.
+pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthServerStatus {
+    let server = crate::core::srun::SrunClient::normalize_server_url(server);
+    if server.is_empty() {
+        tracing::warn!("[AuthServer] No server URL configured");
+        return AuthServerStatus::Unknown;
+    }
 
-/// Check campus auth by sending an HTTP request via the campus IPv4 interface.
-/// Binds to `campus_ipv4` to force IPv4, avoiding IPv6 false-positive.
-pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
@@ -36,43 +37,143 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
         .no_deflate()
         .no_proxy();
 
-    if let Some(ip) = campus_ipv4 {
+    let bound = if let Some(ip) = campus_ipv4 {
         if let Ok(addr) = ip.parse::<Ipv4Addr>() {
             builder = builder.local_address(std::net::IpAddr::V4(addr));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("[AuthServer] Failed to build client: {}", e);
+            return AuthServerStatus::Unknown;
+        }
+    };
+
+    let url = format!("{}/cgi-bin/get_challenge", server);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+
+    tracing::info!(
+        "[AuthServer] Probing: url={} campus_ipv4={:?} bound={}",
+        url, campus_ipv4, bound
+    );
+
+    match client.get(&url).query(&[("callback", "sdu"), ("_", &ts)]).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            tracing::info!(
+                "[AuthServer] Reachable: status={} campus_ipv4={:?}",
+                status.as_u16(),
+                campus_ipv4
+            );
+            AuthServerStatus::Reachable
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[AuthServer] Unreachable: error={} url={} campus_ipv4={:?} bound={}",
+                e, url, campus_ipv4, bound
+            );
+            AuthServerStatus::Unreachable
         }
     }
+}
+
+// ── Captive Portal Probe (Auth Status) ─────────────────────────────
+// Determines login state by detecting whether the campus gateway
+// redirects HTTP requests to the portal login page.
+// This is NOT an auth server check — it's a captive portal probe.
+// If the probe itself fails, the result is Unknown, not "server unreachable".
+
+/// Check login status via captive portal probe: send an HTTP request to an
+/// external URL. If the campus gateway redirects to the portal → NotLoggedIn.
+/// If the request succeeds without redirect → LoggedIn.
+/// If the probe fails entirely (DNS, timeout, etc.) → Unknown.
+pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .no_brotli()
+        .no_gzip()
+        .no_deflate()
+        .no_proxy();
+
+    let bound = if let Some(ip) = campus_ipv4 {
+        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+            builder = builder.local_address(std::net::IpAddr::V4(addr));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
 let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("Failed to build auth check client: {}", e);
+            tracing::warn!("[CaptiveProbe] Failed to build client: {}", e);
             return CampusAuthStatus::Unknown;
         }
     };
+
+    // Use a well-known HTTP URL. The campus gateway will redirect to the
+    // portal if not logged in.
+    tracing::info!(
+        "[CaptiveProbe] Probing http://www.baidu.com campus_ipv4={:?} bound={}",
+        campus_ipv4, bound
+    );
 
     match client.get("http://www.baidu.com").send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
+                tracing::info!("[CaptiveProbe] LoggedIn: status={}", status.as_u16());
                 return CampusAuthStatus::LoggedIn;
             }
             if status.is_redirection() {
-                if let Some(location) = resp
+                let location = resp
                     .headers()
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
-                {
-                    if is_portal_url(location) {
-                        return CampusAuthStatus::NotLoggedIn;
-                    }
+                    .unwrap_or("(missing)");
+                if is_portal_url(location) {
+                    tracing::info!(
+                        "[CaptiveProbe] NotLoggedIn: portal redirect location={}",
+                        location
+                    );
+                    return CampusAuthStatus::NotLoggedIn;
                 }
+                // Non-portal redirect (e.g., http→https upgrade) → logged in
+                tracing::info!(
+                    "[CaptiveProbe] LoggedIn (non-portal redirect): status={} location={}",
+                    status.as_u16(), location
+                );
                 return CampusAuthStatus::LoggedIn;
             }
+            tracing::info!(
+                "[CaptiveProbe] Unknown: unexpected status={}",
+                status.as_u16()
+            );
             CampusAuthStatus::Unknown
         }
         Err(e) => {
-            tracing::debug!("Auth check request failed: {}", e);
-            CampusAuthStatus::ServerUnreachable
+            // Probe failed — NOT "server unreachable"
+            tracing::warn!(
+                "[CaptiveProbe] Probe failed (Unknown): error={} campus_ipv4={:?} bound={}",
+                e, campus_ipv4, bound
+            );
+            CampusAuthStatus::Unknown
         }
     }
 }
@@ -93,41 +194,81 @@ fn is_portal_url(url: &str) -> bool {
 struct ReachabilityCheck {
     url: &'static str,
     success: SuccessCondition,
+    /// Prefer this endpoint for unbound fallback (more stable domestically)
+    preferred: bool,
 }
 
 enum SuccessCondition {
-    Status(u16),
     Status200MinLen(usize),
     Status204,
 }
 
+/// Ordered by domestic stability. Preferred endpoints tried first in unbound fallback.
 static REACHABILITY_CHECKS: &[ReachabilityCheck] = &[
     ReachabilityCheck {
-        url: "https://www.baidu.com",
+        url: "http://www.baidu.com",
         success: SuccessCondition::Status200MinLen(1000),
-    },
-    ReachabilityCheck {
-        url: "http://cp.cloudflare.com/",
-        success: SuccessCondition::Status200MinLen(0),
-    },
-    ReachabilityCheck {
-        url: "http://www.gstatic.com/generate_204",
-        success: SuccessCondition::Status204,
+        preferred: true,
     },
     ReachabilityCheck {
         url: "http://connect.rom.miui.com/generate_204",
         success: SuccessCondition::Status204,
+        preferred: true,
+    },
+    ReachabilityCheck {
+        url: "http://www.msftconnecttest.com/connecttest.txt",
+        success: SuccessCondition::Status200MinLen(0),
+        preferred: false,
+    },
+    ReachabilityCheck {
+        url: "http://cp.cloudflare.com/",
+        success: SuccessCondition::Status200MinLen(0),
+        preferred: false,
     },
 ];
 
-/// Check IPv4 internet reachability by forcing the HTTP client to bind
-/// to the campus IPv4 address. This ensures the traffic goes over IPv4
-/// and is not routed via IPv6 (which may be unfiltered).
+/// Check IPv4 internet reachability.
 ///
-/// Returns `Ipv4InternetStatus::Reachable` if any check URL succeeds,
-/// `CaptivePortal` if a portal redirect is detected,
-/// `Unreachable` if all checks fail.
+/// Strategy:
+/// 1. Bound probe: bind client to campus_ipv4 via local_address.
+/// 2. If all bound probes fail, attempt unbound IPv4 probe as fallback.
+/// 3. Log every endpoint result for diagnostics.
+///
+/// Returns `ProbeFailed` if the client can't be built at all.
 pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetStatus {
+    // ── Bound probe ────────────────────────────────────
+    if let Some(ip) = campus_ipv4 {
+        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+            let bound_result = run_reachability_probes(Some(addr)).await;
+            match bound_result {
+                Ipv4InternetStatus::Reachable | Ipv4InternetStatus::CaptivePortal => {
+                    return bound_result;
+                }
+                _ => {
+                    tracing::warn!(
+                        "[IPv4] Bound probe failed (campus_ipv4={}), trying unbound fallback...",
+                        ip
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Unbound fallback ───────────────────────────────
+    // Try without local_address, preferring domestic endpoints.
+    // Request still goes over whatever route the system chooses;
+    // in a dual-stack environment this may go over IPv6, so a
+    // "Reachable" here is less trustworthy.
+    tracing::info!("[IPv4] Running unbound fallback probe...");
+    let unbound_result = run_reachability_probes(None).await;
+    if matches!(unbound_result, Ipv4InternetStatus::Reachable) {
+        tracing::info!("[IPv4] Unbound probe succeeded (may have used IPv6!)");
+    }
+    unbound_result
+}
+
+/// Run the full set of reachability checks with an optional local_address binding.
+async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStatus {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
@@ -137,52 +278,75 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
         .no_deflate()
         .no_proxy();
 
-    // Force IPv4 by binding to the campus IPv4 address
-    if let Some(ip) = campus_ipv4 {
-        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-            builder = builder.local_address(std::net::IpAddr::V4(addr));
-        }
-    }
+    let bound = if let Some(addr) = local_v4 {
+        builder = builder.local_address(std::net::IpAddr::V4(addr));
+        true
+    } else {
+        false
+    };
 
-    let client = match builder.build() {
+let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("Failed to build IPv4 check client: {}", e);
-            return Ipv4InternetStatus::Unreachable;
+            tracing::warn!("[IPv4] Failed to build client: {} bound={}", e, bound);
+            return Ipv4InternetStatus::ProbeFailed;
         }
     };
 
+    let mut last_error = String::new();
+
     for check in REACHABILITY_CHECKS {
-        match try_reachability_check(&client, check).await {
-            Ok(()) => return Ipv4InternetStatus::Reachable,
-            Err(CheckError::CaptivePortal) => return Ipv4InternetStatus::CaptivePortal,
-            Err(CheckError::Failed) => continue,
+        match try_single_check(&client, check).await {
+            Ok(()) => {
+                tracing::info!(
+                    "[IPv4] Reachable via: {} bound={}",
+                    check.url, bound
+                );
+                return Ipv4InternetStatus::Reachable;
+            }
+            Err(CheckError::CaptivePortal { url, location }) => {
+                tracing::info!(
+                    "[IPv4] CaptivePortal: {} → location={} bound={}",
+                    url, location, bound
+                );
+                return Ipv4InternetStatus::CaptivePortal;
+            }
+            Err(CheckError::Failed { url, detail }) => {
+                tracing::debug!(
+                    "[IPv4] Failed: {} detail={} bound={}",
+                    url, detail, bound
+                );
+                last_error = format!("{}: {}", url, detail);
+            }
         }
     }
 
+    tracing::warn!(
+        "[IPv4] All probes failed. last_error={} bound={}",
+        last_error, bound
+    );
     Ipv4InternetStatus::Unreachable
 }
 
 enum CheckError {
-    CaptivePortal,
-    Failed,
+    CaptivePortal { url: &'static str, location: String },
+    Failed { url: &'static str, detail: String },
 }
 
-async fn try_reachability_check(
+async fn try_single_check(
     client: &reqwest::Client,
     check: &ReachabilityCheck,
 ) -> Result<(), CheckError> {
-    let resp = client
-        .get(check.url)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::debug!("IPv4 check {} failed: {}", check.url, e);
-            CheckError::Failed
-        })?;
+    let resp = client.get(check.url).send().await.map_err(|e| {
+        CheckError::Failed {
+            url: check.url,
+            detail: format!("request error: {}", e),
+        }
+    })?;
 
     let status = resp.status();
 
+    // Check for captive portal redirect
     if status.is_redirection() {
         if let Some(location) = resp
             .headers()
@@ -190,39 +354,48 @@ async fn try_reachability_check(
             .and_then(|v| v.to_str().ok())
         {
             if is_portal_url(location) {
-                return Err(CheckError::CaptivePortal);
+                return Err(CheckError::CaptivePortal {
+                    url: check.url,
+                    location: location.to_string(),
+                });
             }
         }
     }
 
     match check.success {
-        SuccessCondition::Status(expected) => {
-            if status.as_u16() == expected {
-                Ok(())
-            } else {
-                Err(CheckError::Failed)
-            }
-        }
         SuccessCondition::Status204 => {
             if status.as_u16() == 204 {
                 Ok(())
             } else {
-                Err(CheckError::Failed)
+                Err(CheckError::Failed {
+                    url: check.url,
+                    detail: format!("expected 204, got {}", status.as_u16()),
+                })
             }
         }
         SuccessCondition::Status200MinLen(min_len) => {
             if !status.is_success() {
-                return Err(CheckError::Failed);
+                return Err(CheckError::Failed {
+                    url: check.url,
+                    detail: format!("expected 200, got {}", status.as_u16()),
+                });
             }
             if min_len == 0 {
                 return Ok(());
             }
-            let body = resp.bytes().await.map_err(|_| CheckError::Failed)?;
+            let body = resp.bytes().await.map_err(|e| {
+                CheckError::Failed {
+                    url: check.url,
+                    detail: format!("body read error: {}", e),
+                }
+            })?;
             if body.len() >= min_len {
                 Ok(())
             } else {
-                tracing::debug!("{} body too short: {} < {}", check.url, body.len(), min_len);
-                Err(CheckError::Failed)
+                Err(CheckError::Failed {
+                    url: check.url,
+                    detail: format!("body too short: {} < {}", body.len(), min_len),
+                })
             }
         }
     }
@@ -238,6 +411,13 @@ mod tests {
     fn test_detect_campus_ip() {
         let ip = detect_campus_ip();
         println!("Campus IPv4: {:?}", ip);
+    }
+
+    #[tokio::test]
+    async fn test_check_auth_server() {
+        let ip = detect_campus_ip();
+        let status = check_auth_server("http://10.0.0.55", ip.as_deref()).await;
+        println!("Auth server: {:?}", status);
     }
 
     #[tokio::test]
