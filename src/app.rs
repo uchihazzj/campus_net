@@ -683,10 +683,23 @@ impl CampusNetApp {
                 changed = true;
             }
 
+            let old_interval = monitor_interval;
             ui.label(t.label_monitor_interval);
-            changed |= ui
-                .add(egui::DragValue::new(&mut monitor_interval).range(10..=3600))
+            let interval_changed = ui
+                .add(
+                    egui::DragValue::new(&mut monitor_interval)
+                        .range(15..=300)
+                        .suffix(format!(" {}", t.seconds_unit)),
+                )
                 .changed();
+            if interval_changed && monitor_interval != old_interval {
+                let mut s = self.state.lock().unwrap();
+                s.add_log(format!(
+                    "[INFO] Network check interval changed to {}s",
+                    monitor_interval
+                ));
+            }
+            changed |= interval_changed;
 
             if changed {
                 {

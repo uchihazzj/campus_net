@@ -113,15 +113,15 @@ Layer 2、Layer 3 和 Layer 4 的 HTTP 客户端通过 `reqwest::ClientBuilder::
 
 ### 自动重连逻辑
 
-- 检测间隔：**15 秒**（基础）
+- 检测间隔：默认 **30 秒**，通过 UI 可配置范围 15–300 秒
 - 无校园网 IPv4 时：**不自动重连**
 - 触发条件（任一满足且连续 2 次确认）：
   - `IPv4 Internet` 为 `CaptivePortal`（IPv4 被门户劫持）
   - `Campus Auth` 为 `NotLoggedIn`（认证已丢失）
   - `LoggedIn` 但 `IPv4 Internet` 为 `Unreachable`（已登录但外网不通）
 - 重连目标：首次检测到问题时快照所有 Online 用户；若没有 Online 用户则重连全部配置的用户
-- 重连失败后采用**指数退避**：15s → 30s → 60s → 120s → 240s → 300s（最大）
-- 重连成功后重置为 15s，清空重连目标
+- 重连失败后采用**指数退避**：从当前检测间隔开始翻倍，最大 300s
+- 重连成功后重置为当前检测间隔，清空重连目标
 
 ## 编译
 
@@ -199,7 +199,7 @@ cargo build --release
 | `name` | string | `Windows` | 上报给认证服务器的设备名 |
 | `retry_delay` | int | `1000` | 登录重试间隔（毫秒） |
 | `retry_times` | int | `3` | 登录重试次数 |
-| `monitor_interval_secs` | int | `30` | 监控检测间隔（秒），当前实现固定 15 秒 |
+| `monitor_interval_secs` | int | `30` | 网络检测间隔（秒），范围 15–300，通过 UI 设置面板调整 |
 | `auto_reconnect` | bool | `true` | 断网自动重连 |
 | `minimize_to_tray` | bool | `true` | 关闭窗口时最小化到托盘 |
 | `auto_start` | bool | `true` | 开机自启 |

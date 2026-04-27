@@ -6,16 +6,28 @@ use crate::service::detection::{
 };
 use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState};
 
-const BASE_INTERVAL_SECS: u64 = 15;
+const MIN_INTERVAL_SECS: u64 = 15;
+const MAX_INTERVAL_SECS: u64 = 300;
 const MAX_BACKOFF_SECS: u64 = 300;
 const FAILURE_THRESHOLD: u32 = 2;
 
 pub fn spawn_monitor(state: SharedState) {
     tokio::spawn(async move {
-        let mut backoff_secs = BASE_INTERVAL_SECS;
+        let initial_interval = {
+            let mut s = state.lock().unwrap();
+            let iv = s.config.monitor_interval_secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
+            s.add_log(format!("[INFO] Network monitor interval: {}s", iv));
+            iv
+        };
+        let mut backoff_secs = initial_interval;
 
         loop {
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+
+            let interval = {
+                let s = state.lock().unwrap();
+                s.config.monitor_interval_secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS)
+            };
 
             // ── Layer 1: Campus IPv4 ────────────────────
             let campus_ipv4 = detect_campus_ip();
@@ -31,7 +43,7 @@ pub fn spawn_monitor(state: SharedState) {
                 s.ipv4_internet = Ipv4InternetStatus::Checking;
                 s.internet_fail_count = 0;
                 s.reconnect_targets.clear();
-                backoff_secs = BASE_INTERVAL_SECS;
+                backoff_secs = interval;
                 continue;
             }
             let ip = campus_ipv4.as_deref();
@@ -103,7 +115,7 @@ pub fn spawn_monitor(state: SharedState) {
             };
 
             if !auto_reconnect {
-                backoff_secs = BASE_INTERVAL_SECS;
+                backoff_secs = interval;
                 continue;
             }
 
@@ -163,7 +175,7 @@ pub fn spawn_monitor(state: SharedState) {
                         do_login(state.clone(), *idx).await;
                     }
                 }
-                backoff_secs = BASE_INTERVAL_SECS;
+                backoff_secs = interval;
                 continue;
             }
 
@@ -230,7 +242,7 @@ pub fn spawn_monitor(state: SharedState) {
                     let mut s = state.lock().unwrap();
                     s.reconnect_targets.clear();
                     s.add_log("[OK] Auto-reconnect succeeded".to_string());
-                    backoff_secs = BASE_INTERVAL_SECS;
+                    backoff_secs = interval;
                 } else {
                     let mut s = state.lock().unwrap();
                     s.add_log(format!(
@@ -250,7 +262,7 @@ pub fn spawn_monitor(state: SharedState) {
                         ));
                     }
                 }
-                backoff_secs = BASE_INTERVAL_SECS;
+                backoff_secs = interval;
             }
         }
     });
