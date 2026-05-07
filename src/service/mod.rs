@@ -25,6 +25,7 @@ pub fn request_ui_repaint() {
 pub mod auth;
 pub mod config;
 pub mod detection;
+pub mod http_client;
 pub mod monitor;
 pub mod online_info;
 pub mod update;
@@ -100,7 +101,6 @@ pub struct AppState {
     pub campus_auth: CampusAuthStatus,
     pub ipv4_internet: Ipv4InternetStatus,
     // Consecutive failure counters
-    pub auth_fail_count: u32,
     pub internet_fail_count: u32,
     /// User indices to reconnect on next auto-reconnect cycle.
     /// Populated on first trouble detection, cleared on success
@@ -110,6 +110,12 @@ pub struct AppState {
     pub online_info: Option<OnlineUserInfo>,
     /// Consecutive failures of rad_user_info query (request timeout, parse error).
     pub online_info_fail_count: u32,
+    /// True when rad_user_info query has failed at least once since last success.
+    /// The last online_info is preserved but may not reflect current server state.
+    pub online_info_stale: bool,
+    /// True after user manually logs out. Suppresses auto-reconnect until user
+    /// manually logs in. Not persisted to config — runtime-only.
+    pub suppress_auto_reconnect: bool,
     pub update_status: UpdateStatus,
 }
 
@@ -129,11 +135,12 @@ impl AppState {
             } else {
                 Ipv4InternetStatus::Disabled
             },
-            auth_fail_count: 0,
             internet_fail_count: 0,
             reconnect_targets: Vec::new(),
             online_info: None,
             online_info_fail_count: 0,
+            online_info_stale: false,
+            suppress_auto_reconnect: false,
             update_status: UpdateStatus::Idle,
         }
     }

@@ -1,4 +1,3 @@
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -46,24 +45,12 @@ pub async fn fetch_online_user_info(
         return Err("No server URL configured".to_string());
     }
 
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .no_brotli()
-        .no_gzip()
-        .no_deflate()
-        .no_proxy();
-
-    if let Some(ip) = campus_ipv4 {
-        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-            builder = builder.local_address(std::net::IpAddr::V4(addr));
-        }
-    }
-
-    let client = builder
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let (client, _bound) = crate::service::http_client::build_probe_client(
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        campus_ipv4,
+    )
+    .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     let url = format!("{}/cgi-bin/rad_user_info", server);
     let ts = std::time::SystemTime::now()
@@ -137,6 +124,7 @@ pub async fn sync_online_state(state: &SharedState) {
             s.campus_auth = CampusAuthStatus::LoggedIn;
             s.online_info = Some(info.clone());
             s.online_info_fail_count = 0;
+            s.online_info_stale = false;
 
             // Match online user_name to local configured users.
             // Collect usernames first to avoid borrowing s.config and
@@ -177,6 +165,7 @@ pub async fn sync_online_state(state: &SharedState) {
             s.campus_auth = CampusAuthStatus::NotLoggedIn;
             s.online_info = None;
             s.online_info_fail_count = 0;
+            s.online_info_stale = false;
 
             // Invalidate users that were marked Online
             for us in &mut s.user_statuses {
@@ -193,6 +182,7 @@ pub async fn sync_online_state(state: &SharedState) {
             let (_fail_count, degraded) = {
                 let mut s = state.lock().unwrap();
                 s.online_info_fail_count += 1;
+                s.online_info_stale = true;
                 let fc = s.online_info_fail_count;
                 if fc <= 2 {
                     s.add_log(format!(
@@ -296,6 +286,7 @@ pub fn spawn_startup_tasks(state: SharedState) {
                 );
                 {
                     let mut s = state.lock().unwrap();
+                    s.suppress_auto_reconnect = false;
                     s.add_log("[INFO] Auto-login on startup...".to_string());
                 }
                 crate::service::request_ui_repaint();

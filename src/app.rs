@@ -161,18 +161,6 @@ pub struct CampusNetApp {
     cached_lang: Lang,
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const GB: u64 = 1_073_741_824;
-    const MB: u64 = 1_048_576;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 impl CampusNetApp {
     pub fn new(state: SharedState) -> Self {
         let lang = {
@@ -495,15 +483,20 @@ impl CampusNetApp {
                         ui.colored_label(Color32::GREEN, "●");
                         ui.label(RichText::new(t.status_online).color(Color32::GREEN));
                         // Show "✓ Confirmed" when server confirms this user
-                        let confirmed = {
+                        let (confirmed, stale) = {
                             let s = self.state.lock().unwrap();
-                            s.online_info
+                            let c = s
+                                .online_info
                                 .as_ref()
                                 .map(|info| info.user_name == username)
-                                .unwrap_or(false)
+                                .unwrap_or(false);
+                            (c, s.online_info_stale)
                         };
                         if confirmed {
                             ui.colored_label(Color32::GREEN, t.campus_auth_confirmed);
+                            if stale {
+                                ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
+                            }
                         }
                     }
                     LoginState::LoggingIn => {
@@ -615,7 +608,7 @@ impl CampusNetApp {
                     ui.label(format!(
                         "{} {}",
                         t.remain_traffic_label,
-                        format_bytes(info.remain_bytes)
+                        crate::ui::format_bytes(info.remain_bytes)
                     ));
                 }
 
@@ -1167,35 +1160,7 @@ impl CampusNetApp {
 
     fn render_log(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        ui.collapsing(t.section_log, |ui| {
-            let log_msgs: Vec<String> = {
-                let s = self.state.lock().unwrap();
-                s.log_messages.clone()
-            };
-
-            let mut text = log_msgs.join("\n");
-
-            ScrollArea::vertical()
-                .max_height(200.0)
-                .auto_shrink([false; 2])
-                .stick_to_bottom(self.log_scroll_to_bottom)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
-                    );
-                });
-
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.log_scroll_to_bottom, t.opt_auto_scroll);
-                if ui.button(t.btn_clear).clicked() {
-                    let mut s = self.state.lock().unwrap();
-                    s.log_messages.clear();
-                }
-            });
-        });
+        crate::ui::log_panel::render_log_panel(&self.state, &mut self.log_scroll_to_bottom, ui, &t);
     }
 
     fn save_config(&self) -> anyhow::Result<()> {

@@ -28,27 +28,11 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
         return AuthServerStatus::Unknown;
     }
 
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(4))
-        .no_brotli()
-        .no_gzip()
-        .no_deflate()
-        .no_proxy();
-
-    let bound = if let Some(ip) = campus_ipv4 {
-        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-            builder = builder.local_address(std::net::IpAddr::V4(addr));
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    let client = match builder.build() {
+    let (client, bound) = match crate::service::http_client::build_probe_client(
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        campus_ipv4,
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[AuthServer] Failed to build client: {}", e);
@@ -109,27 +93,11 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
 /// If the request succeeds without redirect → LoggedIn.
 /// If the probe fails entirely (DNS, timeout, etc.) → Unknown.
 pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .no_brotli()
-        .no_gzip()
-        .no_deflate()
-        .no_proxy();
-
-    let bound = if let Some(ip) = campus_ipv4 {
-        if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-            builder = builder.local_address(std::net::IpAddr::V4(addr));
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    let client = match builder.build() {
+    let (client, bound) = match crate::service::http_client::build_probe_client(
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        campus_ipv4,
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[CaptiveProbe] Failed to build client: {}", e);
@@ -286,26 +254,19 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
 
 /// Run the full set of reachability checks with an optional local_address binding.
 async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStatus {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .no_brotli()
-        .no_gzip()
-        .no_deflate()
-        .no_proxy();
-
-    let bound = if let Some(addr) = local_v4 {
-        builder = builder.local_address(std::net::IpAddr::V4(addr));
-        true
-    } else {
-        false
-    };
-
-    let client = match builder.build() {
+    let ip_str = local_v4.map(|a| a.to_string());
+    let (client, bound) = match crate::service::http_client::build_probe_client(
+        Duration::from_secs(2),
+        Duration::from_secs(3),
+        ip_str.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("[IPv4] Failed to build client: {} bound={}", e, bound);
+            tracing::warn!(
+                "[IPv4] Failed to build client: {} bound={}",
+                e,
+                local_v4.is_some()
+            );
             return Ipv4InternetStatus::ProbeFailed;
         }
     };

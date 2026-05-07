@@ -69,6 +69,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         let uname = s.config.users[user_idx].username.clone();
         s.user_statuses[user_idx].state = LoginState::LoggingIn;
         s.user_statuses[user_idx].last_error.clear();
+        s.suppress_auto_reconnect = false;
         s.add_log(format!("[INFO] {}: Logging in...", uname));
     }
 
@@ -185,6 +186,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
                     s.user_statuses[user_idx].state = LoginState::LoggedOut;
                     s.user_statuses[user_idx].current_ip.clear();
                     s.reconnect_targets.retain(|&i| i != user_idx);
+                    s.suppress_auto_reconnect = true;
                     s.add_log(format!("[OK] {}: Logout success", uname));
                 }
             }
@@ -247,6 +249,7 @@ pub async fn do_one_click_login(state: SharedState) {
 
     {
         let mut s = state.lock().unwrap();
+        s.suppress_auto_reconnect = false;
         s.add_log("[INFO] One-click login: starting...".to_string());
     }
     crate::service::request_ui_repaint();
@@ -405,6 +408,7 @@ pub async fn do_one_click_logout(state: SharedState) {
     tracing::info!("[OneClickLogout] Completed");
     {
         let mut s = state.lock().unwrap();
+        s.suppress_auto_reconnect = true;
         s.add_log("[OK] One-click logout: completed".to_string());
     }
     crate::service::request_ui_repaint();
