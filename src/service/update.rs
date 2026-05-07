@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::service::SharedState;
@@ -122,14 +123,14 @@ fn app_log(msg: &str) {
 
 /// Download the latest exe from GitHub, generate updater script, launch it, and exit.
 pub async fn perform_update(state: SharedState, version: String, download_url: String) {
+    let clean_ver = version.trim_start_matches('v');
+    let download_filename = format!("campus-net-client-v{}.exe", clean_ver);
+
     // ── Step 1: Download ────────────────────────────────
     {
         let mut s = state.lock().unwrap();
         s.update_status = UpdateStatus::Downloading;
-        s.add_log(format!(
-            "[INFO] Downloading campus-net-client-v{}.exe ...",
-            version
-        ));
+        s.add_log(format!("[INFO] Downloading {} ...", download_filename));
     }
     crate::service::request_ui_repaint();
 
@@ -145,8 +146,8 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
         }
     };
 
-    let download_path = dir.join(format!("campus-net-client-v{}.exe.download", version));
-    let final_path = dir.join(format!("campus-net-client-v{}.exe", version));
+    let download_path = dir.join(format!("{}.download", download_filename));
+    let final_path = dir.join(&download_filename);
 
     // Download the asset
     let client = match reqwest::Client::builder()
@@ -323,6 +324,7 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     {
         Ok(_) => {
             app_log("[INFO] Updater launched, exiting...");
+            crate::app::FORCE_QUIT.store(true, Ordering::SeqCst);
             std::process::exit(0);
         }
         Err(e) => {

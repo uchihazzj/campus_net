@@ -18,7 +18,7 @@ use crate::ui::l10n::{self, Lang, UiText};
 
 // ── Windows native window handle ───────────────────────
 static MAIN_HWND: OnceLock<isize> = OnceLock::new();
-static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+pub(crate) static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 /// Set by native_show_window() — signals the next update() to sync
 /// eframe's viewport visibility state via Visible(true). This is
 /// needed because native ShowWindow bypasses eframe/winit state tracking.
@@ -853,16 +853,7 @@ impl CampusNetApp {
                 release_url,
                 download_url,
             } => {
-                ui.colored_label(
-                    Color32::YELLOW,
-                    format!(
-                        "{} v{}  →  {} {}",
-                        t.version_label,
-                        env!("CARGO_PKG_VERSION"),
-                        t.update_available.replace("{}", ""),
-                        latest
-                    ),
-                );
+                ui.colored_label(Color32::YELLOW, t.update_available.replace("{}", latest));
                 ui.add_space(4.0);
 
                 if ui.button(t.btn_auto_update).clicked() {
@@ -879,11 +870,6 @@ impl CampusNetApp {
                         .args(["/c", "start", "", release_url.as_str()])
                         .spawn();
                 }
-
-                ui.hyperlink_to(
-                    format!("github.com/uchihazzj/campus_net/releases/tag/{}", latest),
-                    release_url.as_str(),
-                );
             }
             UpdateStatus::Downloading => {
                 ui.colored_label(Color32::YELLOW, t.update_downloading);
@@ -1148,7 +1134,10 @@ impl eframe::App for CampusNetApp {
                 let _ = self.save_config();
             }
 
-            let minimize = {
+            let force = FORCE_QUIT.load(Ordering::SeqCst);
+            let minimize = if force {
+                false
+            } else {
                 let s = self.state.lock().unwrap();
                 s.config.minimize_to_tray
             };
