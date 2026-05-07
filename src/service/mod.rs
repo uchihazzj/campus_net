@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service::config::AppConfig;
+pub use crate::service::update::UpdateStatus;
 
 // ── UI repaint signal ──────────────────────────────────
 // Stored egui::Context for triggering immediate repaints
@@ -24,6 +25,7 @@ pub mod auth;
 pub mod config;
 pub mod detection;
 pub mod monitor;
+pub mod update;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginState {
@@ -100,6 +102,7 @@ pub struct AppState {
     /// Populated on first trouble detection, cleared on success
     /// or when user manually logs out.
     pub reconnect_targets: Vec<usize>,
+    pub update_status: UpdateStatus,
 }
 
 impl AppState {
@@ -116,6 +119,7 @@ impl AppState {
             auth_fail_count: 0,
             internet_fail_count: 0,
             reconnect_targets: Vec::new(),
+            update_status: UpdateStatus::Idle,
         }
     }
 

@@ -13,7 +13,7 @@ use crate::platform::secure_store;
 use crate::service::auth;
 use crate::service::config::{write_config, StoredUser};
 
-use crate::service::{Ipv4InternetStatus, LoginState, SharedState};
+use crate::service::{Ipv4InternetStatus, LoginState, SharedState, UpdateStatus};
 use crate::ui::l10n::{self, Lang, UiText};
 
 // ── Windows native window handle ───────────────────────
@@ -742,6 +742,71 @@ impl CampusNetApp {
             });
     }
 
+    fn render_version_section(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let status = {
+            let s = self.state.lock().unwrap();
+            s.update_status.clone()
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(format!("{} v{}", t.version_label, env!("CARGO_PKG_VERSION")));
+
+            let is_checking = matches!(status, UpdateStatus::Checking);
+            if ui
+                .add_enabled(!is_checking, egui::Button::new(t.btn_check_update))
+                .clicked()
+            {
+                let state = self.state.clone();
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.update_status = UpdateStatus::Checking;
+                }
+                crate::service::request_ui_repaint();
+                tokio::spawn(async move {
+                    let result = crate::service::update::check_update().await;
+                    let mut s = state.lock().unwrap();
+                    match result {
+                        Ok(Some((latest, url))) => {
+                            s.update_status = UpdateStatus::Available { latest, url };
+                        }
+                        Ok(None) => {
+                            s.update_status = UpdateStatus::UpToDate;
+                        }
+                        Err(e) => {
+                            s.update_status = UpdateStatus::Failed(e);
+                        }
+                    }
+                    crate::service::request_ui_repaint();
+                });
+            }
+
+            match &status {
+                UpdateStatus::Idle => {}
+                UpdateStatus::Checking => {
+                    ui.colored_label(Color32::GRAY, t.update_checking);
+                }
+                UpdateStatus::UpToDate => {
+                    ui.colored_label(Color32::GREEN, t.update_up_to_date);
+                }
+                UpdateStatus::Available { latest, url } => {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        t.update_available.replace("{}", latest),
+                    );
+                    ui.add_space(4.0);
+                    ui.hyperlink_to(
+                        format!("github.com/uchihazzj/campus_net/releases/tag/{}", latest),
+                        url.as_str(),
+                    );
+                }
+                UpdateStatus::Failed(e) => {
+                    ui.colored_label(Color32::RED, format!("{}: {}", t.update_failed, e));
+                }
+            }
+        });
+    }
+
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.collapsing(t.section_settings, |ui| {
@@ -997,6 +1062,8 @@ impl eframe::App for CampusNetApp {
                         "https://github.com/uchihazzj/campus_net",
                     );
                 });
+                ui.add_space(4.0);
+                self.render_version_section(ui);
                 ui.add_space(8.0);
                 self.render_settings(ui);
                 ui.add_space(8.0);
