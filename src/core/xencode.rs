@@ -1,9 +1,9 @@
 use std::sync::LazyLock;
 
 use base64::{
-    Engine,
     alphabet::Alphabet,
     engine::{self, GeneralPurpose},
+    Engine,
 };
 
 const BASE64_ALPHABET: &str = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA";

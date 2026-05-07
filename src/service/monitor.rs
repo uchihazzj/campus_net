@@ -4,7 +4,9 @@ use crate::service::auth::do_login;
 use crate::service::detection::{
     check_auth_server, check_auth_status, check_ipv4_reachability, detect_campus_ip,
 };
-use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState};
+use crate::service::{
+    AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState,
+};
 
 const MIN_INTERVAL_SECS: u64 = 15;
 const MAX_INTERVAL_SECS: u64 = 300;
@@ -15,7 +17,10 @@ pub fn spawn_monitor(state: SharedState) {
     tokio::spawn(async move {
         let initial_interval = {
             let mut s = state.lock().unwrap();
-            let iv = s.config.monitor_interval_secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
+            let iv = s
+                .config
+                .monitor_interval_secs
+                .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
             s.add_log(format!("[INFO] Network monitor interval: {}s", iv));
             iv
         };
@@ -26,7 +31,9 @@ pub fn spawn_monitor(state: SharedState) {
 
             let interval = {
                 let s = state.lock().unwrap();
-                s.config.monitor_interval_secs.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS)
+                s.config
+                    .monitor_interval_secs
+                    .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS)
             };
 
             // ── Layer 1: Campus IPv4 ────────────────────
@@ -57,10 +64,7 @@ pub fn spawn_monitor(state: SharedState) {
             {
                 let mut s = state.lock().unwrap();
                 if s.auth_server != auth_server {
-                    s.add_log(format!(
-                        "[INFO] Auth server {}: {:?}",
-                        server, auth_server
-                    ));
+                    s.add_log(format!("[INFO] Auth server {}: {:?}", server, auth_server));
                 }
                 s.auth_server = auth_server;
             }
@@ -81,7 +85,10 @@ pub fn spawn_monitor(state: SharedState) {
                         s.internet_fail_count = 0;
                         s.ipv4_internet = Ipv4InternetStatus::Reachable;
                         if !s.reconnect_targets.is_empty() {
-                            s.add_log("[INFO] IPv4 internet restored, clearing reconnect targets".to_string());
+                            s.add_log(
+                                "[INFO] IPv4 internet restored, clearing reconnect targets"
+                                    .to_string(),
+                            );
                             s.reconnect_targets.clear();
                         }
                     }
@@ -129,7 +136,8 @@ pub fn spawn_monitor(state: SharedState) {
                         || matches!(inet, Ipv4InternetStatus::ProbeFailed)
                         || auth == CampusAuthStatus::NotLoggedIn;
                     if trouble {
-                        let targets: Vec<usize> = s.user_statuses
+                        let targets: Vec<usize> = s
+                            .user_statuses
                             .iter()
                             .enumerate()
                             .filter(|(_, us)| us.state == LoginState::Online)
@@ -211,7 +219,8 @@ pub fn spawn_monitor(state: SharedState) {
             let mut log_msg = String::new();
 
             // Case 1: CaptivePortal detected → IPv4 hijacked by portal, need re-login
-            if matches!(inet, Ipv4InternetStatus::CaptivePortal) && fail_count >= FAILURE_THRESHOLD {
+            if matches!(inet, Ipv4InternetStatus::CaptivePortal) && fail_count >= FAILURE_THRESHOLD
+            {
                 let mut s = state.lock().unwrap();
                 s.internet_fail_count = 0;
                 log_msg = format!(
@@ -284,14 +293,15 @@ pub fn spawn_monitor(state: SharedState) {
                 }
             } else {
                 // Log why we're NOT reconnecting
-                if matches!(inet, Ipv4InternetStatus::CaptivePortal) || matches!(inet, Ipv4InternetStatus::Unreachable) {
-                    if fail_count < FAILURE_THRESHOLD {
-                        let mut s = state.lock().unwrap();
-                        s.add_log(format!(
+                if (matches!(inet, Ipv4InternetStatus::CaptivePortal)
+                    || matches!(inet, Ipv4InternetStatus::Unreachable))
+                    && fail_count < FAILURE_THRESHOLD
+                {
+                    let mut s = state.lock().unwrap();
+                    s.add_log(format!(
                             "[INFO] Trouble detected (inet={:?}) but fail_count={}/{} — waiting for next cycle",
                             inet, fail_count, FAILURE_THRESHOLD
                         ));
-                    }
                 }
                 backoff_secs = interval;
             }

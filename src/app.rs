@@ -63,7 +63,9 @@ fn native_force_quit(state: &SharedState) {
     FORCE_QUIT.store(true, Ordering::SeqCst);
     if let Some(&hwnd) = MAIN_HWND.get() {
         tracing::info!("[Native] Posting WM_CLOSE to hwnd={}", hwnd);
-        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
     }
     // Fallback: if event loop doesn't respond, force exit after 2s
     std::thread::spawn(|| {
@@ -169,10 +171,26 @@ impl CampusNetApp {
 
         let tray_icon_rgba = create_tray_icon_rgba();
 
-        let show_item = MenuItem::new(t.tray_show, true, None::<tray_icon::menu::accelerator::Accelerator>);
-        let login_all_item = MenuItem::new(t.tray_login_all, true, None::<tray_icon::menu::accelerator::Accelerator>);
-        let logout_all_item = MenuItem::new(t.tray_logout_all, true, None::<tray_icon::menu::accelerator::Accelerator>);
-        let quit_item = MenuItem::new(t.tray_quit, true, None::<tray_icon::menu::accelerator::Accelerator>);
+        let show_item = MenuItem::new(
+            t.tray_show,
+            true,
+            None::<tray_icon::menu::accelerator::Accelerator>,
+        );
+        let login_all_item = MenuItem::new(
+            t.tray_login_all,
+            true,
+            None::<tray_icon::menu::accelerator::Accelerator>,
+        );
+        let logout_all_item = MenuItem::new(
+            t.tray_logout_all,
+            true,
+            None::<tray_icon::menu::accelerator::Accelerator>,
+        );
+        let quit_item = MenuItem::new(
+            t.tray_quit,
+            true,
+            None::<tray_icon::menu::accelerator::Accelerator>,
+        );
 
         let show_id = show_item.id().clone();
         let login_all_id = login_all_item.id().clone();
@@ -181,14 +199,17 @@ impl CampusNetApp {
 
         tracing::info!(
             "Tray menu IDs — show={:?}, login_all={:?}, logout_all={:?}, quit={:?}",
-            show_id, login_all_id, logout_all_id, quit_id
+            show_id,
+            login_all_id,
+            logout_all_id,
+            quit_id
         );
 
         let menu = Menu::new();
-        menu.append(&show_item);
-        menu.append(&login_all_item);
-        menu.append(&logout_all_item);
-        menu.append(&quit_item);
+        let _ = menu.append(&show_item);
+        let _ = menu.append(&login_all_item);
+        let _ = menu.append(&logout_all_item);
+        let _ = menu.append(&quit_item);
 
         // ── Tray event listener thread ──────────────────
         // Uses blocking select! on both MenuEvent and TrayIconEvent channels.
@@ -200,7 +221,9 @@ impl CampusNetApp {
         std::thread::spawn(move || {
             let menu_rx = MenuEvent::receiver();
             let tray_rx = TrayIconEvent::receiver();
-            tracing::info!("[TrayListener] Thread started, listening for MenuEvent + TrayIconEvent...");
+            tracing::info!(
+                "[TrayListener] Thread started, listening for MenuEvent + TrayIconEvent..."
+            );
 
             loop {
                 crossbeam_channel::select! {
@@ -273,17 +296,16 @@ impl CampusNetApp {
                             Ok(event) => {
                                 tracing::info!("[TrayListener] TrayIconEvent: {:?}", event);
                                 match &event {
-                                    TrayIconEvent::Click { button, button_state, .. } => {
+                                    TrayIconEvent::Click { button, button_state, .. }
                                         if matches!(button, tray_icon::MouseButton::Left)
-                                           && matches!(button_state, tray_icon::MouseButtonState::Up)
+                                           && matches!(button_state, tray_icon::MouseButtonState::Up) =>
+                                    {
+                                        tracing::info!("[TrayListener] Left-click → show window");
                                         {
-                                            tracing::info!("[TrayListener] Left-click → show window");
-                                            {
-                                                let mut s = state_for_listener.lock().unwrap();
-                                                s.add_log("[INFO] Tray left-click: show window".to_string());
-                                            }
-                                            native_show_window();
+                                            let mut s = state_for_listener.lock().unwrap();
+                                            s.add_log("[INFO] Tray left-click: show window".to_string());
                                         }
+                                        native_show_window();
                                     }
                                     TrayIconEvent::DoubleClick { button, .. } => {
                                         if matches!(button, tray_icon::MouseButton::Left) {
@@ -360,24 +382,30 @@ impl CampusNetApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let (campus_ip, ipv4_internet) = {
                     let s = self.state.lock().unwrap();
-                    (
-                        s.campus_ip.clone(),
-                        s.ipv4_internet.clone(),
-                    )
+                    (s.campus_ip.clone(), s.ipv4_internet.clone())
                 };
 
                 let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
-                let ip_color = if campus_ip.is_some() { Color32::GREEN } else { Color32::GRAY };
+                let ip_color = if campus_ip.is_some() {
+                    Color32::GREEN
+                } else {
+                    Color32::GRAY
+                };
                 ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
 
                 let (inet_color, inet_text) = match ipv4_internet {
                     Ipv4InternetStatus::Reachable => (Color32::GREEN, t.ipv4_internet_reachable),
                     Ipv4InternetStatus::CaptivePortal => (Color32::YELLOW, t.ipv4_internet_captive),
                     Ipv4InternetStatus::Unreachable => (Color32::RED, t.ipv4_internet_unreachable),
-                    Ipv4InternetStatus::ProbeFailed => (Color32::YELLOW, t.ipv4_internet_probe_failed),
+                    Ipv4InternetStatus::ProbeFailed => {
+                        (Color32::YELLOW, t.ipv4_internet_probe_failed)
+                    }
                     Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
                 };
-                ui.colored_label(inet_color, format!("{} {}", t.ipv4_internet_label, inet_text));
+                ui.colored_label(
+                    inet_color,
+                    format!("{} {}", t.ipv4_internet_label, inet_text),
+                );
             });
         });
         ui.separator();
@@ -388,10 +416,9 @@ impl CampusNetApp {
                 let s = self.state.lock().unwrap();
                 s.config.server.clone()
             };
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut server)
-                    .hint_text(t.server_hint),
-            ).on_hover_text(t.server_tooltip);
+            let resp = ui
+                .add(egui::TextEdit::singleline(&mut server).hint_text(t.server_hint))
+                .on_hover_text(t.server_tooltip);
             if resp.changed() {
                 let normalized = SrunClient::normalize_server_url(&server);
                 let mut s = self.state.lock().unwrap();
@@ -480,8 +507,7 @@ impl CampusNetApp {
                         }
                     }
 
-                    let is_busy =
-                        state == LoginState::LoggingIn || state == LoginState::LoggingOut;
+                    let is_busy = state == LoginState::LoggingIn || state == LoginState::LoggingOut;
 
                     match &state {
                         LoginState::Online | LoginState::Error => {
@@ -522,7 +548,11 @@ impl CampusNetApp {
                 if let Some(user) = s.config.users.get(user_idx) {
                     if let Some(ref ip) = user.ip {
                         if !ip.is_empty() {
-                            ui.label(format!("{} {}", t.ip_label, t.ip_configured.replace("{}", ip)));
+                            ui.label(format!(
+                                "{} {}",
+                                t.ip_label,
+                                t.ip_configured.replace("{}", ip)
+                            ));
                         } else if let Some(ref if_name) = user.if_name {
                             ui.label(t.ip_interface.replace("{}", if_name));
                         } else {
@@ -579,7 +609,11 @@ impl CampusNetApp {
                 let preferred = ifaces
                     .iter()
                     .find(|(_, ip)| ip.is_ipv4() && ip.to_string().starts_with("10."))
-                    .or_else(|| ifaces.iter().find(|(_, ip)| ip.is_ipv4() && !ip.is_loopback()));
+                    .or_else(|| {
+                        ifaces
+                            .iter()
+                            .find(|(_, ip)| ip.is_ipv4() && !ip.is_loopback())
+                    });
                 if let Some((name, ip)) = preferred {
                     self.edit_ip = ip.to_string();
                     self.edit_if_name = name.clone();
@@ -590,16 +624,22 @@ impl CampusNetApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let any_busy = {
                     let s = self.state.lock().unwrap();
-                    s.user_statuses
-                        .iter()
-                        .any(|us| us.state == LoginState::LoggingIn || us.state == LoginState::LoggingOut)
+                    s.user_statuses.iter().any(|us| {
+                        us.state == LoginState::LoggingIn || us.state == LoginState::LoggingOut
+                    })
                 };
 
-                if ui.add_enabled(!any_busy, egui::Button::new(t.btn_login_all)).clicked() {
+                if ui
+                    .add_enabled(!any_busy, egui::Button::new(t.btn_login_all))
+                    .clicked()
+                {
                     let state = self.state.clone();
                     tokio::spawn(async move { auth::do_one_click_login(state).await });
                 }
-                if ui.add_enabled(!any_busy, egui::Button::new(t.btn_logout_all)).clicked() {
+                if ui
+                    .add_enabled(!any_busy, egui::Button::new(t.btn_logout_all))
+                    .clicked()
+                {
                     let state = self.state.clone();
                     tokio::spawn(async move { auth::do_one_click_logout(state).await });
                 }
@@ -630,7 +670,11 @@ impl CampusNetApp {
                 ui.text_edit_singleline(&mut self.edit_username);
 
                 ui.label(t.field_password);
-                let pwd_hint = if is_new_user { t.field_password_hint } else { t.field_password_hint_edit };
+                let pwd_hint = if is_new_user {
+                    t.field_password_hint
+                } else {
+                    t.field_password_hint_edit
+                };
                 ui.add(
                     egui::TextEdit::singleline(&mut self.edit_password)
                         .password(true)
@@ -715,8 +759,7 @@ impl CampusNetApp {
                                 }
                             } else {
                                 s.config.users.push(new_user);
-                                s.user_statuses
-                                    .push(crate::service::UserStatus::new());
+                                s.user_statuses.push(crate::service::UserStatus::new());
                                 let uname = s.config.users.last().unwrap().username.clone();
                                 s.add_log(format!("[INFO] Added user {}", uname));
                             }
@@ -750,7 +793,11 @@ impl CampusNetApp {
         };
 
         ui.horizontal(|ui| {
-            ui.label(format!("{} v{}", t.version_label, env!("CARGO_PKG_VERSION")));
+            ui.label(format!(
+                "{} v{}",
+                t.version_label,
+                env!("CARGO_PKG_VERSION")
+            ));
 
             let is_checking = matches!(status, UpdateStatus::Checking);
             if ui
@@ -790,10 +837,7 @@ impl CampusNetApp {
                     ui.colored_label(Color32::GREEN, t.update_up_to_date);
                 }
                 UpdateStatus::Available { latest, url } => {
-                    ui.colored_label(
-                        Color32::YELLOW,
-                        t.update_available.replace("{}", latest),
-                    );
+                    ui.colored_label(Color32::YELLOW, t.update_available.replace("{}", latest));
                     ui.add_space(4.0);
                     ui.hyperlink_to(
                         format!("github.com/uchihazzj/campus_net/releases/tag/{}", latest),
@@ -810,7 +854,22 @@ impl CampusNetApp {
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.collapsing(t.section_settings, |ui| {
-            let (mut auto_reconnect, mut minimize_to_tray, mut auto_start, mut detect_ip, mut strict_bind, mut double_stack, mut monitor_interval, mut retry_times, mut retry_delay, mut n, mut utype, mut acid, mut os, mut name) = {
+            let (
+                mut auto_reconnect,
+                mut minimize_to_tray,
+                mut auto_start,
+                mut detect_ip,
+                mut strict_bind,
+                mut double_stack,
+                mut monitor_interval,
+                mut retry_times,
+                mut retry_delay,
+                mut n,
+                mut utype,
+                mut acid,
+                mut os,
+                mut name,
+            ) = {
                 let s = self.state.lock().unwrap();
                 let c = &s.config;
                 (
@@ -859,11 +918,17 @@ impl CampusNetApp {
             ui.label(t.section_auth_params);
             ui.horizontal(|ui| {
                 ui.label(t.label_n);
-                changed |= ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut n).range(1..=999))
+                    .changed();
                 ui.label(t.label_type);
-                changed |= ui.add(egui::DragValue::new(&mut utype).range(1..=99)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut utype).range(1..=99))
+                    .changed();
                 ui.label(t.label_acid);
-                changed |= ui.add(egui::DragValue::new(&mut acid).range(1..=999)).changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut acid).range(1..=999))
+                    .changed();
             });
 
             ui.horizontal(|ui| {
@@ -897,8 +962,12 @@ impl CampusNetApp {
 
             ui.separator();
             ui.label(t.section_app_options);
-            changed |= ui.checkbox(&mut auto_reconnect, t.opt_auto_reconnect).changed();
-            changed |= ui.checkbox(&mut minimize_to_tray, t.opt_minimize_tray).changed();
+            changed |= ui
+                .checkbox(&mut auto_reconnect, t.opt_auto_reconnect)
+                .changed();
+            changed |= ui
+                .checkbox(&mut minimize_to_tray, t.opt_minimize_tray)
+                .changed();
 
             let as_changed = ui.checkbox(&mut auto_start, t.opt_auto_start).changed();
             if as_changed {
@@ -1011,8 +1080,11 @@ impl eframe::App for CampusNetApp {
         }
 
         if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
-            tracing::info!("[MainLoop] quit_requested={}, FORCE_QUIT={} — sending Close",
-                self.quit_requested, FORCE_QUIT.load(Ordering::SeqCst));
+            tracing::info!(
+                "[MainLoop] quit_requested={}, FORCE_QUIT={} — sending Close",
+                self.quit_requested,
+                FORCE_QUIT.load(Ordering::SeqCst)
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -1041,7 +1113,9 @@ impl eframe::App for CampusNetApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 // Also native hide to ensure symmetry with native_show_window()
                 if let Some(&hwnd) = MAIN_HWND.get() {
-                    unsafe { ShowWindow(hwnd, SW_HIDE); }
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
                 }
             } else {
                 tracing::info!("[MainLoop] Close requested → real quit (minimize_to_tray=false)");

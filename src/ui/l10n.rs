@@ -17,6 +17,7 @@ impl Lang {
     }
 }
 
+#[allow(dead_code)]
 pub struct UiText {
     pub window_title: &'static str,
     pub server_label: &'static str,

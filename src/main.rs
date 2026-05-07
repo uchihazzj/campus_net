@@ -84,10 +84,7 @@ fn main() -> anyhow::Result<()> {
     // Install panic hook early — write panic info + backtrace to app.log
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::capture();
-        let msg = format!(
-            "=== PANIC ===\n{}\n\nBacktrace:\n{}\n",
-            info, backtrace
-        );
+        let msg = format!("=== PANIC ===\n{}\n\nBacktrace:\n{}\n", info, backtrace);
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -165,9 +162,7 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| {
             if let Some(font_data) = load_cjk_font() {
                 let mut fonts = egui::FontDefinitions::default();
-                fonts
-                    .font_data
-                    .insert("cjk_font".to_owned(), font_data);
+                fonts.font_data.insert("cjk_font".to_owned(), font_data);
                 fonts
                     .families
                     .get_mut(&egui::FontFamily::Proportional)
@@ -182,7 +177,8 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    ).map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 
     drop(_rt_guard);
     drop(rt);

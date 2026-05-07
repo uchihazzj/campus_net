@@ -15,11 +15,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
             .ip
             .clone()
             .filter(|i| !i.is_empty())
-            .or_else(|| {
-                user.if_name
-                    .as_ref()
-                    .and_then(|n| get_ip_by_if_name(n))
-            })
+            .or_else(|| user.if_name.as_ref().and_then(|n| get_ip_by_if_name(n)))
             .unwrap_or_default();
         (
             cfg.server.clone(),
@@ -47,8 +43,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
             if user_idx < s.config.users.len() {
                 let uname = s.config.users[user_idx].username.clone();
                 s.user_statuses[user_idx].state = LoginState::Error;
-                s.user_statuses[user_idx].last_error =
-                    format!("Password decrypt failed: {}", e);
+                s.user_statuses[user_idx].last_error = format!("Password decrypt failed: {}", e);
                 s.add_log(format!("[ERROR] {}: Failed to decrypt password", uname));
             }
             return;
@@ -117,7 +112,8 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             return;
         }
         let user = &cfg.users[user_idx];
-        let status_ip = s.user_statuses
+        let status_ip = s
+            .user_statuses
             .get(user_idx)
             .map(|us| us.current_ip.clone())
             .unwrap_or_default();
@@ -185,6 +181,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
     }
 }
 
+#[allow(dead_code)]
 pub async fn do_login_all(state: SharedState) {
     let count = {
         let s = state.lock().unwrap();
@@ -195,6 +192,7 @@ pub async fn do_login_all(state: SharedState) {
     }
 }
 
+#[allow(dead_code)]
 pub async fn do_logout_all(state: SharedState) {
     let count = {
         let s = state.lock().unwrap();
@@ -230,7 +228,11 @@ pub async fn do_one_click_login(state: SharedState) {
     for idx in 0..user_count {
         let username = {
             let s = state.lock().unwrap();
-            s.config.users.get(idx).map(|u| u.username.clone()).unwrap_or_default()
+            s.config
+                .users
+                .get(idx)
+                .map(|u| u.username.clone())
+                .unwrap_or_default()
         };
 
         tracing::info!("[OneClickLogin] Trying user {}: {}", idx, username);
@@ -262,12 +264,18 @@ pub async fn do_one_click_login(state: SharedState) {
         } else {
             let error = {
                 let s = state.lock().unwrap();
-                s.user_statuses.get(idx).map(|us| us.last_error.clone()).unwrap_or_default()
+                s.user_statuses
+                    .get(idx)
+                    .map(|us| us.last_error.clone())
+                    .unwrap_or_default()
             };
             tracing::info!("[OneClickLogin] {} failed: {}", username, error);
             {
                 let mut s = state.lock().unwrap();
-                s.add_log(format!("[ERROR] One-click login: {} failed — {}", username, error));
+                s.add_log(format!(
+                    "[ERROR] One-click login: {} failed — {}",
+                    username, error
+                ));
             }
             crate::service::request_ui_repaint();
         }
@@ -309,7 +317,8 @@ pub async fn do_one_click_logout(state: SharedState) {
         let names: Vec<String> = online_indices
             .iter()
             .map(|&idx| {
-                s.config.users
+                s.config
+                    .users
                     .get(idx)
                     .map(|u| u.username.clone())
                     .unwrap_or_default()
@@ -335,16 +344,25 @@ pub async fn do_one_click_logout(state: SharedState) {
     for &idx in &online_indices {
         let (username, ip) = {
             let s = state.lock().unwrap();
-            let uname = s.config.users.get(idx)
+            let uname = s
+                .config
+                .users
+                .get(idx)
                 .map(|u| u.username.clone())
                 .unwrap_or_default();
-            let ip = s.user_statuses.get(idx)
+            let ip = s
+                .user_statuses
+                .get(idx)
                 .map(|us| us.current_ip.clone())
                 .unwrap_or_default();
             (uname, ip)
         };
 
-        tracing::info!("[OneClickLogout] Sending logout: user={} ip={}", username, ip);
+        tracing::info!(
+            "[OneClickLogout] Sending logout: user={} ip={}",
+            username,
+            ip
+        );
         {
             let mut s = state.lock().unwrap();
             s.add_log(format!(

@@ -65,10 +65,17 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
 
     tracing::info!(
         "[AuthServer] Probing: url={} campus_ipv4={:?} bound={}",
-        url, campus_ipv4, bound
+        url,
+        campus_ipv4,
+        bound
     );
 
-    match client.get(&url).query(&[("callback", "sdu"), ("_", &ts)]).send().await {
+    match client
+        .get(&url)
+        .query(&[("callback", "sdu"), ("_", &ts)])
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             tracing::info!(
@@ -81,7 +88,10 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
         Err(e) => {
             tracing::warn!(
                 "[AuthServer] Unreachable: error={} url={} campus_ipv4={:?} bound={}",
-                e, url, campus_ipv4, bound
+                e,
+                url,
+                campus_ipv4,
+                bound
             );
             AuthServerStatus::Unreachable
         }
@@ -119,7 +129,7 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
         false
     };
 
-let client = match builder.build() {
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[CaptiveProbe] Failed to build client: {}", e);
@@ -131,7 +141,8 @@ let client = match builder.build() {
     // portal if not logged in.
     tracing::info!(
         "[CaptiveProbe] Probing http://www.baidu.com campus_ipv4={:?} bound={}",
-        campus_ipv4, bound
+        campus_ipv4,
+        bound
     );
 
     match client.get("http://www.baidu.com").send().await {
@@ -157,7 +168,8 @@ let client = match builder.build() {
                 // Non-portal redirect (e.g., http→https upgrade) → logged in
                 tracing::info!(
                     "[CaptiveProbe] LoggedIn (non-portal redirect): status={} location={}",
-                    status.as_u16(), location
+                    status.as_u16(),
+                    location
                 );
                 return CampusAuthStatus::LoggedIn;
             }
@@ -171,7 +183,9 @@ let client = match builder.build() {
             // Probe failed — NOT "server unreachable"
             tracing::warn!(
                 "[CaptiveProbe] Probe failed (Unknown): error={} campus_ipv4={:?} bound={}",
-                e, campus_ipv4, bound
+                e,
+                campus_ipv4,
+                bound
             );
             CampusAuthStatus::Unknown
         }
@@ -288,7 +302,7 @@ async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStat
         false
     };
 
-let client = match builder.build() {
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[IPv4] Failed to build client: {} bound={}", e, bound);
@@ -301,24 +315,20 @@ let client = match builder.build() {
     for check in REACHABILITY_CHECKS {
         match try_single_check(&client, check).await {
             Ok(()) => {
-                tracing::info!(
-                    "[IPv4] Reachable via: {} bound={}",
-                    check.url, bound
-                );
+                tracing::info!("[IPv4] Reachable via: {} bound={}", check.url, bound);
                 return Ipv4InternetStatus::Reachable;
             }
             Err(CheckError::CaptivePortal { url, location }) => {
                 tracing::info!(
                     "[IPv4] CaptivePortal: {} → location={} bound={}",
-                    url, location, bound
+                    url,
+                    location,
+                    bound
                 );
                 return Ipv4InternetStatus::CaptivePortal;
             }
             Err(CheckError::Failed { url, detail }) => {
-                tracing::debug!(
-                    "[IPv4] Failed: {} detail={} bound={}",
-                    url, detail, bound
-                );
+                tracing::debug!("[IPv4] Failed: {} detail={} bound={}", url, detail, bound);
                 last_error = format!("{}: {}", url, detail);
             }
         }
@@ -326,7 +336,8 @@ let client = match builder.build() {
 
     tracing::warn!(
         "[IPv4] All probes failed. last_error={} bound={}",
-        last_error, bound
+        last_error,
+        bound
     );
     Ipv4InternetStatus::Unreachable
 }
@@ -340,12 +351,14 @@ async fn try_single_check(
     client: &reqwest::Client,
     check: &ReachabilityCheck,
 ) -> Result<(), CheckError> {
-    let resp = client.get(check.url).send().await.map_err(|e| {
-        CheckError::Failed {
+    let resp = client
+        .get(check.url)
+        .send()
+        .await
+        .map_err(|e| CheckError::Failed {
             url: check.url,
             detail: format!("request error: {}", e),
-        }
-    })?;
+        })?;
 
     let status = resp.status();
 
@@ -386,11 +399,9 @@ async fn try_single_check(
             if min_len == 0 {
                 return Ok(());
             }
-            let body = resp.bytes().await.map_err(|e| {
-                CheckError::Failed {
-                    url: check.url,
-                    detail: format!("body read error: {}", e),
-                }
+            let body = resp.bytes().await.map_err(|e| CheckError::Failed {
+                url: check.url,
+                detail: format!("body read error: {}", e),
             })?;
             if body.len() >= min_len {
                 Ok(())

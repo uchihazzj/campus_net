@@ -63,10 +63,12 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    #[allow(dead_code)]
     pub fn get_password(&self, user: &StoredUser) -> anyhow::Result<String> {
         secure_store::decrypt_password(&user.encrypted_password)
     }
 
+    #[allow(dead_code)]
     pub fn set_password(&mut self, user_idx: usize, password: &str) -> anyhow::Result<()> {
         let encrypted = secure_store::encrypt_password(password)?;
         if let Some(u) = self.users.get_mut(user_idx) {
@@ -75,6 +77,7 @@ impl AppConfig {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn resolve_ip(&self, user: &StoredUser) -> Option<String> {
         if let Some(ref ip) = user.ip {
             if !ip.is_empty() {

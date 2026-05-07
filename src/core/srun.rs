@@ -109,8 +109,13 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
 
     // srun wraps JSON as: sdu({...}) — strip 4-byte prefix and 1-byte suffix
     let inner = &bytes[4..bytes.len() - 1];
-    serde_json::from_slice(inner)
-        .map_err(|e| anyhow::anyhow!("JSON parse error: {}. Body: {}", e, String::from_utf8_lossy(inner)))
+    serde_json::from_slice(inner).map_err(|e| {
+        anyhow::anyhow!(
+            "JSON parse error: {}. Body: {}",
+            e,
+            String::from_utf8_lossy(inner)
+        )
+    })
 }
 
 impl SrunClient {
@@ -209,7 +214,11 @@ impl SrunClient {
         } else {
             url.to_string()
         };
-        if let Some(pos) = with_scheme.get(8..).and_then(|s| s.find('/')).map(|p| p + 8) {
+        if let Some(pos) = with_scheme
+            .get(8..)
+            .and_then(|s| s.find('/'))
+            .map(|p| p + 8)
+        {
             with_scheme[..pos].to_string()
         } else {
             with_scheme
@@ -222,7 +231,10 @@ impl SrunClient {
 
         // Validate server URL
         if !self.auth_server.starts_with("http://") && !self.auth_server.starts_with("https://") {
-            anyhow::bail!("Invalid server URL: '{}'. Must start with http:// or https://", self.auth_server);
+            anyhow::bail!(
+                "Invalid server URL: '{}'. Must start with http:// or https://",
+                self.auth_server
+            );
         }
 
         let url = format!("{}{}", self.auth_server, PATH_GET_CHALLENGE);
@@ -233,8 +245,7 @@ impl SrunClient {
             ("ip", &self.client_ip),
             ("_", &time_str),
         ];
-        let challenge: ChallengeResponse =
-            fetch_json(&client, &url, &query).await?;
+        let challenge: ChallengeResponse = fetch_json(&client, &url, &query).await?;
         if !challenge.online_ip.is_empty() {
             self.client_ip = challenge.online_ip;
             return Ok(());
@@ -247,8 +258,9 @@ impl SrunClient {
                 let s = ip.to_string();
                 if s.starts_with("10.")
                     || (s.starts_with("172.") && {
-                        let second: u32 = s[4..].split('.').next().unwrap_or("0").parse().unwrap_or(0);
-                        second >= 16 && second <= 31
+                        let second: u32 =
+                            s[4..].split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                        (16..=31).contains(&second)
                     })
                     || s.starts_with("192.168.")
                 {
@@ -283,8 +295,7 @@ impl SrunClient {
             ("ip", &self.client_ip),
             ("_", &time_str),
         ];
-        let challenge: ChallengeResponse =
-            fetch_json(&client, &url, &query).await?;
+        let challenge: ChallengeResponse = fetch_json(&client, &url, &query).await?;
         match challenge.challenge {
             Some(token) => {
                 self.token = token;
@@ -346,7 +357,11 @@ impl SrunClient {
         let time_str = self.time.to_string();
 
         let mut result = PortalResponse::default();
-        let retries = if self.retry_times == 0 { 1 } else { self.retry_times };
+        let retries = if self.retry_times == 0 {
+            1
+        } else {
+            self.retry_times
+        };
         for ti in 1..=retries {
             let client = build_http_client(self.strict_bind, &self.ip)?;
             let url = format!("{}{}", self.auth_server, PATH_PORTAL);
@@ -426,6 +441,7 @@ impl SrunClient {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct ChallengeResponse {
     challenge: Option<String>,
     #[serde(default)]
@@ -444,6 +460,7 @@ struct ChallengeResponse {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+#[allow(dead_code)]
 struct PortalResponse {
     #[serde(rename = "ServerFlag")]
     server_flag: i32,
