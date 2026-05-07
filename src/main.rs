@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod core;
@@ -81,6 +81,24 @@ fn load_cjk_font() -> Option<egui::FontData> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install panic hook early — write panic info + backtrace to app.log
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        let msg = format!(
+            "=== PANIC ===\n{}\n\nBacktrace:\n{}\n",
+            info, backtrace
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("app.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", msg);
+        }
+        eprintln!("{}", msg);
+    }));
+
     let log_file = FileWriter::new("app.log");
 
     let stderr_layer = tracing_subscriber::fmt::layer()

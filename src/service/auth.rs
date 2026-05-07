@@ -34,23 +34,32 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
 
     let encrypted_password = {
         let s = state.lock().unwrap();
-        s.config.users[user_idx].encrypted_password.clone()
+        match s.config.users.get(user_idx) {
+            Some(user) => user.encrypted_password.clone(),
+            None => return,
+        }
     };
 
     let password = match secure_store::decrypt_password(&encrypted_password) {
         Ok(p) => p,
         Err(e) => {
             let mut s = state.lock().unwrap();
-            let uname = s.config.users[user_idx].username.clone();
-            s.user_statuses[user_idx].state = LoginState::Error;
-            s.user_statuses[user_idx].last_error = format!("Password decrypt failed: {}", e);
-            s.add_log(format!("[ERROR] {}: Failed to decrypt password", uname));
+            if user_idx < s.config.users.len() {
+                let uname = s.config.users[user_idx].username.clone();
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error =
+                    format!("Password decrypt failed: {}", e);
+                s.add_log(format!("[ERROR] {}: Failed to decrypt password", uname));
+            }
             return;
         }
     };
 
     {
         let mut s = state.lock().unwrap();
+        if user_idx >= s.config.users.len() {
+            return;
+        }
         let uname = s.config.users[user_idx].username.clone();
         s.user_statuses[user_idx].state = LoginState::LoggingIn;
         s.user_statuses[user_idx].last_error.clear();
@@ -79,19 +88,23 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
     match client.login().await {
         Ok(()) => {
             let mut s = state.lock().unwrap();
-            let uname = s.config.users[user_idx].username.clone();
-            let ip = client.client_ip.clone();
-            s.user_statuses[user_idx].state = LoginState::Online;
-            s.user_statuses[user_idx].current_ip = ip.clone();
-            s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
+            if user_idx < s.config.users.len() {
+                let uname = s.config.users[user_idx].username.clone();
+                let ip = client.client_ip.clone();
+                s.user_statuses[user_idx].state = LoginState::Online;
+                s.user_statuses[user_idx].current_ip = ip.clone();
+                s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
+            }
         }
         Err(e) => {
             let mut s = state.lock().unwrap();
-            let uname = s.config.users[user_idx].username.clone();
-            let err = e.to_string();
-            s.user_statuses[user_idx].state = LoginState::Error;
-            s.user_statuses[user_idx].last_error = err.clone();
-            s.add_log(format!("[ERROR] {}: Login failed - {}", uname, err));
+            if user_idx < s.config.users.len() {
+                let uname = s.config.users[user_idx].username.clone();
+                let err = e.to_string();
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error = err.clone();
+                s.add_log(format!("[ERROR] {}: Login failed - {}", uname, err));
+            }
         }
     }
 }
@@ -104,7 +117,10 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             return;
         }
         let user = &cfg.users[user_idx];
-        let status_ip = s.user_statuses[user_idx].current_ip.clone();
+        let status_ip = s.user_statuses
+            .get(user_idx)
+            .map(|us| us.current_ip.clone())
+            .unwrap_or_default();
         let ip = if !status_ip.is_empty() {
             status_ip
         } else if let Some(ref uip) = user.ip {
@@ -132,6 +148,9 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
 
     {
         let mut s = state.lock().unwrap();
+        if user_idx >= s.config.users.len() {
+            return;
+        }
         let uname = s.config.users[user_idx].username.clone();
         s.user_statuses[user_idx].state = LoginState::LoggingOut;
         s.add_log(format!("[INFO] {}: Logging out...", uname));
@@ -144,20 +163,24 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
     match client.logout().await {
         Ok(()) => {
             let mut s = state.lock().unwrap();
-            let uname = s.config.users[user_idx].username.clone();
-            s.user_statuses[user_idx].state = LoginState::LoggedOut;
-            s.user_statuses[user_idx].current_ip.clear();
-            s.reconnect_targets.retain(|&i| i != user_idx);
-            s.add_log(format!("[OK] {}: Logout success", uname));
+            if user_idx < s.config.users.len() {
+                let uname = s.config.users[user_idx].username.clone();
+                s.user_statuses[user_idx].state = LoginState::LoggedOut;
+                s.user_statuses[user_idx].current_ip.clear();
+                s.reconnect_targets.retain(|&i| i != user_idx);
+                s.add_log(format!("[OK] {}: Logout success", uname));
+            }
         }
         Err(e) => {
             let mut s = state.lock().unwrap();
-            let uname = s.config.users[user_idx].username.clone();
-            let err = e.to_string();
-            s.user_statuses[user_idx].state = LoginState::Error;
-            s.user_statuses[user_idx].last_error = err.clone();
-            s.reconnect_targets.retain(|&i| i != user_idx);
-            s.add_log(format!("[ERROR] {}: Logout failed - {}", uname, err));
+            if user_idx < s.config.users.len() {
+                let uname = s.config.users[user_idx].username.clone();
+                let err = e.to_string();
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error = err.clone();
+                s.reconnect_targets.retain(|&i| i != user_idx);
+                s.add_log(format!("[ERROR] {}: Logout failed - {}", uname, err));
+            }
         }
     }
 }

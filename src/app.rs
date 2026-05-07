@@ -452,6 +452,12 @@ impl CampusNetApp {
                             let mut s = self.state.lock().unwrap();
                             s.config.users.remove(user_idx);
                             s.user_statuses.remove(user_idx);
+                            s.reconnect_targets.retain(|&i| i != user_idx);
+                            for t in &mut s.reconnect_targets {
+                                if *t > user_idx {
+                                    *t -= 1;
+                                }
+                            }
                             s.add_log("[INFO] Removed user".to_string());
                         }
                         let _ = self.save_config();

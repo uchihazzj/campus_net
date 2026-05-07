@@ -68,7 +68,9 @@ fn unix_second() -> u64 {
 
 fn build_http_client(strict_bind: bool, ip: &str) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5));
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .no_proxy();
 
     if strict_bind && !ip.is_empty() {
         let local_addr: std::net::IpAddr = ip

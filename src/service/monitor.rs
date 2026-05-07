@@ -143,8 +143,10 @@ pub fn spawn_monitor(state: SharedState) {
             }
 
             let (targets, target_count) = {
-                let s = state.lock().unwrap();
-                (s.reconnect_targets.clone(), s.config.users.len())
+                let mut s = state.lock().unwrap();
+                let user_len = s.config.users.len();
+                s.reconnect_targets.retain(|&i| i < user_len);
+                (s.reconnect_targets.clone(), user_len)
             };
 
             if targets.is_empty() {
