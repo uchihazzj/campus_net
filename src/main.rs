@@ -45,7 +45,13 @@ impl FileWriter {
             .create(true)
             .append(true)
             .open(path)
-            .expect("Failed to open app.log");
+            .unwrap_or_else(|e| {
+                eprintln!("WARNING: Failed to open app.log ({}), logging to NUL", e);
+                OpenOptions::new()
+                    .write(true)
+                    .open("NUL")
+                    .expect("Failed to open NUL")
+            });
         Self {
             inner: Arc::new(Mutex::new(file)),
         }

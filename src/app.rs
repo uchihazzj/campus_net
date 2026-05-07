@@ -432,7 +432,10 @@ impl CampusNetApp {
                             (Color32::YELLOW, t.ipv4_internet_probe_failed)
                         }
                         Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
-                        Ipv4InternetStatus::Disabled => unreachable!(),
+                        Ipv4InternetStatus::Disabled => {
+                            // guarded by `!= Disabled` above; fallback
+                            (Color32::GRAY, "")
+                        }
                     };
                     ui.colored_label(
                         inet_color,
@@ -471,11 +474,12 @@ impl CampusNetApp {
         let t = self.t();
         let (username, state, current_ip, last_error) = {
             let s = self.state.lock().unwrap();
-            if user_idx >= s.config.users.len() {
+            let Some(user) = s.config.users.get(user_idx) else {
                 return;
-            }
-            let user = &s.config.users[user_idx];
-            let us = &s.user_statuses[user_idx];
+            };
+            let Some(us) = s.user_statuses.get(user_idx) else {
+                return;
+            };
             (
                 user.username.clone(),
                 us.state.clone(),
@@ -544,8 +548,7 @@ impl CampusNetApp {
 
                     if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
                         let s = self.state.lock().unwrap();
-                        if user_idx < s.config.users.len() {
-                            let user = &s.config.users[user_idx];
+                        if let Some(user) = s.config.users.get(user_idx) {
                             self.editing_user_idx = Some(user_idx);
                             self.edit_username = user.username.clone();
                             self.edit_password.clear();
@@ -810,7 +813,11 @@ impl CampusNetApp {
                         let encrypted = if self.edit_password.is_empty() {
                             if let Some(idx) = self.editing_user_idx {
                                 let s = self.state.lock().unwrap();
-                                s.config.users[idx].encrypted_password.clone()
+                                s.config
+                                    .users
+                                    .get(idx)
+                                    .map(|u| u.encrypted_password.clone())
+                                    .unwrap_or_default()
                             } else {
                                 String::new()
                             }
