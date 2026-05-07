@@ -1,6 +1,10 @@
+use std::time::Duration;
+
 use crate::core::srun::SrunClient;
 use crate::core::utils::get_ip_by_if_name;
 use crate::platform::secure_store;
+use crate::service::detection::detect_campus_ip;
+use crate::service::online_info::sync_online_state;
 use crate::service::{LoginState, SharedState};
 
 pub async fn do_login(state: SharedState, user_idx: usize) {
@@ -11,11 +15,18 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
             return;
         }
         let user = &cfg.users[user_idx];
+        // IP resolution priority:
+        // 1. if_name real-time resolution (most stable across DHCP changes)
+        // 2. Auto-detect current 10.x.x.x campus IPv4
+        // 3. Legacy user.ip (backward compat, not recommended)
+        // 4. Empty — SrunClient will try detect_ip if configured
         let ip = user
-            .ip
-            .clone()
+            .if_name
+            .as_ref()
+            .and_then(|n| get_ip_by_if_name(n))
             .filter(|i| !i.is_empty())
-            .or_else(|| user.if_name.as_ref().and_then(|n| get_ip_by_if_name(n)))
+            .or_else(detect_campus_ip)
+            .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
             .unwrap_or_default();
         (
             cfg.server.clone(),
@@ -82,14 +93,22 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
 
     match client.login().await {
         Ok(()) => {
-            let mut s = state.lock().unwrap();
-            if user_idx < s.config.users.len() {
-                let uname = s.config.users[user_idx].username.clone();
-                let ip = client.client_ip.clone();
-                s.user_statuses[user_idx].state = LoginState::Online;
-                s.user_statuses[user_idx].current_ip = ip.clone();
-                s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
+            {
+                let mut s = state.lock().unwrap();
+                if user_idx < s.config.users.len() {
+                    let uname = s.config.users[user_idx].username.clone();
+                    let ip = client.client_ip.clone();
+                    s.user_statuses[user_idx].state = LoginState::Online;
+                    s.user_statuses[user_idx].current_ip = ip.clone();
+                    s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
+                }
             }
+            // Refresh online_info to populate online duration, traffic etc.
+            let st = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                sync_online_state(&st).await;
+            });
         }
         Err(e) => {
             let mut s = state.lock().unwrap();
@@ -117,20 +136,21 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             .get(user_idx)
             .map(|us| us.current_ip.clone())
             .unwrap_or_default();
+        // IP resolution priority for logout:
+        // 1. current_ip from online session (most accurate)
+        // 2. if_name real-time resolution
+        // 3. Auto-detect current 10.x.x.x campus IPv4
+        // 4. Legacy user.ip (backward compat, not recommended)
         let ip = if !status_ip.is_empty() {
             status_ip
-        } else if let Some(ref uip) = user.ip {
-            if !uip.is_empty() {
-                uip.clone()
-            } else if let Some(ref if_name) = user.if_name {
-                get_ip_by_if_name(if_name).unwrap_or_default()
-            } else {
-                String::new()
-            }
-        } else if let Some(ref if_name) = user.if_name {
-            get_ip_by_if_name(if_name).unwrap_or_default()
         } else {
-            String::new()
+            user.if_name
+                .as_ref()
+                .and_then(|n| get_ip_by_if_name(n))
+                .filter(|i| !i.is_empty())
+                .or_else(detect_campus_ip)
+                .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
+                .unwrap_or_default()
         };
         (
             cfg.server.clone(),
@@ -158,14 +178,21 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
 
     match client.logout().await {
         Ok(()) => {
-            let mut s = state.lock().unwrap();
-            if user_idx < s.config.users.len() {
-                let uname = s.config.users[user_idx].username.clone();
-                s.user_statuses[user_idx].state = LoginState::LoggedOut;
-                s.user_statuses[user_idx].current_ip.clear();
-                s.reconnect_targets.retain(|&i| i != user_idx);
-                s.add_log(format!("[OK] {}: Logout success", uname));
+            {
+                let mut s = state.lock().unwrap();
+                if user_idx < s.config.users.len() {
+                    let uname = s.config.users[user_idx].username.clone();
+                    s.user_statuses[user_idx].state = LoginState::LoggedOut;
+                    s.user_statuses[user_idx].current_ip.clear();
+                    s.reconnect_targets.retain(|&i| i != user_idx);
+                    s.add_log(format!("[OK] {}: Logout success", uname));
+                }
             }
+            // Refresh online_info to confirm server state after logout
+            let st = state.clone();
+            tokio::spawn(async move {
+                sync_online_state(&st).await;
+            });
         }
         Err(e) => {
             let mut s = state.lock().unwrap();

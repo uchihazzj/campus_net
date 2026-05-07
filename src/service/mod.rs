@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service::config::AppConfig;
+pub use crate::service::online_info::OnlineUserInfo;
 pub use crate::service::update::UpdateStatus;
 
 // ── UI repaint signal ──────────────────────────────────
@@ -25,6 +26,7 @@ pub mod auth;
 pub mod config;
 pub mod detection;
 pub mod monitor;
+pub mod online_info;
 pub mod update;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +69,8 @@ pub enum Ipv4InternetStatus {
     /// on all endpoints, or client build error). Different from Unreachable,
     /// which means we confirmed IPv4 is down.
     ProbeFailed,
+    /// IPv4 internet probe is disabled by user config.
+    Disabled,
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +106,17 @@ pub struct AppState {
     /// Populated on first trouble detection, cleared on success
     /// or when user manually logs out.
     pub reconnect_targets: Vec<usize>,
+    /// Latest result from rad_user_info query. None if never queried or not logged in.
+    pub online_info: Option<OnlineUserInfo>,
+    /// Consecutive failures of rad_user_info query (request timeout, parse error).
+    pub online_info_fail_count: u32,
     pub update_status: UpdateStatus,
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let user_count = config.users.len();
+        let probe_enabled = config.enable_ipv4_internet_probe;
         Self {
             config,
             user_statuses: vec![UserStatus::new(); user_count],
@@ -115,10 +124,16 @@ impl AppState {
             campus_ip: None,
             auth_server: AuthServerStatus::Unknown,
             campus_auth: CampusAuthStatus::Unknown,
-            ipv4_internet: Ipv4InternetStatus::Checking,
+            ipv4_internet: if probe_enabled {
+                Ipv4InternetStatus::Checking
+            } else {
+                Ipv4InternetStatus::Disabled
+            },
             auth_fail_count: 0,
             internet_fail_count: 0,
             reconnect_targets: Vec::new(),
+            online_info: None,
+            online_info_fail_count: 0,
             update_status: UpdateStatus::Idle,
         }
     }

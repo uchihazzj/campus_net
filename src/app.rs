@@ -161,6 +161,18 @@ pub struct CampusNetApp {
     cached_lang: Lang,
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 impl CampusNetApp {
     pub fn new(state: SharedState) -> Self {
         let lang = {
@@ -380,10 +392,21 @@ impl CampusNetApp {
         ui.horizontal(|ui| {
             ui.heading(RichText::new(t.window_title).size(20.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let (campus_ip, ipv4_internet) = {
+                let (campus_ip, ipv4_internet, online_info) = {
                     let s = self.state.lock().unwrap();
-                    (s.campus_ip.clone(), s.ipv4_internet.clone())
+                    (
+                        s.campus_ip.clone(),
+                        s.ipv4_internet.clone(),
+                        s.online_info.clone(),
+                    )
                 };
+
+                if let Some(ref info) = online_info {
+                    ui.colored_label(
+                        Color32::GREEN,
+                        format!("{} {}", t.campus_account_label, info.user_name),
+                    );
+                }
 
                 let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
                 let ip_color = if campus_ip.is_some() {
@@ -393,19 +416,29 @@ impl CampusNetApp {
                 };
                 ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
 
-                let (inet_color, inet_text) = match ipv4_internet {
-                    Ipv4InternetStatus::Reachable => (Color32::GREEN, t.ipv4_internet_reachable),
-                    Ipv4InternetStatus::CaptivePortal => (Color32::YELLOW, t.ipv4_internet_captive),
-                    Ipv4InternetStatus::Unreachable => (Color32::RED, t.ipv4_internet_unreachable),
-                    Ipv4InternetStatus::ProbeFailed => {
-                        (Color32::YELLOW, t.ipv4_internet_probe_failed)
-                    }
-                    Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
-                };
-                ui.colored_label(
-                    inet_color,
-                    format!("{} {}", t.ipv4_internet_label, inet_text),
-                );
+                // IPv4 internet status — only shown when probe is enabled
+                if ipv4_internet != Ipv4InternetStatus::Disabled {
+                    let (inet_color, inet_text) = match ipv4_internet {
+                        Ipv4InternetStatus::Reachable => {
+                            (Color32::GREEN, t.ipv4_internet_reachable)
+                        }
+                        Ipv4InternetStatus::CaptivePortal => {
+                            (Color32::YELLOW, t.ipv4_internet_captive)
+                        }
+                        Ipv4InternetStatus::Unreachable => {
+                            (Color32::RED, t.ipv4_internet_unreachable)
+                        }
+                        Ipv4InternetStatus::ProbeFailed => {
+                            (Color32::YELLOW, t.ipv4_internet_probe_failed)
+                        }
+                        Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
+                        Ipv4InternetStatus::Disabled => unreachable!(),
+                    };
+                    ui.colored_label(
+                        inet_color,
+                        format!("{} {}", t.ipv4_internet_label, inet_text),
+                    );
+                }
             });
         });
         ui.separator();
@@ -423,6 +456,13 @@ impl CampusNetApp {
                 let normalized = SrunClient::normalize_server_url(&server);
                 let mut s = self.state.lock().unwrap();
                 s.config.server = normalized;
+            }
+            // Refresh status button — manually re-queries rad_user_info
+            if ui.button(t.btn_refresh_status).clicked() {
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    crate::service::online_info::sync_online_state(&state).await;
+                });
             }
         });
     }
@@ -450,6 +490,17 @@ impl CampusNetApp {
                     LoginState::Online => {
                         ui.colored_label(Color32::GREEN, "●");
                         ui.label(RichText::new(t.status_online).color(Color32::GREEN));
+                        // Show "✓ Confirmed" when server confirms this user
+                        let confirmed = {
+                            let s = self.state.lock().unwrap();
+                            s.online_info
+                                .as_ref()
+                                .map(|info| info.user_name == username)
+                                .unwrap_or(false)
+                        };
+                        if confirmed {
+                            ui.colored_label(Color32::GREEN, t.campus_auth_confirmed);
+                        }
                     }
                     LoginState::LoggingIn => {
                         ui.colored_label(Color32::YELLOW, "◐");
@@ -541,7 +592,37 @@ impl CampusNetApp {
                 ui.label(RichText::new(&username).strong());
             });
 
-            if !current_ip.is_empty() {
+            // Show server-confirmed auth details when applicable
+            let confirmed_info = {
+                let s = self.state.lock().unwrap();
+                s.online_info
+                    .as_ref()
+                    .filter(|info| info.user_name == username)
+                    .cloned()
+            };
+
+            if let Some(ref info) = confirmed_info {
+                // Server confirmed this user is online — show auth details
+                ui.label(format!("{} {}", t.ip_label, info.online_ip));
+
+                let hours = info.sum_seconds / 3600;
+                ui.label(format!("{} {}h", t.online_duration_label, hours));
+
+                if info.remain_bytes > 0 {
+                    ui.label(format!(
+                        "{} {}",
+                        t.remain_traffic_label,
+                        format_bytes(info.remain_bytes)
+                    ));
+                }
+
+                if !info.products_name.is_empty() {
+                    ui.colored_label(
+                        Color32::GRAY,
+                        format!("{} {}", t.plan_label, info.products_name),
+                    );
+                }
+            } else if !current_ip.is_empty() {
                 ui.label(format!("{} {}", t.ip_label, current_ip));
             } else {
                 let s = self.state.lock().unwrap();
@@ -614,8 +695,7 @@ impl CampusNetApp {
                             .iter()
                             .find(|(_, ip)| ip.is_ipv4() && !ip.is_loopback())
                     });
-                if let Some((name, ip)) = preferred {
-                    self.edit_ip = ip.to_string();
+                if let Some((name, _ip)) = preferred {
                     self.edit_if_name = name.clone();
                 }
                 self.show_add_dialog = true;
@@ -685,6 +765,12 @@ impl CampusNetApp {
                 ui.text_edit_singleline(&mut self.edit_ip)
                     .on_hover_text(t.field_ip_hint);
 
+                // Show current detected campus IP as readonly info
+                let detected_ip = crate::service::detection::detect_campus_ip();
+                if let Some(ref dip) = detected_ip {
+                    ui.colored_label(Color32::GRAY, t.ip_detected.replace("{}", dip));
+                }
+
                 ui.label(t.field_if_name);
                 ui.text_edit_singleline(&mut self.edit_if_name)
                     .on_hover_text(t.field_if_name_hint);
@@ -694,7 +780,6 @@ impl CampusNetApp {
                     ui.label(t.available_interfaces);
                     for (name, ip) in &interfaces {
                         if ui.button(format!("  {} — {}", name, ip)).clicked() {
-                            self.edit_ip = ip.to_string();
                             self.edit_if_name.clone_from(name);
                         }
                     }
@@ -893,6 +978,7 @@ impl CampusNetApp {
                 mut auto_reconnect,
                 mut minimize_to_tray,
                 mut auto_start,
+                mut enable_ipv4_internet_probe,
                 mut detect_ip,
                 mut strict_bind,
                 mut double_stack,
@@ -911,6 +997,7 @@ impl CampusNetApp {
                     c.auto_reconnect,
                     c.minimize_to_tray,
                     c.auto_start,
+                    c.enable_ipv4_internet_probe,
                     c.detect_ip,
                     c.strict_bind,
                     c.double_stack,
@@ -1018,6 +1105,11 @@ impl CampusNetApp {
                 changed = true;
             }
 
+            changed |= ui
+                .checkbox(&mut enable_ipv4_internet_probe, t.enable_ipv4_probe)
+                .on_hover_text(t.enable_ipv4_probe_hint)
+                .changed();
+
             let old_interval = monitor_interval;
             ui.label(t.label_monitor_interval);
             let interval_changed = ui
@@ -1043,6 +1135,12 @@ impl CampusNetApp {
                     s.config.auto_reconnect = auto_reconnect;
                     s.config.minimize_to_tray = minimize_to_tray;
                     s.config.auto_start = auto_start;
+                    s.config.enable_ipv4_internet_probe = enable_ipv4_internet_probe;
+                    if !enable_ipv4_internet_probe {
+                        s.ipv4_internet = Ipv4InternetStatus::Disabled;
+                    } else if s.ipv4_internet == Ipv4InternetStatus::Disabled {
+                        s.ipv4_internet = Ipv4InternetStatus::Checking;
+                    }
                     s.config.detect_ip = detect_ip;
                     s.config.strict_bind = strict_bind;
                     s.config.double_stack = double_stack;

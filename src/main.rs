@@ -140,8 +140,8 @@ fn main() -> anyhow::Result<()> {
 
     let state: SharedState = Arc::new(Mutex::new(service::AppState::new(config)));
 
-    // Spawn network monitor
-    service::monitor::spawn_monitor(state.clone());
+    // Spawn startup tasks: version check → online state sync → monitor
+    service::online_info::spawn_startup_tasks(state.clone());
 
     // Build window icon
     let icon_data = app::create_window_icon();
