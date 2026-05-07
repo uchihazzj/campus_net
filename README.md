@@ -1,127 +1,94 @@
 # Campus Net Client
 
-基于 srun 协议的 Windows 桌面校园网认证客户端。
+基于 Srun / 深澜认证协议的 Windows 桌面校园网客户端。
 
 ## 功能
 
-- **深澜 / srun 校园网认证**：登录 / 登出，支持多用户管理
-- **四层网络状态检测（仅 IPv4）**：
-  - Layer 1 — 校园网 IPv4 检测：枚举 `10.*.*.*` 地址
-  - Layer 2 — 认证服务器可达性：检测 srun 认证服务器是否响应
-  - Layer 3 — 认证状态检测：通过 HTTP 重定向判断是否已登录
-  - Layer 4 — IPv4 外网可达性：多端点 HTTP/HTTPS 检测，强制绑定 IPv4
-- **IPv4-only 检测**：所有网络检测通过 `local_address` 绑定到校园网 IPv4 地址，避免 IPv6 可访问导致的误判
-- **断网自动重连**：连续确认后触发，支持指数退避
-- **系统托盘**：最小化到托盘，右键菜单快捷操作
+- **多账号管理**：添加、编辑、删除用户，支持一键登录/登出
+- **登录 / 登出**：基于 srun 协议 (HMAC-MD5 + x_encode + SHA1)
+- **系统托盘**：最小化到托盘，左键单击/双击显示窗口，右键菜单快捷操作（显示窗口、一键登录、一键登出、退出）
+- **认证状态同步**：通过校园网认证服务器接口 (`rad_user_info`) 读取当前在线状态，包括当前账号、认证 IP、在线时长、剩余流量等
+- **登录后自动刷新**：登录成功后自动刷新认证状态，UI 同步显示在线时长和剩余流量
+- **手动刷新**：服务器地址旁提供「刷新状态」按钮，可随时手动查询认证服务器
+- **界面反馈**：在线用户卡片上显示「已确认」标签，表示服务器已验证该用户在线
+- **自动重连**：基于认证服务器状态判断，支持指数退避，可在设置中开启/关闭
+- **版本更新**：启动时自动检查 GitHub Release 更新，支持程序内一键自动更新
+- **IPv4 外网探测开关**：可选的 IPv4 外网可达性诊断功能（默认关闭），关闭后不访问任何外网探测 URL
+- **开机自启**：通过 Windows 注册表 Run 键
 - **中 / English 语言切换**
-- **开机自启**：Windows 注册表 Run 键
-- **严格绑定 IP**：将出站连接绑定到指定 IP 地址
-- **运营商选择**：用户名后缀 `@cmcc` / `@unicom` / `@chinanet`
-- **窗口大小记忆**：关闭时保存窗口尺寸
+- **窗口大小记忆**：关闭时自动保存
 - **无控制台窗口**：`#![windows_subsystem = "windows"]`
 
-## 截图
+## 认证状态同步
 
-```
-┌──────────────────────────────────────────────────┐
-│  校园网客户端                                     │
-│  服务器: [http://10.0.0.55_______________]        │
-├──────────────────────────────────────────────────┤
-│  校园网 IPv4: 10.x.x.x  IPv4 外网: 可访问          │
-├──────────────────────────────────────────────────┤
-│  ┌ user1 ───────────────────────── 编辑 删除     │
-│  │ ● 在线   用户: user1   IP: 10.x.x.x           │
-│  └───────────────────────────────────────────────┘│
-│  ┌ user2 ─────────────────────────── 编辑 删除   │
-│  │ ○ 离线  用户: user2   IP: 自动检测            │
-│  └───────────────────────────────────────────────┘│
-│  [+ 添加用户]    [一键登录] [一键登出]             │
-├──────────────────────────────────────────────────┤
-│  ▼ 设置                                          │
-│  ▼ 日志                                          │
-│       github.com/uchihazzj/campus_net             │
-└──────────────────────────────────────────────────┘
-```
+程序通过校园网认证服务器的 `/cgi-bin/rad_user_info` 接口读取当前在线状态。该接口无需额外认证即可返回已登录用户信息。
 
-## 网络检测机制
+**当前支持读取的信息**：
 
-软件采用四层检测，**全程仅使用 IPv4 HTTP/HTTPS，不使用 ICMP ping**，适配 Clash TUN mode、双栈网络等环境。
+- 当前在线账号
+- 认证分配的 IP 地址
+- 在线时长（小时）
+- 剩余流量
+- 当前套餐名称
+- 账户余额
 
-### 检测前提
+**状态同步时机**：
 
-在笔者的校园网环境中，未完成校园网认证时 **IPv6 仍然可以正常访问外网**，只有 IPv4 访问外网需要认证。因此本软件的网络检测必须满足：
+- 程序启动时自动检测一次
+- 登录成功后自动刷新（延迟 500ms 等待服务器状态更新）
+- 登出成功后自动刷新
+- 后台每 30 秒（可配置）周期刷新
+- 点击「刷新状态」按钮手动刷新
 
-- 不能因为 IPv6 可达就显示"互联网正常"
-- 必须强制使用 IPv4 进行所有外网可达性检测
-- 校园网认证状态必须独立判断，不能用公网可达性替代
+**UI 显示原则**：
 
-### 四层检测详解
+- 当前在线账号完整显示在 UI 中
+- 在线时长、剩余流量、套餐名称显示在已登录用户卡片内
+- MAC 地址和真实姓名默认不显示
+- 在线时长仅显示小时数，向下取整
 
-| 层级 | 检测内容 | 检测方式 | 说明 |
-|------|---------|---------|------|
-| **Layer 1** | 校园网 IPv4 | 枚举所有 IPv4 地址，匹配 `10.*.*.*` | 未检测到 10 段 IP 时停止后续检测和自动重连 |
-| **Layer 2** | 认证服务器 | HTTP GET `{server}/cgi-bin/get_challenge` | 任何 HTTP 响应 = Reachable；连接失败 = Unreachable |
-| **Layer 3** | 校园网认证 | HTTP GET `baidu.com`，禁用自动跳转 | 被 portal 劫持重定向 → Not logged in |
-| **Layer 4** | IPv4 外网 | 多 URL 串行检测，强制绑定校园网 IPv4 | 连续失败 2 次才判定 Unreachable |
+## 自动重连
 
-### IPv4 强制绑定
+自动重连逻辑优先根据校园网认证服务器返回的登录状态判断是否需要重连：
 
-Layer 2、Layer 3 和 Layer 4 的 HTTP 客户端通过 `reqwest::ClientBuilder::local_address()` 绑定到检测到的校园网 IPv4 地址（即 `10.*.*.*`），确保：
+- 认证服务器确认已登录 → 不重连
+- 认证服务器确认未登录 → 触发重连
+- 认证服务器请求失败（Unknown）→ 不立即重连，等待下次周期确认
+- 连续 3 次请求失败后降级为原有 HTTP 重定向检测
 
-- HTTP 流量走 IPv4 而不是 IPv6
-- 流量走校园网物理接口而不是 TUN 虚拟接口
-- DNS 解析结果自动过滤 IPv6 地址（因为 IPv4 socket 无法连接 IPv6 地址）
+自动重连可在设置中开启或关闭。当 IPv4 外网探测开关关闭时，自动重连不依赖外网探测结果。
 
-同时启用 `no_proxy()` 避免应用层 HTTP 代理干扰。
+## IPv4 外网探测开关
 
-### Layer 2 — 认证服务器可达性检测
+该功能用于诊断 IPv4 外网可达性，通过向多个公共 URL（baidu.com、miui.com、msftconnecttest.com、cloudflare.com）发送 HTTP 请求来判断 IPv4 外网是否通畅。
 
-向认证服务器的 `/cgi-bin/get_challenge` 发起 HTTP GET 请求：
-
-| 响应 | 判断 |
+| 设置 | 行为 |
 |------|------|
-| 任何 HTTP 响应（200 / 4xx / 5xx） | `Reachable` |
-| 连接失败 / 超时 | `Unreachable` |
+| **关闭（默认）** | 不访问外网探测 URL；UI 不显示 IPv4 外网状态；仍通过校园网认证服务器刷新登录状态 |
+| **开启** | 执行外网 IPv4 探测；UI 显示 IPv4 外网可达性；仅作诊断参考，不作为唯一登录状态依据 |
 
-### Layer 3 — 认证状态检测
+推荐普通用户保持关闭。需要排查校园网 IPv4 路由问题时再打开。
 
-向 `http://www.baidu.com` 发起 HTTP GET 请求，不跟随重定向：
+此开关在设置面板中，中文显示为「启用外网 IPv4 探测」，英文显示为「Enable IPv4 internet probe」。
 
-| 响应 | 判断 |
-|------|------|
-| 200 OK | `Logged in` |
-| 30x 重定向到 portal（含 `srun_portal` / `ac_id=` / `wlanuserip` 等） | `Not logged in` |
-| 30x 重定向到非 portal URL（如 http→https 升级） | `Logged in` |
-| 连接失败 / 超时 | `Unknown` |
+## 自动更新
 
-### Layer 4 — IPv4 外网可达性检测
+程序启动时会自动检查 GitHub latest release 是否有新版本。
 
-先绑定校园网 IPv4 探测，全部失败后执行 unbound fallback：
+- 检测到新版本时，UI 显示最新版本号、[自动更新] 按钮和 [打开 GitHub Release] 按钮
+- 点击 [自动更新] 后，程序下载 `campus-net-client.exe`、生成 PowerShell 替换脚本、保存配置后退出旧进程
+- Release Assets 中必须包含文件名 `campus-net-client.exe`
+- 自动更新需要当前程序目录有写入权限
+- 如果程序放在 `Program Files` 等受保护目录，自动更新可能因权限不足失败
+- 更新失败时可查看当前目录下的 `app.log`
 
-| 检测 URL | 成功条件 |
-|----------|---------|
-| `http://www.baidu.com` | 200 且 body ≥ 1000 字节 |
-| `http://connect.rom.miui.com/generate_204` | 204 No Content |
-| `http://www.msftconnecttest.com/connecttest.txt` | 200 OK |
-| `http://cp.cloudflare.com/` | 200 OK |
+## 安装和升级
 
-**Bound probe**：HTTP 客户端绑定校园网 IPv4，任意端点成功 → `Reachable`，portal 重定向 → `CaptivePortal`，全部失败 → 进入 fallback。
-
-**Unbound fallback**：仅信任 `CaptivePortal`（portal 重定向在任何 IP 协议上都是真实的）。若 unbound 返回 `Reachable`，视为 `ProbeFailed`——因为无法确认是否经由 IPv6 到达，避免误报。
-
-连续 2 次确认后更新 UI 状态。
-
-### 自动重连逻辑
-
-- 检测间隔：默认 **30 秒**，通过 UI 可配置范围 15–300 秒
-- 无校园网 IPv4 时：**不自动重连**
-- 触发条件（任一满足且连续 2 次确认）：
-  - `IPv4 Internet` 为 `CaptivePortal`（IPv4 被门户劫持）
-  - `Campus Auth` 为 `NotLoggedIn`（认证已丢失）
-  - `LoggedIn` 但 `IPv4 Internet` 为 `Unreachable`（已登录但外网不通）
-- 重连目标：首次检测到问题时快照所有 Online 用户；若没有 Online 用户则重连全部配置的用户
-- 重连失败后采用**指数退避**：从当前检测间隔开始翻倍，最大 300s
-- 重连成功后重置为当前检测间隔，清空重连目标
+1. 从 [GitHub Releases](https://github.com/uchihazzj/campus_net/releases) 下载 `campus-net-client.exe`
+2. 将 exe 放在普通用户有写权限的目录（推荐 `%USERPROFILE%\CampusNet\`）
+3. 首次运行后自动生成 `config.json`
+4. 升级时只需替换 exe 文件，保留 `config.json` 即可沿用旧配置
+5. 后续版本可使用程序内自动更新
 
 ## 编译
 
@@ -148,8 +115,13 @@ cargo build --release
 
 1. 启动 `campus-net-client.exe`（无控制台窗口）
 2. 顶部输入校园网认证服务器地址，例如 `http://10.0.0.55`
-3. 点击「添加用户」，填写用户名和密码
+3. 点击「+ 添加用户」，填写用户名和密码
 4. 点击「登录」
+5. 登录成功后，用户卡片自动显示已确认状态、认证 IP、在线时长、剩余流量
+
+### 网卡绑定
+
+推荐在用户设置中绑定网卡名（如 `Ethernet0`），而不是固定 IP。程序会通过网卡名实时解析当前校园网 IP。不推荐填写固定 IP — 校园网 DHCP 重新分配 IP 后会导致登录失败。
 
 ### 配置文件
 
@@ -172,13 +144,14 @@ cargo build --release
   "auto_reconnect": true,
   "minimize_to_tray": true,
   "auto_start": true,
+  "enable_ipv4_internet_probe": false,
   "language": "zh",
   "users": [
     {
       "username": "your_account",
       "encrypted_password": "base64...",
       "ip": null,
-      "if_name": null
+      "if_name": "Ethernet0"
     }
   ]
 }
@@ -188,9 +161,9 @@ cargo build --release
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `server` | string | `http://10.0.0.55` | 认证服务器地址，**不是你本机的 IP** |
-| `detect_ip` | bool | `false` | 登录时自动检测 IP（通过 get_challenge 接口） |
-| `strict_bind` | bool | `false` | 将出站连接绑定到用户配置的 IP |
+| `server` | string | `http://10.0.0.55` | 认证服务器地址 |
+| `detect_ip` | bool | `false` | 登录时通过 get_challenge 自动检测 IP |
+| `strict_bind` | bool | `false` | 将出站连接绑定到指定 IP |
 | `double_stack` | bool | `false` | 启用 IPv4 + IPv6 双栈 |
 | `n` | int | `200` | srun 认证参数 |
 | `type` | int | `1` | srun 认证类型 |
@@ -199,10 +172,11 @@ cargo build --release
 | `name` | string | `Windows` | 上报给认证服务器的设备名 |
 | `retry_delay` | int | `1000` | 登录重试间隔（毫秒） |
 | `retry_times` | int | `3` | 登录重试次数 |
-| `monitor_interval_secs` | int | `30` | 网络检测间隔（秒），范围 15–300，通过 UI 设置面板调整 |
+| `monitor_interval_secs` | int | `30` | 网络检测间隔（秒），范围 15–300 |
 | `auto_reconnect` | bool | `true` | 断网自动重连 |
 | `minimize_to_tray` | bool | `true` | 关闭窗口时最小化到托盘 |
 | `auto_start` | bool | `true` | 开机自启 |
+| `enable_ipv4_internet_probe` | bool | `false` | 启用 IPv4 外网探测（诊断用，默认关闭） |
 | `language` | string | `zh` | 语言：`zh` 中文 / `en` English |
 | `window_width` | float | — | 上次窗口宽度（自动保存） |
 | `window_height` | float | — | 上次窗口高度（自动保存） |
@@ -212,9 +186,19 @@ cargo build --release
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `username` | string | 校园网账号 |
-| `encrypted_password` | string | 密码（base64 编码存储） |
-| `ip` | string \| null | 静态 IP，留空则自动检测 |
-| `if_name` | string \| null | 指定网卡名（如 `Ethernet0`），用于多网卡环境 |
+| `encrypted_password` | string | 密码（base64 编码本地存储） |
+| `ip` | string \| null | 固定 IP（不推荐填写；程序优先通过网卡名实时解析） |
+| `if_name` | string \| null | 网卡名（推荐填写，如 `Ethernet0`） |
+
+### IP 解析优先级
+
+登录和登出时，程序按以下优先级确定使用的 IP：
+
+1. 网卡名实时解析（推荐方式，适配 DHCP 变化）
+2. 自动检测当前 `10.x.x.x` 校园网 IP
+3. 用户配置的固定 IP（仅作为兜底）
+
+新用户默认不保存固定 IP，避免 DHCP 重新分配后登录失败。
 
 ### 运营商选择
 
@@ -224,25 +208,46 @@ cargo build --release
 - 联通：`username@unicom`
 - 电信：`username@chinanet`
 
+## 日志与排错
+
+程序运行目录自动生成 `app.log`，记录运行状态和错误信息。
+
+| 问题 | 排查方向 |
+|------|---------|
+| 登录失败 | 检查认证服务器地址、账号密码、网卡/IP 配置、校园网连接状态 |
+| 自动更新失败 | 检查当前目录是否有写入权限、能否访问 GitHub |
+| 认证状态刷新失败 | 查看 `app.log` 中 `[OnlineInfo]` / `[WARN]` 相关日志 |
+| 自动重连未触发 | 确认设置中 `auto_reconnect` 已开启 |
+
+## 已知限制
+
+- 当前主要面向 Windows 平台
+- 认证接口 (`rad_user_info`) 和返回字段依赖具体校园网的深澜认证系统版本，不同学校可能不同
+- 不同学校的 `acid`、`n`、`type`、认证服务器地址等参数可能需要手动调整
+- 自动更新仅校验文件名，未做 SHA/签名校验
+- IPv4 外网探测仅用于网络诊断，不应作为登录状态的唯一判断依据
+
 ## 项目结构
 
 ```
 src/
-├── main.rs              # 入口：tokio runtime + eframe + CJK 字体加载
-├── app.rs               # GUI 渲染 + 系统托盘 + 用户增删改
+├── main.rs              # 入口：tokio runtime + eframe + CJK 字体加载 + tracing 日志
+├── app.rs               # GUI 渲染 + 系统托盘 + 用户增删改 + 设置面板
 ├── core/
 │   ├── srun.rs          # srun 认证协议（async reqwest）
 │   ├── xencode.rs       # x_encode 加密算法
 │   └── utils.rs         # 网卡枚举
 ├── service/
-│   ├── auth.rs          # 异步登录 / 登出
+│   ├── auth.rs          # 异步登录 / 登出 + 一键登录/登出
 │   ├── config.rs        # 配置读写
-│   ├── detection.rs     # 四层网络检测（IPv4-only）
+│   ├── detection.rs     # 校园网 IP 检测 + 认证服务器探测 + 外网可达性检测
 │   ├── monitor.rs       # 后台监控 + 自动重连 + 指数退避
-│   └── mod.rs           # AppState / SharedState / 状态枚举
+│   ├── online_info.rs   # rad_user_info 查询 + 在线状态同步 + 启动任务编排
+│   ├── mod.rs           # AppState / SharedState / 状态枚举
+│   └── update.rs        # 版本更新检查 + 下载 + PowerShell 更新脚本
 ├── platform/
 │   ├── autostart.rs     # Windows 注册表开机自启
-│   └── secure_store.rs  # 密码 base64 编解码
+│   └── secure_store.rs  # 密码 base64 编解码存储
 └── ui/
     └── l10n.rs          # 中英文 UI 文案
 ```
@@ -257,9 +262,8 @@ src/
 | HTTP 客户端 | [reqwest](https://github.com/seanmonstar/reqwest) 0.12 (rustls-tls, no default features) |
 | 序列化 | [serde](https://serde.rs/) + serde_json |
 | 网卡枚举 | [if-addrs](https://github.com/sajuthy/if-addrs) 0.13 |
-| 加密算法（自实现） | md-5 + sha-1 + base64 |
+| 加密算法 | md-5 + sha-1 + base64（自实现 HMAC-MD5 + x_encode + SHA1） |
 | 日志 | [tracing](https://github.com/tokio-rs/tracing) + tracing-subscriber |
-| srun 协议 | 自实现：HMAC-MD5 + x_encode + SHA1 |
 
 ## License
 
