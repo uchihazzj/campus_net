@@ -80,7 +80,7 @@
 - Release Assets 中必须包含文件名 `campus-net-client.exe`
 - 自动更新需要当前程序目录有写入权限
 - 如果程序放在 `Program Files` 等受保护目录，自动更新可能因权限不足失败
-- 更新失败时可查看当前目录下的 `app.log`
+- 更新失败时可查看 exe 所在目录下的 `app.log`
 
 ## 安装和升级
 
@@ -125,7 +125,7 @@ cargo build --release
 
 ### 配置文件
 
-程序运行目录自动生成 `config.json`，可通过 GUI 或手动编辑。
+程序 exe 所在目录自动生成 `config.json`，可通过 GUI 或手动编辑。
 
 ```json
 {
@@ -212,7 +212,7 @@ cargo build --release
 
 ## 日志与排错
 
-程序运行目录自动生成 `app.log`，记录运行状态和错误信息。
+程序 exe 所在目录自动生成 `app.log`，记录运行状态和错误信息。
 
 | 问题 | 排查方向 |
 |------|---------|
@@ -235,6 +235,7 @@ cargo build --release
 src/
 ├── main.rs              # 入口：tokio runtime + eframe + CJK 字体加载 + tracing 日志
 ├── app.rs               # GUI 渲染 + 系统托盘 + 用户增删改 + 设置面板
+├── path.rs              # 统一路径：config_path() / log_path() 基于 current_exe()
 ├── core/
 │   ├── srun.rs          # srun 认证协议（async reqwest）
 │   ├── xencode.rs       # x_encode 加密算法
@@ -243,6 +244,7 @@ src/
 │   ├── auth.rs          # 异步登录 / 登出 + 一键登录/登出
 │   ├── config.rs        # 配置读写
 │   ├── detection.rs     # 校园网 IP 检测 + 认证服务器探测 + 外网可达性检测
+│   ├── http_client.rs   # 共享 reqwest::Client 构建器
 │   ├── monitor.rs       # 后台监控 + 自动重连 + 指数退避
 │   ├── online_info.rs   # rad_user_info 查询 + 在线状态同步 + 启动任务编排
 │   ├── mod.rs           # AppState / SharedState / 状态枚举
@@ -251,7 +253,9 @@ src/
 │   ├── autostart.rs     # Windows 注册表开机自启
 │   └── secure_store.rs  # 密码 base64 编解码存储
 └── ui/
-    └── l10n.rs          # 中英文 UI 文案
+    ├── mod.rs           # UI 公共工具（format_bytes 等）
+    ├── l10n.rs          # 中英文 UI 文案
+    └── log_panel.rs     # 日志面板渲染
 ```
 
 ## 技术栈
