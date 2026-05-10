@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -105,13 +104,6 @@ pub async fn check_update() -> Result<Option<(String, String, String)>, String> 
     Ok(Some((release.tag_name, release.html_url, download_url)))
 }
 
-fn exe_dir() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {}", e))?;
-    exe.parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| "Failed to get exe directory".to_string())
-}
-
 fn app_log(msg: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -135,9 +127,10 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
     }
     crate::service::request_ui_repaint();
 
-    let dir = match exe_dir() {
-        Ok(d) => d,
-        Err(e) => {
+    let dir = match crate::path::exe_dir() {
+        Some(d) => d,
+        None => {
+            let e = "Failed to get exe directory".to_string();
             let mut s = state.lock().unwrap();
             s.update_status = UpdateStatus::Failed(e.clone());
             s.add_log(format!("[ERROR] {}", e));
@@ -298,7 +291,12 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     // Save config before exit
     {
         let s = state.lock().unwrap();
-        let _ = crate::service::config::write_config(config_path(), &s.config);
+        if let Err(e) = crate::service::config::write_config(config_path(), &s.config) {
+            app_log(&format!(
+                "[ERROR] Failed to save config before update: {}",
+                e
+            ));
+        }
     }
 
     let old_exe_str = old_exe.to_string_lossy().to_string();

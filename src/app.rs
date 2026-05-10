@@ -57,7 +57,9 @@ fn native_force_quit(state: &SharedState) {
     tracing::info!("[Native] Force quit from tray");
     // Save config before exiting
     if let Ok(mut s) = state.lock() {
-        let _ = write_config(config_path(), &s.config);
+        if let Err(e) = write_config(config_path(), &s.config) {
+            tracing::error!("Failed to save config on quit: {}", e);
+        }
         s.add_log("[INFO] Quit from tray menu".to_string());
         tracing::info!("[Native] Config saved, initiating quit");
     }
@@ -536,7 +538,7 @@ impl CampusNetApp {
                             }
                             s.add_log("[INFO] Removed user".to_string());
                         }
-                        let _ = self.save_config();
+                        self.save_config();
                         return;
                     }
 
@@ -852,7 +854,7 @@ impl CampusNetApp {
                             s.ensure_statuses();
                         }
 
-                        let _ = self.save_config();
+                        self.save_config();
                         self.show_add_dialog = false;
                         self.editing_user_idx = None;
                     }
@@ -1154,7 +1156,7 @@ impl CampusNetApp {
                     s.config.os = os;
                     s.config.name = name;
                 }
-                let _ = self.save_config();
+                self.save_config();
             }
         });
     }
@@ -1164,9 +1166,17 @@ impl CampusNetApp {
         crate::ui::log_panel::render_log_panel(&self.state, &mut self.log_scroll_to_bottom, ui, &t);
     }
 
-    fn save_config(&self) -> anyhow::Result<()> {
-        let s = self.state.lock().unwrap();
-        write_config(config_path(), &s.config)
+    fn save_config(&self) {
+        let result = {
+            let s = self.state.lock().unwrap();
+            write_config(config_path(), &s.config)
+        };
+        if let Err(ref e) = result {
+            tracing::error!("Failed to save config: {}", e);
+            if let Ok(mut s) = self.state.lock() {
+                s.add_log(format!("[ERROR] Failed to save config: {}", e));
+            }
+        }
     }
 }
 
@@ -1202,7 +1212,7 @@ impl eframe::App for CampusNetApp {
                 s.config.window_width = Some(size.x);
                 s.config.window_height = Some(size.y);
                 drop(s);
-                let _ = self.save_config();
+                self.save_config();
             }
 
             let force = FORCE_QUIT.load(Ordering::SeqCst);

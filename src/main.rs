@@ -16,7 +16,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use path::{config_path, log_path};
+use path::{config_path, ensure_data_dir, log_path, migrate_config};
 use service::config::read_config;
 use service::SharedState;
 
@@ -111,6 +111,26 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{}", msg);
     }));
 
+    // Ensure C:\ProgramData\CampusNetClient exists before any file I/O
+    let data_dir_error = match ensure_data_dir() {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("FATAL: Failed to create app data directory: {}", e);
+            Some(e)
+        }
+    };
+
+    // Migrate old config to ProgramData if needed
+    let migration_msg = match migrate_config() {
+        Ok((true, msg)) => Some(msg),
+        Ok((false, _)) => None,
+        Err(e) => {
+            let msg = format!("Config migration failed: {}", e);
+            eprintln!("{}", msg);
+            Some(msg)
+        }
+    };
+
     let log_file = FileWriter::new(log_path());
 
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -151,6 +171,12 @@ fn main() -> anyhow::Result<()> {
         cfg_path.display(),
         log_p.display(),
     );
+    if let Some(ref e) = data_dir_error {
+        tracing::error!("app_data_dir creation failed: {}", e);
+    }
+    if let Some(ref msg) = migration_msg {
+        tracing::info!("config_migration: {}", msg);
+    }
 
     // Build tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
