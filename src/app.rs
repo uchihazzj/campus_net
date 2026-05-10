@@ -8,6 +8,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::core::srun::SrunClient;
 use crate::core::utils::get_network_interfaces;
+use crate::path::config_path;
 use crate::platform::autostart;
 use crate::platform::secure_store;
 use crate::service::auth;
@@ -56,7 +57,7 @@ fn native_force_quit(state: &SharedState) {
     tracing::info!("[Native] Force quit from tray");
     // Save config before exiting
     if let Ok(mut s) = state.lock() {
-        let _ = write_config("config.json", &s.config);
+        let _ = write_config(config_path(), &s.config);
         s.add_log("[INFO] Quit from tray menu".to_string());
         tracing::info!("[Native] Config saved, initiating quit");
     }
@@ -1165,7 +1166,7 @@ impl CampusNetApp {
 
     fn save_config(&self) -> anyhow::Result<()> {
         let s = self.state.lock().unwrap();
-        write_config("config.json", &s.config)
+        write_config(config_path(), &s.config)
     }
 }
 

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::platform::secure_store;
@@ -95,7 +97,8 @@ impl AppConfig {
     }
 }
 
-pub fn read_config(path: &str) -> anyhow::Result<AppConfig> {
+pub fn read_config(path: impl AsRef<Path>) -> anyhow::Result<AppConfig> {
+    let path = path.as_ref();
     let mut config = match std::fs::read_to_string(path) {
         Ok(content) => {
             let c: AppConfig = serde_json::from_str(&content)?;
@@ -122,7 +125,7 @@ pub fn read_config(path: &str) -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
-pub fn write_config(path: &str, config: &AppConfig) -> anyhow::Result<()> {
+pub fn write_config(path: impl AsRef<Path>, config: &AppConfig) -> anyhow::Result<()> {
     let content = serde_json::to_string_pretty(config)?;
     std::fs::write(path, content)?;
     Ok(())

@@ -70,9 +70,11 @@ mod windows_impl {
 
     pub fn enable_autostart() -> anyhow::Result<()> {
         let exe_path = get_exe_path()?;
+        // Quote the path so it works even with spaces (e.g. Program Files)
+        let quoted_path = format!("\"{}\"", exe_path);
         let key_name = to_wide(RUN_KEY);
         let value_name = to_wide(APP_NAME);
-        let exe_wide: Vec<u16> = OsStr::new(&exe_path)
+        let exe_wide: Vec<u16> = OsStr::new(&quoted_path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();

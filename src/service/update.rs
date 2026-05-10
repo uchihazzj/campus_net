@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::path::{config_path, log_path};
 use crate::service::SharedState;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,7 +116,7 @@ fn app_log(msg: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("app.log")
+        .open(log_path())
     {
         let _ = writeln!(file, "{}", msg);
     }
@@ -297,7 +298,7 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     // Save config before exit
     {
         let s = state.lock().unwrap();
-        let _ = crate::service::config::write_config("config.json", &s.config);
+        let _ = crate::service::config::write_config(config_path(), &s.config);
     }
 
     let old_exe_str = old_exe.to_string_lossy().to_string();
