@@ -122,7 +122,12 @@ pub fn spawn_monitor(state: SharedState) {
                 s.campus_ip = campus_ipv4.clone();
             }
 
-            if campus_ipv4.is_none() {
+            let has_usable_ip = {
+                let s = state.lock().unwrap();
+                any_usable_ip(&s)
+            };
+
+            if campus_ipv4.is_none() && !has_usable_ip {
                 let mut s = state.lock().unwrap();
                 s.auth_server = AuthServerStatus::Unknown;
                 s.campus_auth = CampusAuthStatus::Unknown;
@@ -132,15 +137,29 @@ pub fn spawn_monitor(state: SharedState) {
                     Ipv4InternetStatus::Disabled
                 };
                 s.internet_fail_count = 0;
-                s.reconnect_targets.clear();
+                s.add_log(
+                    "[WARN] No campus IPv4 detected and no user-bound IP available; waiting"
+                        .to_string(),
+                );
                 backoff_secs = interval;
                 continue;
+            }
+
+            if campus_ipv4.is_none() {
+                // has_usable_ip is true — we have user-configured IP or
+                // current_ip to fall back on for login, but rad_user_info and
+                // IPv4 probe may bind to a less precise address.
+                let mut s = state.lock().unwrap();
+                s.auth_server = AuthServerStatus::Unknown;
+                s.campus_auth = CampusAuthStatus::Unknown;
+                s.add_log(
+                    "[WARN] No global campus IPv4 detected, but user-bound IP exists; continuing auto-reconnect evaluation"
+                        .to_string(),
+                );
             }
             let ip = campus_ipv4.as_deref();
 
             // ── Layer 2+3: Auth Server + Auth Status ─────
-            // Merged into a single rad_user_info query that provides both
-            // server reachability AND definitive login state (+ account identity).
             sync_online_state(&state).await;
 
             // ── Layer 4: IPv4 Internet (conditional) ─────
@@ -150,34 +169,45 @@ pub fn spawn_monitor(state: SharedState) {
             };
 
             if probe_enabled {
-                let ipv4_status = check_ipv4_reachability(ip).await;
-                {
-                    let mut s = state.lock().unwrap();
-                    match &ipv4_status {
-                        Ipv4InternetStatus::Reachable => {
-                            s.internet_fail_count = 0;
-                            s.ipv4_internet = Ipv4InternetStatus::Reachable;
-                            if !s.reconnect_targets.is_empty() {
-                                s.add_log(
-                                    "[INFO] IPv4 internet restored, clearing reconnect targets"
-                                        .to_string(),
-                                );
-                                s.reconnect_targets.clear();
+                if let Some(bind_ip) = ip {
+                    let ipv4_status = check_ipv4_reachability(Some(bind_ip)).await;
+                    {
+                        let mut s = state.lock().unwrap();
+                        match &ipv4_status {
+                            Ipv4InternetStatus::Reachable => {
+                                s.internet_fail_count = 0;
+                                s.ipv4_internet = Ipv4InternetStatus::Reachable;
+                                if !s.reconnect_targets.is_empty() {
+                                    s.add_log(
+                                        "[INFO] IPv4 internet restored, clearing reconnect targets"
+                                            .to_string(),
+                                    );
+                                    s.reconnect_targets.clear();
+                                }
                             }
-                        }
-                        Ipv4InternetStatus::CaptivePortal => {
-                            s.internet_fail_count += 1;
-                            if s.internet_fail_count >= FAILURE_THRESHOLD {
-                                s.ipv4_internet = Ipv4InternetStatus::CaptivePortal;
+                            Ipv4InternetStatus::CaptivePortal => {
+                                s.internet_fail_count += 1;
+                                if s.internet_fail_count >= FAILURE_THRESHOLD {
+                                    s.ipv4_internet = Ipv4InternetStatus::CaptivePortal;
+                                }
                             }
-                        }
-                        _ => {
-                            s.internet_fail_count += 1;
-                            if s.internet_fail_count >= FAILURE_THRESHOLD {
-                                s.ipv4_internet = ipv4_status.clone();
+                            _ => {
+                                s.internet_fail_count += 1;
+                                if s.internet_fail_count >= FAILURE_THRESHOLD {
+                                    s.ipv4_internet = ipv4_status.clone();
+                                }
                             }
                         }
                     }
+                } else {
+                    // No global campus IPv4 to bind probe — skip to avoid
+                    // false positives from IPv6 or default route.
+                    let mut s = state.lock().unwrap();
+                    s.ipv4_internet = Ipv4InternetStatus::ProbeFailed;
+                    s.add_log(
+                        "[WARN] IPv4 probe skipped: no global campus IPv4 for bound probe, but user-bound IP exists"
+                            .to_string(),
+                    );
                 }
             } else {
                 let mut s = state.lock().unwrap();
@@ -369,5 +399,54 @@ mod tests {
     fn no_ip_at_all() {
         let s = make_state();
         assert!(!any_usable_ip(&s));
+    }
+
+    // ── evaluate_reconnect with user-bound IP ─────────────
+
+    #[test]
+    fn reconnect_user_ip_without_campus_ip() {
+        let mut s = make_state();
+        s.config.auto_reconnect = true;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        s.config.users.push(StoredUser {
+            username: "test".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.2".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        // campus_ip is None but user.ip exists → should allow reconnect
+        assert!(matches!(
+            evaluate_reconnect(&s),
+            ReconnectDecision::Reconnect
+        ));
+    }
+
+    #[test]
+    fn reconnect_current_ip_without_campus_ip() {
+        let mut s = make_state();
+        s.config.auto_reconnect = true;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        s.config.users.push(StoredUser {
+            username: "test".to_string(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.user_statuses[0].current_ip = "10.0.0.3".to_string();
+        assert!(matches!(
+            evaluate_reconnect(&s),
+            ReconnectDecision::Reconnect
+        ));
+    }
+
+    #[test]
+    fn no_reconnect_without_any_ip() {
+        let mut s = make_state();
+        s.config.auto_reconnect = true;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        // No campus_ip, no user.ip, no current_ip, no if_name
+        assert!(matches!(evaluate_reconnect(&s), ReconnectDecision::Wait));
     }
 }
