@@ -436,36 +436,7 @@ pub fn should_auto_login(
 
 pub fn spawn_startup_tasks(state: SharedState) {
     tokio::spawn(async move {
-        // ── Phase 1: Version check ──────────────────────
-        {
-            let mut s = state.lock().unwrap();
-            s.update_status = crate::service::update::UpdateStatus::Checking;
-            s.add_log("[INFO] Checking for updates...".to_string());
-        }
-        crate::service::request_ui_repaint();
-
-        match crate::service::update::check_update().await {
-            Ok(Some((latest, release_url, download_url))) => {
-                let mut s = state.lock().unwrap();
-                s.add_log(format!("[INFO] New version available: {}", latest));
-                s.update_status = crate::service::update::UpdateStatus::Available {
-                    latest,
-                    release_url,
-                    download_url,
-                };
-            }
-            Ok(None) => {
-                let mut s = state.lock().unwrap();
-                s.update_status = crate::service::update::UpdateStatus::UpToDate;
-            }
-            Err(e) => {
-                let mut s = state.lock().unwrap();
-                s.add_log(format!("[WARN] Version check failed: {}", e));
-                s.update_status = crate::service::update::UpdateStatus::Failed(e);
-            }
-        }
-        crate::service::request_ui_repaint();
-
+        // Phase 1 (version check) is now handled by update_scheduler.
         // ── Phase 2: Detect campus IP ──────────────────
         {
             let ip = detect_campus_ip();
