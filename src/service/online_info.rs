@@ -93,6 +93,20 @@ pub fn match_account(
     }
 }
 
+/// If `online_info` matches a single local account, return its index.
+/// Returns `None` when online_info is None, the match is ambiguous,
+/// or no local user matches.
+pub fn confirmed_online_user_idx(
+    online_info: Option<&OnlineUserInfo>,
+    users: &[crate::service::config::StoredUser],
+) -> Option<usize> {
+    let info = online_info?;
+    match match_account(&info.user_name, users) {
+        MatchResult::Exact(idx) | MatchResult::UniqueBase(idx) => Some(idx),
+        MatchResult::Ambiguous(_) | MatchResult::NoMatch => None,
+    }
+}
+
 /// Fetch online user info from the auth server's rad_user_info endpoint.
 ///
 /// Returns:
@@ -818,5 +832,63 @@ mod tests {
         // PendingConfirm should be invalidated
         assert_eq!(statuses[0].state, LoginState::Error);
         assert_eq!(statuses[1].state, LoginState::LoggedOut);
+    }
+
+    // ── confirmed_online_user_idx tests ────────────────────
+
+    fn make_online_info(user_name: &str) -> OnlineUserInfo {
+        OnlineUserInfo {
+            user_name: user_name.to_string(),
+            error: "ok".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn confirmed_none_when_online_info_is_none() {
+        let users = vec![make_user("abc@cmcc")];
+        assert_eq!(confirmed_online_user_idx(None, &users), None);
+    }
+
+    #[test]
+    fn confirmed_block_other_account() {
+        // Server confirms account A (idx 0), target is B (idx 1) → block
+        let info = make_online_info("alice@cmcc");
+        let users = vec![make_user("alice@cmcc"), make_user("bob@cmcc")];
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), Some(0));
+    }
+
+    #[test]
+    fn confirmed_same_account_not_blocked() {
+        // Server confirms account A (idx 0), target is also A → no block
+        let info = make_online_info("alice@cmcc");
+        let users = vec![make_user("alice@cmcc"), make_user("bob@cmcc")];
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), Some(0));
+    }
+
+    #[test]
+    fn confirmed_unique_base_block_other() {
+        // Server returns "abc" (base), local has abc@cmcc (idx 0)
+        // Target is another user (idx 1) → block (returns 0)
+        let info = make_online_info("abc");
+        let users = vec![make_user("abc@cmcc"), make_user("xyz@cmcc")];
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), Some(0));
+    }
+
+    #[test]
+    fn confirmed_ambiguous_not_blocked() {
+        // Server returns "abc" (base), local has abc@cmcc AND abc@unicom
+        // Ambiguous → None (don't block)
+        let info = make_online_info("abc");
+        let users = vec![make_user("abc@cmcc"), make_user("abc@unicom")];
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), None);
+    }
+
+    #[test]
+    fn confirmed_no_match_not_blocked() {
+        // Server returns user not in local config → None (don't block)
+        let info = make_online_info("stranger");
+        let users = vec![make_user("alice@cmcc")];
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), None);
     }
 }

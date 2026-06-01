@@ -39,6 +39,31 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         )
     };
 
+    // Guard: block login if a different local account is already confirmed online
+    {
+        let mut s = state.lock().unwrap();
+        if let Some(online_idx) = crate::service::online_info::confirmed_online_user_idx(
+            s.online_info.as_ref(),
+            &s.config.users,
+        ) {
+            if online_idx != user_idx && user_idx < s.config.users.len() {
+                let target_uname = s.config.users[user_idx].username.clone();
+                let online_uname = s.config.users[online_idx].username.clone();
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error = format!(
+                    "Another account is already online: {}. Please logout first before logging into this account.",
+                    online_uname
+                );
+                s.add_log(format!(
+                    "[WARN] {}: login blocked because {} is already online",
+                    target_uname, online_uname
+                ));
+                crate::service::request_ui_repaint();
+                return;
+            }
+        }
+    }
+
     let encrypted_password = {
         let s = state.lock().unwrap();
         match s.config.users.get(user_idx) {

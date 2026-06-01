@@ -146,6 +146,10 @@ pub fn create_window_icon() -> egui::IconData {
     }
 }
 
+fn should_show_logout_button(state: &LoginState) -> bool {
+    matches!(state, LoginState::Online | LoginState::PendingConfirm)
+}
+
 pub struct CampusNetApp {
     state: SharedState,
     _tray_icon: TrayIcon,
@@ -582,28 +586,25 @@ impl CampusNetApp {
 
                     let is_busy = state == LoginState::LoggingIn || state == LoginState::LoggingOut;
 
-                    match &state {
-                        LoginState::Online | LoginState::PendingConfirm | LoginState::Error => {
-                            if ui
-                                .add_enabled(!is_busy, egui::Button::new(t.btn_logout))
-                                .clicked()
-                            {
-                                let state = self.state.clone();
-                                tokio::spawn(async move {
-                                    auth::do_logout(state, user_idx).await;
-                                });
-                            }
+                    if should_show_logout_button(&state) {
+                        if ui
+                            .add_enabled(!is_busy, egui::Button::new(t.btn_logout))
+                            .clicked()
+                        {
+                            let state = self.state.clone();
+                            tokio::spawn(async move {
+                                auth::do_logout(state, user_idx).await;
+                            });
                         }
-                        _ => {
-                            if ui
-                                .add_enabled(!is_busy, egui::Button::new(t.btn_login))
-                                .clicked()
-                            {
-                                let state = self.state.clone();
-                                tokio::spawn(async move {
-                                    auth::do_login(state, user_idx).await;
-                                });
-                            }
+                    } else {
+                        if ui
+                            .add_enabled(!is_busy, egui::Button::new(t.btn_login))
+                            .clicked()
+                        {
+                            let state = self.state.clone();
+                            tokio::spawn(async move {
+                                auth::do_login(state, user_idx).await;
+                            });
                         }
                     }
                 });
@@ -1292,5 +1293,40 @@ impl eframe::App for CampusNetApp {
         });
 
         ctx.request_repaint_after(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logout_button_for_online() {
+        assert!(should_show_logout_button(&LoginState::Online));
+    }
+
+    #[test]
+    fn logout_button_for_pending_confirm() {
+        assert!(should_show_logout_button(&LoginState::PendingConfirm));
+    }
+
+    #[test]
+    fn login_button_for_error() {
+        assert!(!should_show_logout_button(&LoginState::Error));
+    }
+
+    #[test]
+    fn login_button_for_logged_out() {
+        assert!(!should_show_logout_button(&LoginState::LoggedOut));
+    }
+
+    #[test]
+    fn busy_button_for_logging_in() {
+        assert!(!should_show_logout_button(&LoginState::LoggingIn));
+    }
+
+    #[test]
+    fn busy_button_for_logging_out() {
+        assert!(!should_show_logout_button(&LoginState::LoggingOut));
     }
 }
