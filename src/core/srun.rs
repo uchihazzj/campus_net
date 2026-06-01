@@ -97,23 +97,14 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
         anyhow::bail!("HTTP {}: {}", status.as_u16(), body);
     }
 
-    let bytes = resp.bytes().await?;
+    let body = resp.text().await?;
+    let json_str = crate::core::jsonp::strip_jsonp(&body).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    if bytes.len() < 5 {
-        anyhow::bail!(
-            "Server returned short response ({} bytes): {}",
-            bytes.len(),
-            String::from_utf8_lossy(&bytes)
-        );
-    }
-
-    // srun wraps JSON as: sdu({...}) — strip 4-byte prefix and 1-byte suffix
-    let inner = &bytes[4..bytes.len() - 1];
-    serde_json::from_slice(inner).map_err(|e| {
+    serde_json::from_str(json_str).map_err(|e| {
         anyhow::anyhow!(
             "JSON parse error: {}. Body: {}",
             e,
-            String::from_utf8_lossy(inner)
+            crate::core::jsonp::safe_truncate(json_str, 200)
         )
     })
 }

@@ -93,42 +93,6 @@ pub fn match_account(
     }
 }
 
-/// Safely truncate a string to at most `max_chars` characters, on a
-/// UTF-8 character boundary. Does not panic for any input.
-fn safe_truncate(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => &s[..byte_idx],
-        None => s,
-    }
-}
-
-/// Strip a JSONP wrapper like `sdu({...})` or ` sdu({...}); ` from `body`,
-/// returning the inner JSON string. Handles whitespace and optional trailing
-/// semicolon. Returns `Err(description)` on malformed input; the description
-/// uses char-safe truncation and never panics.
-fn strip_jsonp(body: &str) -> Result<&str, String> {
-    let trimmed = body.trim();
-
-    let after_prefix = trimmed.strip_prefix("sdu(").ok_or_else(|| {
-        format!(
-            "Unexpected JSONP format (first 80 chars): {}",
-            safe_truncate(trimmed, 80)
-        )
-    })?;
-
-    let inner = after_prefix
-        .strip_suffix(')')
-        .or_else(|| after_prefix.strip_suffix(");"))
-        .ok_or_else(|| {
-            format!(
-                "JSONP missing closing ')' (first 80 chars): {}",
-                safe_truncate(trimmed, 80)
-            )
-        })?;
-
-    Ok(inner.trim())
-}
-
 /// Fetch online user info from the auth server's rad_user_info endpoint.
 ///
 /// Returns:
@@ -180,7 +144,7 @@ pub async fn fetch_online_user_info(
         .await
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-    let json_str = strip_jsonp(&body)?;
+    let json_str = crate::core::jsonp::strip_jsonp(&body)?;
 
     let info: OnlineUserInfo =
         serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
@@ -199,7 +163,59 @@ pub async fn fetch_online_user_info(
     }
 }
 
-/// Query rad_user_info and update AppState accordingly.
+/// Apply a match result to user statuses — pure function, testable.
+///
+/// - `Exact` / `UniqueBase`: the matching user → `Online`, others with
+///   `Online` or `PendingConfirm` → `Error` (another account is online).
+/// - `Ambiguous`: matching candidates that were `PendingConfirm` stay
+///   `PendingConfirm`; `Online` users among candidates are demoted to `Error`.
+///   No user is promoted to `Online`.
+/// - `NoMatch`: any `Online` or `PendingConfirm` user → `Error`.
+pub fn apply_match_result(
+    match_result: &MatchResult,
+    user_statuses: &mut [crate::service::UserStatus],
+    server_user: &str,
+    server_ip: &str,
+) {
+    match match_result {
+        MatchResult::Exact(idx) | MatchResult::UniqueBase(idx) => {
+            for (i, us) in user_statuses.iter_mut().enumerate() {
+                if i == *idx {
+                    us.state = LoginState::Online;
+                    us.current_ip = server_ip.to_string();
+                    us.last_error.clear();
+                } else if us.state == LoginState::Online || us.state == LoginState::PendingConfirm {
+                    us.state = LoginState::Error;
+                    us.last_error = format!("Another account is online: {}", server_user);
+                }
+            }
+        }
+        MatchResult::Ambiguous(indices) => {
+            for (i, us) in user_statuses.iter_mut().enumerate() {
+                if indices.contains(&i) {
+                    if us.state == LoginState::Online {
+                        us.state = LoginState::Error;
+                        us.last_error =
+                            format!("Ambiguous server match — cannot confirm: {}", server_user);
+                    }
+                    // PendingConfirm stays PendingConfirm — not promoted to Online
+                } else if us.state == LoginState::Online || us.state == LoginState::PendingConfirm {
+                    us.state = LoginState::Error;
+                    us.last_error = format!("Another account is online: {}", server_user);
+                }
+            }
+        }
+        MatchResult::NoMatch => {
+            for us in user_statuses.iter_mut() {
+                if us.state == LoginState::Online || us.state == LoginState::PendingConfirm {
+                    us.state = LoginState::Error;
+                    us.last_error = format!("Another account is online: {}", server_user);
+                }
+            }
+        }
+    }
+}
+
 /// Called at startup and periodically by the monitor.
 pub async fn sync_online_state(state: &SharedState) {
     let (server, query_ip) = {
@@ -236,23 +252,12 @@ pub async fn sync_online_state(state: &SharedState) {
             s.online_info_stale = false;
 
             let match_result = match_account(&info.user_name, &s.config.users);
-            // Reset all users that were Online or PendingConfirm — the server
-            // is authoritative, so anything stale must be corrected.
-            for (idx, us) in s.user_statuses.iter_mut().enumerate() {
-                let is_matched = match &match_result {
-                    MatchResult::Exact(i) | MatchResult::UniqueBase(i) => *i == idx,
-                    MatchResult::Ambiguous(indices) => indices.contains(&idx),
-                    MatchResult::NoMatch => false,
-                };
-                if is_matched {
-                    us.state = LoginState::Online;
-                    us.current_ip = info.online_ip.clone();
-                    us.last_error.clear();
-                } else if us.state == LoginState::Online || us.state == LoginState::PendingConfirm {
-                    us.state = LoginState::Error;
-                    us.last_error = format!("Another account is online: {}", info.user_name);
-                }
-            }
+            apply_match_result(
+                &match_result,
+                &mut s.user_statuses,
+                &info.user_name,
+                &info.online_ip,
+            );
             match &match_result {
                 MatchResult::Exact(idx) => {
                     let uname = s.config.users[*idx].username.clone();
@@ -369,6 +374,19 @@ pub async fn sync_online_state(state: &SharedState) {
 
 /// Startup orchestration: version check → online state sync → conditional auto-login → monitor.
 /// Called once from main.rs, replaces direct spawn_monitor().
+/// Pure predicate: should the startup auto-login fire?
+pub fn should_auto_login(
+    auto_reconnect: bool,
+    has_online: bool,
+    user_count: usize,
+    campus_auth: &CampusAuthStatus,
+) -> bool {
+    if !auto_reconnect || has_online || user_count == 0 {
+        return false;
+    }
+    matches!(campus_auth, CampusAuthStatus::NotLoggedIn)
+}
+
 pub fn spawn_startup_tasks(state: SharedState) {
     tokio::spawn(async move {
         // ── Phase 1: Version check ──────────────────────
@@ -422,26 +440,38 @@ pub fn spawn_startup_tasks(state: SharedState) {
             (s.config.auto_reconnect, s.config.users.len(), has_online)
         };
 
-        if auto_reconnect && !has_online && should_login > 0 {
-            let campus_auth = {
-                let s = state.lock().unwrap();
-                s.campus_auth.clone()
-            };
-            if campus_auth != CampusAuthStatus::LoggedIn {
-                tracing::info!(
-                    "[Startup] Auto-reconnect enabled, not logged in — starting one-click login"
-                );
-                {
-                    let mut s = state.lock().unwrap();
-                    s.suppress_auto_reconnect = false;
-                    s.add_log("[INFO] Auto-login on startup...".to_string());
-                }
-                crate::service::request_ui_repaint();
-                crate::service::auth::do_one_click_login(state.clone()).await;
-                // Re-sync after login attempt
-                sync_online_state(&state).await;
+        let campus_auth = {
+            let s = state.lock().unwrap();
+            s.campus_auth.clone()
+        };
+        if should_auto_login(auto_reconnect, has_online, should_login, &campus_auth) {
+            tracing::info!(
+                "[Startup] Auto-reconnect enabled, not logged in — starting one-click login"
+            );
+            {
+                let mut s = state.lock().unwrap();
+                s.suppress_auto_reconnect = false;
+                s.add_log("[INFO] Auto-login on startup...".to_string());
             }
+            crate::service::request_ui_repaint();
+            crate::service::auth::do_one_click_login(state.clone()).await;
+            // Re-sync after login attempt
+            sync_online_state(&state).await;
+        } else if auto_reconnect
+            && !has_online
+            && should_login > 0
+            && campus_auth == CampusAuthStatus::Unknown
+        {
+            tracing::info!(
+                "[Startup] Auth state unknown; skip startup auto-login and wait for monitor/manual refresh"
+            );
+            let mut s = state.lock().unwrap();
+            s.add_log(
+                "[INFO] Auth state unknown; skipping auto-login, waiting for monitor".to_string(),
+            );
         }
+
+        // ──
 
         // ── Phase 5: Start periodic monitor ────────────
         crate::service::monitor::spawn_monitor(state);
@@ -515,62 +545,146 @@ mod tests {
         assert_eq!(match_account("abc", &users), MatchResult::NoMatch);
     }
 
-    // ── strip_jsonp tests ─────────────────────────────────
+    // ── should_auto_login tests ───────────────────────────
 
     #[test]
-    fn strip_jsonp_normal() {
-        assert_eq!(strip_jsonp("sdu({\"a\":1})").unwrap(), "{\"a\":1}");
+    fn auto_login_off() {
+        assert!(!should_auto_login(
+            false,
+            false,
+            1,
+            &CampusAuthStatus::NotLoggedIn
+        ));
     }
 
     #[test]
-    fn strip_jsonp_with_semicolon() {
-        assert_eq!(strip_jsonp("sdu({\"a\":1});").unwrap(), "{\"a\":1}");
+    fn auto_login_has_online() {
+        assert!(!should_auto_login(
+            true,
+            true,
+            1,
+            &CampusAuthStatus::NotLoggedIn
+        ));
     }
 
     #[test]
-    fn strip_jsonp_whitespace() {
-        assert_eq!(strip_jsonp("  sdu({\"a\":1})  ").unwrap(), "{\"a\":1}");
+    fn auto_login_no_users() {
+        assert!(!should_auto_login(
+            true,
+            false,
+            0,
+            &CampusAuthStatus::NotLoggedIn
+        ));
     }
 
     #[test]
-    fn strip_jsonp_whitespace_and_semicolon() {
-        assert_eq!(strip_jsonp(" sdu(  {\"a\":1}  ); ").unwrap(), "{\"a\":1}");
+    fn auto_login_not_logged_in() {
+        assert!(should_auto_login(
+            true,
+            false,
+            1,
+            &CampusAuthStatus::NotLoggedIn
+        ));
     }
 
     #[test]
-    fn strip_jsonp_malformed_no_prefix() {
-        assert!(strip_jsonp("not_jsonp").is_err());
+    fn auto_login_unknown_skipped() {
+        assert!(!should_auto_login(
+            true,
+            false,
+            1,
+            &CampusAuthStatus::Unknown
+        ));
     }
 
     #[test]
-    fn strip_jsonp_malformed_no_suffix() {
-        assert!(strip_jsonp("sdu({\"a\":1}").is_err());
+    fn auto_login_logged_in_skipped() {
+        assert!(!should_auto_login(
+            true,
+            false,
+            1,
+            &CampusAuthStatus::LoggedIn
+        ));
     }
 
-    // ── safe_truncate tests ───────────────────────────────
+    // ── apply_match_result tests ──────────────────────────
 
-    #[test]
-    fn safe_truncate_short() {
-        assert_eq!(safe_truncate("hello", 80), "hello");
-    }
-
-    #[test]
-    fn safe_truncate_exact_boundary() {
-        assert_eq!(safe_truncate("abc", 3), "abc");
-    }
-
-    #[test]
-    fn safe_truncate_multibyte_safe() {
-        // 3-byte Chinese chars: 你好世界 = 12 bytes, 4 chars
-        let s = "你好世界";
-        assert_eq!(safe_truncate(s, 2).chars().count(), 2);
-        // Must not panic
-        let _ = safe_truncate(s, 1);
-        let _ = safe_truncate(s, 3);
+    fn make_status(state: LoginState) -> crate::service::UserStatus {
+        crate::service::UserStatus {
+            state,
+            current_ip: String::new(),
+            last_error: String::new(),
+        }
     }
 
     #[test]
-    fn safe_truncate_empty() {
-        assert_eq!(safe_truncate("", 80), "");
+    fn apply_exact_sets_online_and_invalidates_others() {
+        let mut statuses = vec![
+            make_status(LoginState::LoggedOut),
+            make_status(LoginState::PendingConfirm),
+        ];
+        apply_match_result(&MatchResult::Exact(0), &mut statuses, "alice", "10.0.0.1");
+        assert_eq!(statuses[0].state, LoginState::Online);
+        assert_eq!(statuses[0].current_ip, "10.0.0.1");
+        assert_eq!(statuses[1].state, LoginState::Error);
+    }
+
+    #[test]
+    fn apply_unique_base_confirms_single_candidate() {
+        let mut statuses = vec![make_status(LoginState::PendingConfirm)];
+        apply_match_result(
+            &MatchResult::UniqueBase(0),
+            &mut statuses,
+            "alice",
+            "10.0.0.2",
+        );
+        assert_eq!(statuses[0].state, LoginState::Online);
+    }
+
+    #[test]
+    fn apply_ambiguous_does_not_set_online() {
+        // Local: abc@cmcc (PendingConfirm), abc@unicom (LoggedOut)
+        let mut statuses = vec![
+            make_status(LoginState::PendingConfirm),
+            make_status(LoginState::LoggedOut),
+        ];
+        apply_match_result(
+            &MatchResult::Ambiguous(vec![0, 1]),
+            &mut statuses,
+            "abc",
+            "10.0.0.3",
+        );
+        // Neither should be Online
+        assert_ne!(statuses[0].state, LoginState::Online);
+        assert_ne!(statuses[1].state, LoginState::Online);
+        // PendingConfirm should stay PendingConfirm
+        assert_eq!(statuses[0].state, LoginState::PendingConfirm);
+    }
+
+    #[test]
+    fn apply_ambiguous_demotes_false_online() {
+        // User 0 was Online but server says ambiguous
+        let mut statuses = vec![make_status(LoginState::Online)];
+        apply_match_result(
+            &MatchResult::Ambiguous(vec![0]),
+            &mut statuses,
+            "abc",
+            "10.0.0.4",
+        );
+        assert_eq!(statuses[0].state, LoginState::Error);
+    }
+
+    #[test]
+    fn apply_no_match_does_not_set_online() {
+        let mut statuses = vec![
+            make_status(LoginState::PendingConfirm),
+            make_status(LoginState::LoggedOut),
+        ];
+        apply_match_result(&MatchResult::NoMatch, &mut statuses, "xyz", "10.0.0.5");
+        assert_ne!(statuses[0].state, LoginState::Online);
+        assert_ne!(statuses[1].state, LoginState::Online);
+        // PendingConfirm should be invalidated
+        assert_eq!(statuses[0].state, LoginState::Error);
+        assert_eq!(statuses[1].state, LoginState::LoggedOut);
     }
 }

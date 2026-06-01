@@ -6,8 +6,11 @@ use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 
 // ── Campus IPv4 ────────────────────────────────────────────────────
 
-pub fn detect_campus_ip() -> Option<String> {
-    let candidates: Vec<(String, String)> = get_network_interfaces()
+/// Return all candidate campus IPv4 interfaces (name, ip), filtered to
+/// exclude loopback, link-local, and common virtual adapters (VPN, Docker,
+/// WSL, Hyper‑V, VMware, etc.). Use this for both IP selection and UI.
+pub fn detect_campus_ip_candidates() -> Vec<(String, String)> {
+    get_network_interfaces()
         .iter()
         .filter(|(name, ip)| {
             if !ip.is_ipv4() {
@@ -50,8 +53,11 @@ pub fn detect_campus_ip() -> Option<String> {
             true
         })
         .map(|(name, ip)| (name.clone(), ip.to_string()))
-        .collect();
+        .collect()
+}
 
+pub fn detect_campus_ip() -> Option<String> {
+    let candidates = detect_campus_ip_candidates();
     if candidates.len() > 1 {
         tracing::info!(
             "[IP] Multiple campus IPv4 candidates: {:?}, selecting first",

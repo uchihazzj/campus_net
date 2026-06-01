@@ -516,7 +516,7 @@ impl CampusNetApp {
                     }
                     LoginState::PendingConfirm => {
                         ui.colored_label(Color32::YELLOW, "◐");
-                        ui.label(RichText::new("Pending confirmation...").color(Color32::YELLOW));
+                        ui.label(RichText::new(t.status_pending_confirm).color(Color32::YELLOW));
                         let stale = {
                             let s = self.state.lock().unwrap();
                             s.online_info_stale
@@ -719,16 +719,8 @@ impl CampusNetApp {
                 self.edit_original_username.clear();
                 self.edit_original_ip.clear();
                 self.edit_original_if_name.clear();
-                let ifaces = get_network_interfaces();
-                let preferred = ifaces
-                    .iter()
-                    .find(|(_, ip)| ip.is_ipv4() && ip.to_string().starts_with("10."))
-                    .or_else(|| {
-                        ifaces
-                            .iter()
-                            .find(|(_, ip)| ip.is_ipv4() && !ip.is_loopback())
-                    });
-                if let Some((name, _ip)) = preferred {
+                let candidates = crate::service::detection::detect_campus_ip_candidates();
+                if let Some((name, _ip)) = candidates.first() {
                     self.edit_if_name = name.clone();
                 }
                 self.show_add_dialog = true;

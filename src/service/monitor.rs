@@ -22,6 +22,29 @@ enum ReconnectDecision {
     Reconnect,
 }
 
+/// Check whether any user has a usable login IP (current_ip, user.ip, or
+/// if_name that resolves). Returns true if at least one source is available.
+fn any_usable_ip(s: &crate::service::AppState) -> bool {
+    if s.campus_ip.is_some() {
+        return true;
+    }
+    for (i, us) in s.user_statuses.iter().enumerate() {
+        if !us.current_ip.is_empty() {
+            return true;
+        }
+        if let Some(user) = s.config.users.get(i) {
+            if user.ip.as_ref().is_some_and(|ip| !ip.is_empty()) {
+                return true;
+            }
+            if user.if_name.is_some() {
+                // if_name may resolve at login time; presence is enough
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Evaluate whether auto-reconnect should fire based on current state.
 ///
 /// - rad_user_info (when working) is authoritative: LoggedIn → Healthy,
@@ -38,7 +61,7 @@ fn evaluate_reconnect(s: &crate::service::AppState) -> ReconnectDecision {
     if s.suppress_auto_reconnect {
         return ReconnectDecision::Wait;
     }
-    if s.campus_ip.is_none() {
+    if !any_usable_ip(s) {
         return ReconnectDecision::Wait;
     }
 
@@ -283,4 +306,68 @@ pub fn spawn_monitor(state: SharedState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::config::{AppConfig, StoredUser};
+    use crate::service::AppState;
+
+    fn make_state() -> AppState {
+        AppState::new(AppConfig::default())
+    }
+
+    #[test]
+    fn any_ip_with_campus_ip() {
+        let mut s = make_state();
+        s.campus_ip = Some("10.0.0.1".to_string());
+        assert!(any_usable_ip(&s));
+    }
+
+    #[test]
+    fn any_ip_with_user_ip() {
+        let mut s = make_state();
+        s.config.users.push(StoredUser {
+            username: "test".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.2".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        assert!(any_usable_ip(&s));
+    }
+
+    #[test]
+    fn any_ip_with_if_name() {
+        let mut s = make_state();
+        s.config.users.push(StoredUser {
+            username: "test".to_string(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: Some("Ethernet0".to_string()),
+        });
+        s.ensure_statuses();
+        assert!(any_usable_ip(&s));
+    }
+
+    #[test]
+    fn any_ip_with_current_ip() {
+        let mut s = make_state();
+        s.config.users.push(StoredUser {
+            username: "test".to_string(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.user_statuses[0].current_ip = "10.0.0.3".to_string();
+        assert!(any_usable_ip(&s));
+    }
+
+    #[test]
+    fn no_ip_at_all() {
+        let s = make_state();
+        assert!(!any_usable_ip(&s));
+    }
 }
