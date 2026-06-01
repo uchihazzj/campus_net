@@ -152,7 +152,8 @@ impl AppState {
     }
 
     pub fn add_log(&mut self, msg: String) {
-        self.log_messages.push(msg);
+        let stamped = format!("[{}] {}", current_ui_log_time(), msg);
+        self.log_messages.push(stamped);
         if self.log_messages.len() > 200 {
             self.log_messages.remove(0);
         }
@@ -166,3 +167,72 @@ impl AppState {
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
+
+fn current_ui_log_time() -> String {
+    chrono::Local::now().format("%m/%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::config::AppConfig;
+
+    fn format_ui_log_message(now: chrono::DateTime<chrono::Local>, msg: &str) -> String {
+        format!("[{}] {}", now.format("%m/%d %H:%M"), msg)
+    }
+
+    #[test]
+    fn add_log_prepends_timestamp() {
+        let mut s = AppState::new(AppConfig::default());
+        s.add_log("[INFO] test".to_string());
+        let entry = &s.log_messages[0];
+        // Format: [MM/DD HH:MM] [INFO] test
+        assert!(entry.starts_with('['));
+        assert!(entry.contains("] [INFO] test"));
+        // Check MM/DD HH:MM pattern
+        let after_bracket = &entry[1..];
+        let parts: Vec<&str> = after_bracket.splitn(2, "] ").collect();
+        assert_eq!(parts.len(), 2);
+        let time_part = parts[0];
+        let date_time: Vec<&str> = time_part.split(' ').collect();
+        assert_eq!(date_time.len(), 2);
+        let date: Vec<&str> = date_time[0].split('/').collect();
+        assert_eq!(date.len(), 2);
+        let time: Vec<&str> = date_time[1].split(':').collect();
+        assert_eq!(time.len(), 2);
+        // All parts should parse as u32
+        date[0].parse::<u32>().unwrap();
+        date[1].parse::<u32>().unwrap();
+        time[0].parse::<u32>().unwrap();
+        time[1].parse::<u32>().unwrap();
+    }
+
+    #[test]
+    fn add_log_caps_at_200() {
+        let mut s = AppState::new(AppConfig::default());
+        for i in 0..250 {
+            s.add_log(format!("msg {}", i));
+        }
+        assert_eq!(s.log_messages.len(), 200);
+        // Oldest message removed, so first entry should be "msg 50"
+        assert!(s.log_messages[0].contains("msg 50"));
+        assert!(s.log_messages[199].contains("msg 249"));
+    }
+
+    #[test]
+    fn format_ui_log_message_includes_timestamp() {
+        use chrono::Datelike;
+        use chrono::Timelike;
+
+        let dt = chrono::Local::now()
+            .with_month(6)
+            .and_then(|d| d.with_day(1))
+            .and_then(|d| d.with_hour(20))
+            .and_then(|d| d.with_minute(31))
+            .and_then(|d| d.with_second(0))
+            .and_then(|d| d.with_nanosecond(0))
+            .unwrap();
+        let result = format_ui_log_message(dt, "[INFO] test");
+        assert_eq!(result, "[06/01 20:31] [INFO] test");
+    }
+}

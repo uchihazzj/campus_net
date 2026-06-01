@@ -164,7 +164,6 @@ pub struct CampusNetApp {
     edit_original_ip: String,
     edit_original_if_name: String,
     show_add_dialog: bool,
-    log_scroll_to_bottom: bool,
     cached_lang: Lang,
 }
 
@@ -368,7 +367,6 @@ impl CampusNetApp {
             edit_original_ip: String::new(),
             edit_original_if_name: String::new(),
             show_add_dialog: false,
-            log_scroll_to_bottom: true,
             cached_lang: lang,
         }
     }
@@ -1196,7 +1194,7 @@ impl CampusNetApp {
 
     fn render_log(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        crate::ui::log_panel::render_log_panel(&self.state, &mut self.log_scroll_to_bottom, ui, &t);
+        crate::ui::log_panel::render_log_panel(&self.state, ui, &t);
     }
 
     fn save_config(&self) {
