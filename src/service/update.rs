@@ -35,6 +35,68 @@ struct GitHubRelease {
     assets: Vec<GitHubAsset>,
 }
 
+/// Proxy strategy order for GitHub requests. Used in tests to verify
+/// the fallback order is correct without making real HTTP requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GithubCheckOrder {
+    /// API check: direct first, fallback to system proxy
+    DirectThenSystem,
+    /// Download: system proxy first, fallback to direct
+    SystemThenDirect,
+}
+
+/// API latest check order: direct first → system proxy fallback.
+#[allow(dead_code)]
+pub const API_CHECK_ORDER: GithubCheckOrder = GithubCheckOrder::DirectThenSystem;
+
+/// Asset download order: system proxy first → direct fallback.
+#[allow(dead_code)]
+pub const DOWNLOAD_ORDER: GithubCheckOrder = GithubCheckOrder::SystemThenDirect;
+
+fn user_agent() -> String {
+    format!(
+        "campus-net-client/{} (+https://github.com/uchihazzj/campus_net)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Build a reqwest `Client` for GitHub API or asset download.
+///
+/// `use_proxy = true` → lets reqwest use the system proxy (no `.no_proxy()`).
+/// `use_proxy = false` → calls `.no_proxy()` for a direct connection.
+fn build_github_client(use_proxy: bool, timeout_secs: u64) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .user_agent(user_agent());
+    if !use_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+/// Returns true when the HTTP status and response body indicate a GitHub
+/// rate-limit response (403 with "rate limit" in body, or 429).
+fn is_rate_limit_response(status: u16, body: &str) -> bool {
+    status == 429 || (status == 403 && body.to_lowercase().contains("rate limit"))
+}
+
+fn format_rate_limit_error(
+    status: u16,
+    remaining: &str,
+    reset: &str,
+    request_id: &str,
+    body: &str,
+) -> String {
+    format!(
+        "GitHub API rate limit exceeded (HTTP {}). \
+         Remaining: {}, Reset: {}, Request-ID: {}. Body: {}",
+        status, remaining, reset, request_id, body
+    )
+}
+
 /// Compare two version strings like "0.2.1" and "v0.3.0".
 /// Strips a leading 'v', splits by '.', compares each component as u32.
 /// Returns true if `remote` > `local`.
@@ -60,26 +122,51 @@ fn is_newer(local: &str, remote: &str) -> bool {
     false
 }
 
-/// Check GitHub Releases for a newer version.
-/// Returns Some(UpdateInfo) if an update is available,
-/// None if up to date, or Err(message) if the check failed.
-pub async fn check_update() -> Result<Option<(String, String, String)>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .no_proxy()
-        .user_agent("campus-net-client")
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+async fn do_check_update(use_proxy: bool) -> Result<Option<(String, String, String)>, String> {
+    let client = build_github_client(use_proxy, 8)?;
 
     let resp = client
         .get("https://api.github.com/repos/uchihazzj/campus_net/releases/latest")
         .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status().as_u16()));
+    let status = resp.status();
+    if !status.is_success() {
+        // Extract rate-limit headers before consuming the body
+        let remaining = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let reset = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let request_id = resp
+            .headers()
+            .get("x-github-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+        let body_msg = crate::core::jsonp::safe_truncate(body.trim(), 300).to_string();
+
+        if is_rate_limit_response(status.as_u16(), &body_msg) {
+            return Err(format_rate_limit_error(
+                status.as_u16(),
+                &remaining,
+                &reset,
+                &request_id,
+                &body_msg,
+            ));
+        }
+        return Err(format!("HTTP {}: {}", status.as_u16(), body_msg));
     }
 
     let release: GitHubRelease = resp
@@ -101,6 +188,70 @@ pub async fn check_update() -> Result<Option<(String, String, String)>, String> 
         .ok_or_else(|| "No campus-net-client.exe asset found in release".to_string())?;
 
     Ok(Some((release.tag_name, release.html_url, download_url)))
+}
+
+/// Check GitHub Releases for a newer version.
+///
+/// Proxy strategy: **direct first** (`no_proxy`), then fall back to **system proxy**
+/// if the direct request fails with a network error. If the system proxy request
+/// also fails, the error is reported with rate-limit details when applicable.
+///
+/// Returns `Some((tag, release_url, download_url))` if an update is available,
+/// `None` if up to date, or `Err(message)` if the check failed.
+pub async fn check_update() -> Result<Option<(String, String, String)>, String> {
+    // ── Try direct (no_proxy) first ──────────────────────
+    match do_check_update(false).await {
+        Ok(result) => return Ok(result),
+        Err(direct_err) => {
+            tracing::info!(
+                "[Update] Direct API check failed: {} — falling back to system proxy",
+                direct_err
+            );
+        }
+    }
+
+    // ── Fallback to system proxy ─────────────────────────
+    do_check_update(true).await
+}
+
+/// Download an asset with system-proxy-first strategy.
+/// Tries system proxy, then falls back to direct on failure.
+async fn download_asset(url: &str) -> Result<Vec<u8>, String> {
+    // ── Try system proxy first ──────────────────────────
+    match do_download(url, true).await {
+        Ok(bytes) => return Ok(bytes),
+        Err(sys_err) => {
+            tracing::info!(
+                "[Update] System proxy download failed: {} — falling back to direct",
+                sys_err
+            );
+        }
+    }
+
+    // ── Fallback to direct ─────────────────────────────
+    match do_download(url, false).await {
+        Ok(bytes) => Ok(bytes),
+        Err(direct_err) => Err(format!(
+            "system proxy download failed; direct download failed: {}",
+            direct_err
+        )),
+    }
+}
+
+async fn do_download(url: &str, use_proxy: bool) -> Result<Vec<u8>, String> {
+    let client = build_github_client(use_proxy, 120)?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("download request failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("download read failed: {}", e))
 }
 
 fn app_log(msg: &str) {
@@ -148,55 +299,14 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
     let download_path = dir.join(format!("{}.download", download_filename));
     let final_path = dir.join(&download_filename);
 
-    // Download the asset
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .no_proxy()
-        .user_agent("campus-net-client")
-        .build()
-    {
-        Ok(c) => c,
+    // Download the asset: system proxy first, direct fallback
+    let bytes = match download_asset(&download_url).await {
+        Ok(b) => b,
         Err(e) => {
-            let msg = format!("Failed to build HTTP client: {}", e);
             let mut s = state.lock().unwrap();
-            s.update_status = UpdateStatus::Failed(msg.clone());
-            s.add_log(format!("[ERROR] {}", msg));
-            app_log(&format!("[ERROR] {}", msg));
-            crate::service::request_ui_repaint();
-            return;
-        }
-    };
-
-    let bytes = match client.get(&download_url).send().await {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                let msg = format!("Download failed: HTTP {}", resp.status().as_u16());
-                let mut s = state.lock().unwrap();
-                s.update_status = UpdateStatus::Failed(msg.clone());
-                s.add_log(format!("[ERROR] {}", msg));
-                app_log(&format!("[ERROR] {}", msg));
-                crate::service::request_ui_repaint();
-                return;
-            }
-            match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    let msg = format!("Download failed: {}", e);
-                    let mut s = state.lock().unwrap();
-                    s.update_status = UpdateStatus::Failed(msg.clone());
-                    s.add_log(format!("[ERROR] {}", msg));
-                    app_log(&format!("[ERROR] {}", msg));
-                    crate::service::request_ui_repaint();
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            let msg = format!("Download failed: {}", e);
-            let mut s = state.lock().unwrap();
-            s.update_status = UpdateStatus::Failed(msg.clone());
-            s.add_log(format!("[ERROR] {}", msg));
-            app_log(&format!("[ERROR] {}", msg));
+            s.update_status = UpdateStatus::Failed(e.clone());
+            s.add_log(format!("[ERROR] {}", e));
+            app_log(&format!("[ERROR] {}", e));
             crate::service::request_ui_repaint();
             return;
         }
@@ -357,5 +467,89 @@ mod tests {
         assert!(is_newer("1.0.0", "v1.0.1"));
         assert!(!is_newer("1.0.0", "v1.0.0"));
         assert!(!is_newer("0.2.1", "0.2.1"));
+    }
+
+    // ── Proxy strategy order tests ────────────────────────
+
+    #[test]
+    fn api_check_order_is_direct_then_system() {
+        assert_eq!(API_CHECK_ORDER, GithubCheckOrder::DirectThenSystem);
+    }
+
+    #[test]
+    fn download_order_is_system_then_direct() {
+        assert_eq!(DOWNLOAD_ORDER, GithubCheckOrder::SystemThenDirect);
+    }
+
+    // ── Rate limit detection tests ────────────────────────
+
+    #[test]
+    fn rate_limit_429_is_detected() {
+        assert!(is_rate_limit_response(429, ""));
+    }
+
+    #[test]
+    fn rate_limit_403_with_rate_limit_body_is_detected() {
+        assert!(is_rate_limit_response(
+            403,
+            "API rate limit exceeded for user"
+        ));
+    }
+
+    #[test]
+    fn regular_403_not_detected_as_rate_limit() {
+        assert!(!is_rate_limit_response(403, "Not Found"));
+    }
+
+    #[test]
+    fn regular_200_not_rate_limited() {
+        assert!(!is_rate_limit_response(200, ""));
+    }
+
+    #[test]
+    fn regular_404_not_rate_limited() {
+        assert!(!is_rate_limit_response(404, ""));
+    }
+
+    // ── Rate limit error formatting tests ─────────────────
+
+    #[test]
+    fn format_rate_limit_error_includes_details() {
+        let err = format_rate_limit_error(403, "0", "1717200000", "ABC123", "rate limit exceeded");
+        assert!(err.contains("403"));
+        assert!(err.contains("Remaining: 0"));
+        assert!(err.contains("Reset: 1717200000"));
+        assert!(err.contains("Request-ID: ABC123"));
+        assert!(err.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn format_rate_limit_error_handles_missing_headers() {
+        let err = format_rate_limit_error(429, "-", "-", "-", "");
+        assert!(err.contains("429"));
+        assert!(err.contains("Remaining: -"));
+        assert!(err.contains("Reset: -"));
+        assert!(err.contains("Request-ID: -"));
+    }
+
+    // ── build_github_client tests ─────────────────────────
+
+    #[test]
+    fn client_direct_uses_no_proxy() {
+        let c = build_github_client(false, 8);
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn client_system_proxy_allows_proxy() {
+        let c = build_github_client(true, 8);
+        assert!(c.is_ok());
+    }
+
+    #[test]
+    fn user_agent_includes_version() {
+        let ua = user_agent();
+        assert!(ua.contains("campus-net-client/"));
+        assert!(ua.contains("github.com/uchihazzj/campus_net"));
     }
 }
