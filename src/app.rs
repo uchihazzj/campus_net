@@ -933,24 +933,30 @@ impl CampusNetApp {
                 }
                 crate::service::request_ui_repaint();
                 tokio::spawn(async move {
-                    let result = crate::service::update::check_update().await;
-                    let mut s = state.lock().unwrap();
-                    match result {
-                        Ok(Some((latest, release_url, download_url))) => {
-                            s.update_status = UpdateStatus::Available {
-                                latest,
-                                release_url,
-                                download_url,
-                            };
+                    match crate::service::update::check_update().await {
+                        Ok(Some((latest, _release_url, download_url))) => {
+                            {
+                                let mut s = state.lock().unwrap();
+                                s.add_log(format!(
+                                    "[INFO] New version {} found, starting automatic update",
+                                    latest
+                                ));
+                            }
+                            crate::service::request_ui_repaint();
+                            crate::service::update::perform_update(state, latest, download_url)
+                                .await;
                         }
                         Ok(None) => {
+                            let mut s = state.lock().unwrap();
                             s.update_status = UpdateStatus::UpToDate;
+                            crate::service::request_ui_repaint();
                         }
                         Err(e) => {
+                            let mut s = state.lock().unwrap();
                             s.update_status = UpdateStatus::Failed(e);
+                            crate::service::request_ui_repaint();
                         }
                     }
-                    crate::service::request_ui_repaint();
                 });
             }
         });
