@@ -36,9 +36,10 @@ fn any_usable_ip(s: &crate::service::AppState) -> bool {
             if user.ip.as_ref().is_some_and(|ip| !ip.is_empty()) {
                 return true;
             }
-            if user.if_name.is_some() {
-                // if_name may resolve at login time; presence is enough
-                return true;
+            if let Some(ref name) = user.if_name {
+                if crate::core::utils::get_ip_by_if_name(name).is_some() {
+                    return true;
+                }
             }
         }
     }
@@ -372,15 +373,26 @@ mod tests {
 
     #[test]
     fn any_ip_with_if_name() {
+        // Pick a real IPv4 interface on this machine for the test
+        let ifaces = crate::core::utils::get_network_interfaces();
+        let real_if_name = ifaces
+            .iter()
+            .find(|(_, ip)| ip.is_ipv4())
+            .map(|(name, _)| name.clone());
+
         let mut s = make_state();
         s.config.users.push(StoredUser {
             username: "test".to_string(),
             encrypted_password: String::new(),
             ip: None,
-            if_name: Some("Ethernet0".to_string()),
+            if_name: real_if_name,
         });
         s.ensure_statuses();
-        assert!(any_usable_ip(&s));
+        // If there is an IPv4 interface, if_name should resolve; otherwise the
+        // check is meaningless on this device.
+        if s.config.users[0].if_name.is_some() {
+            assert!(any_usable_ip(&s));
+        }
     }
 
     #[test]

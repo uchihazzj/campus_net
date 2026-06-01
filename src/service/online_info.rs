@@ -222,8 +222,8 @@ pub fn apply_match_result(
 /// 1. `Online` user's `current_ip`
 /// 2. `PendingConfirm` user's `current_ip`
 /// 3. `reconnect_targets`中第一个有 `user.ip` 的用户 IP
-/// 4. 第一个配置了 `user.ip` 的用户 IP
-/// 5. 全局 `campus_ip`
+/// 4. 全局 `campus_ip`（real-time detected, more reliable than stored IP）
+/// 5. 任一配置用户的 `user.ip`（last resort when auto-detection fails）
 pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     // 1. Online.current_ip
     if let Some(us) = s
@@ -260,20 +260,25 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
             }
         }
     }
-    // 4. 任一配置用户的 user.ip
+    // 4. 全局 campus_ip
+    if let Some(ref ip) = s.campus_ip {
+        if !ip.is_empty() {
+            return Some(ip.clone());
+        }
+    }
+    // 5. 任一配置用户的 user.ip（last resort）
     for user in &s.config.users {
         if let Some(ref ip) = user.ip {
             if !ip.is_empty() {
                 tracing::info!(
-                    "[OnlineInfo] Using first configured user.ip={} for status query",
+                    "[OnlineInfo] Using first configured user.ip={} for status query (fallback)",
                     ip
                 );
                 return Some(ip.clone());
             }
         }
     }
-    // 5. 全局 campus_ip
-    s.campus_ip.clone()
+    None
 }
 
 /// Called at startup and periodically by the monitor.
@@ -716,6 +721,51 @@ mod tests {
     fn query_ip_none() {
         let s = make_app_state();
         assert_eq!(best_status_query_ip(&s), None);
+    }
+
+    #[test]
+    fn query_ip_reconnect_target_over_campus_ip() {
+        let mut s = make_app_state();
+        s.campus_ip = Some("10.0.0.10".to_string());
+        s.config.users.push(StoredUser {
+            username: "u1".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.3".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.reconnect_targets = vec![0];
+        // reconnect_target user.ip should beat campus_ip
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.3".to_string()));
+    }
+
+    #[test]
+    fn query_ip_campus_over_arbitrary_user_ip() {
+        let mut s = make_app_state();
+        s.campus_ip = Some("10.0.0.5".to_string());
+        s.config.users.push(StoredUser {
+            username: "u1".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.4".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        // campus_ip (real-time) beats arbitrary saved user.ip
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.5".to_string()));
+    }
+
+    #[test]
+    fn query_ip_user_ip_fallback_when_no_campus() {
+        let mut s = make_app_state();
+        s.config.users.push(StoredUser {
+            username: "u1".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.4".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        // No campus_ip — fallback to configured user.ip
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.4".to_string()));
     }
 
     // ── apply_match_result tests ──────────────────────────
