@@ -102,6 +102,12 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                     s.user_statuses[user_idx].state = LoginState::Online;
                     s.user_statuses[user_idx].current_ip = ip.clone();
                     s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
+                    // Login success proves the auth server is reachable.
+                    // Clear stale online_info (may belong to a different user) and
+                    // reset fail count so the next sync_online_state starts fresh.
+                    s.online_info = None;
+                    s.online_info_fail_count = 0;
+                    s.online_info_stale = false;
                 }
             }
             // Refresh online_info to populate online duration, traffic etc.

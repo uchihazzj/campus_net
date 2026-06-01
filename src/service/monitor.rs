@@ -256,6 +256,8 @@ pub fn spawn_monitor(state: SharedState) {
                     if any_success {
                         let mut s = state.lock().unwrap();
                         s.reconnect_targets.clear();
+                        s.online_info_fail_count = 0;
+                        s.online_info_stale = false;
                         s.add_log("[OK] Auto-reconnect succeeded".to_string());
                         backoff_secs = interval;
                     } else {

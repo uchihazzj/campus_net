@@ -45,6 +45,7 @@ struct FileWriter {
 impl FileWriter {
     fn new(path: impl AsRef<Path>) -> Self {
         let p = path.as_ref();
+        let is_new = !p.exists();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -60,6 +61,11 @@ impl FileWriter {
                     .open("NUL")
                     .expect("Failed to open NUL")
             });
+        if is_new {
+            use std::io::Write;
+            let mut f = &file;
+            let _ = f.write_all(b"\xEF\xBB\xBF");
+        }
         Self {
             inner: Arc::new(Mutex::new(file)),
         }

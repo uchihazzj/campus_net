@@ -280,7 +280,7 @@ pub fn spawn_startup_tasks(state: SharedState) {
                 let s = state.lock().unwrap();
                 s.campus_auth.clone()
             };
-            if campus_auth == CampusAuthStatus::NotLoggedIn {
+            if campus_auth != CampusAuthStatus::LoggedIn {
                 tracing::info!(
                     "[Startup] Auto-reconnect enabled, not logged in — starting one-click login"
                 );
