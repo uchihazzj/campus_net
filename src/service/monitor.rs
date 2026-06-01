@@ -151,9 +151,11 @@ pub fn spawn_monitor(state: SharedState) {
                 // IPv4 probe may bind to a less precise address.
                 let mut s = state.lock().unwrap();
                 s.auth_server = AuthServerStatus::Unknown;
-                s.campus_auth = CampusAuthStatus::Unknown;
+                // Preserve existing campus_auth — it may already be
+                // NotLoggedIn from a previous cycle, and overwriting to
+                // Unknown would block auto-reconnect.
                 s.add_log(
-                    "[WARN] No global campus IPv4 detected, but user-bound IP exists; continuing auto-reconnect evaluation"
+                    "[WARN] No global campus IPv4 detected, but user-bound IP exists; preserving current auth status and continuing auto-reconnect evaluation"
                         .to_string(),
                 );
             }

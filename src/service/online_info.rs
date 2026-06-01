@@ -216,29 +216,71 @@ pub fn apply_match_result(
     }
 }
 
+/// Pick the best IP to bind rad_user_info queries to.
+///
+/// Priority:
+/// 1. `Online` user's `current_ip`
+/// 2. `PendingConfirm` user's `current_ip`
+/// 3. `reconnect_targets`中第一个有 `user.ip` 的用户 IP
+/// 4. 第一个配置了 `user.ip` 的用户 IP
+/// 5. 全局 `campus_ip`
+pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
+    // 1. Online.current_ip
+    if let Some(us) = s
+        .user_statuses
+        .iter()
+        .find(|us| us.state == LoginState::Online)
+    {
+        if !us.current_ip.is_empty() {
+            return Some(us.current_ip.clone());
+        }
+    }
+    // 2. PendingConfirm.current_ip
+    if let Some(us) = s
+        .user_statuses
+        .iter()
+        .find(|us| us.state == LoginState::PendingConfirm)
+    {
+        if !us.current_ip.is_empty() {
+            return Some(us.current_ip.clone());
+        }
+    }
+    // 3. reconnect_targets 中第一个有 user.ip 的用户
+    for &idx in &s.reconnect_targets {
+        if let Some(user) = s.config.users.get(idx) {
+            if let Some(ref ip) = user.ip {
+                if !ip.is_empty() {
+                    tracing::info!(
+                        "[OnlineInfo] Using reconnect_target[{}] user.ip={} for status query",
+                        idx,
+                        ip
+                    );
+                    return Some(ip.clone());
+                }
+            }
+        }
+    }
+    // 4. 任一配置用户的 user.ip
+    for user in &s.config.users {
+        if let Some(ref ip) = user.ip {
+            if !ip.is_empty() {
+                tracing::info!(
+                    "[OnlineInfo] Using first configured user.ip={} for status query",
+                    ip
+                );
+                return Some(ip.clone());
+            }
+        }
+    }
+    // 5. 全局 campus_ip
+    s.campus_ip.clone()
+}
+
 /// Called at startup and periodically by the monitor.
 pub async fn sync_online_state(state: &SharedState) {
     let (server, query_ip) = {
         let s = state.lock().unwrap();
-        // Prefer the IP of a currently confirmed-online user, then a
-        // PendingConfirm user, then the global auto-detected campus IP.
-        let best_ip = s
-            .user_statuses
-            .iter()
-            .find(|us| us.state == LoginState::Online)
-            .or_else(|| {
-                s.user_statuses
-                    .iter()
-                    .find(|us| us.state == LoginState::PendingConfirm)
-            })
-            .and_then(|us| {
-                if !us.current_ip.is_empty() {
-                    Some(us.current_ip.clone())
-                } else {
-                    None
-                }
-            })
-            .or_else(|| s.campus_ip.clone());
+        let best_ip = best_status_query_ip(&s);
         (s.config.server.clone(), best_ip)
     };
 
@@ -605,6 +647,75 @@ mod tests {
             1,
             &CampusAuthStatus::LoggedIn
         ));
+    }
+
+    // ── best_status_query_ip tests ────────────────────────
+
+    use crate::service::config::AppConfig;
+    use crate::service::AppState;
+
+    fn make_app_state() -> AppState {
+        AppState::new(AppConfig::default())
+    }
+
+    #[test]
+    fn query_ip_online_current_ip() {
+        let mut s = make_app_state();
+        s.config.users.push(make_user("u1"));
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.1".to_string();
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn query_ip_pending_current_ip() {
+        let mut s = make_app_state();
+        s.config.users.push(make_user("u1"));
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::PendingConfirm;
+        s.user_statuses[0].current_ip = "10.0.0.2".to_string();
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.2".to_string()));
+    }
+
+    #[test]
+    fn query_ip_reconnect_target_user_ip() {
+        let mut s = make_app_state();
+        s.config.users.push(StoredUser {
+            username: "u1".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.3".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.reconnect_targets = vec![0];
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.3".to_string()));
+    }
+
+    #[test]
+    fn query_ip_first_configured_user_ip() {
+        let mut s = make_app_state();
+        s.config.users.push(StoredUser {
+            username: "u1".to_string(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.4".to_string()),
+            if_name: None,
+        });
+        s.ensure_statuses();
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.4".to_string()));
+    }
+
+    #[test]
+    fn query_ip_fallback_campus_ip() {
+        let mut s = make_app_state();
+        s.campus_ip = Some("10.0.0.5".to_string());
+        assert_eq!(best_status_query_ip(&s), Some("10.0.0.5".to_string()));
+    }
+
+    #[test]
+    fn query_ip_none() {
+        let s = make_app_state();
+        assert_eq!(best_status_query_ip(&s), None);
     }
 
     // ── apply_match_result tests ──────────────────────────
