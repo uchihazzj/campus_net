@@ -136,7 +136,7 @@ pub async fn fetch_online_user_info(
         .as_secs()
         .to_string();
 
-    tracing::info!(
+    tracing::debug!(
         "[OnlineInfo] Querying: url={} campus_ipv4={:?}",
         url,
         campus_ipv4
@@ -164,7 +164,7 @@ pub async fn fetch_online_user_info(
         serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
     if info.error == "ok" {
-        tracing::info!(
+        tracing::debug!(
             "[OnlineInfo] User online: user_name={} ip={} sum_seconds={}",
             info.user_name,
             info.online_ip,
@@ -172,7 +172,7 @@ pub async fn fetch_online_user_info(
         );
         Ok(Some(info))
     } else {
-        tracing::info!("[OnlineInfo] Not logged in: error={}", info.error);
+        tracing::debug!("[OnlineInfo] Not logged in: error={}", info.error);
         Ok(None)
     }
 }

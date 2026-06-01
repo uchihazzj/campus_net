@@ -27,7 +27,7 @@ pub fn get_ip_by_if_name(if_name: &str) -> Option<String> {
 
     // Prefer exact match
     if let Some((_, ip)) = v4.iter().find(|(name, _)| name == if_name) {
-        tracing::info!("[IP] if_name exact match: '{}' → {}", if_name, ip);
+        tracing::debug!("[IP] if_name exact match: '{}' → {}", if_name, ip);
         return Some(ip.to_string());
     }
 
@@ -50,7 +50,7 @@ pub fn get_ip_by_if_name(if_name: &str) -> Option<String> {
         }
         1 => {
             let (name, ip) = contains_matches[0];
-            tracing::info!(
+            tracing::debug!(
                 "[IP] if_name contains match: '{}' matched by '{}' → {}",
                 if_name,
                 name,

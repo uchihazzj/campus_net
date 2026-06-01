@@ -47,7 +47,7 @@ pub fn detect_campus_ip_candidates() -> Vec<(String, String)> {
                 || lower.contains("hamachi")
                 || lower.contains("bluestacks")
             {
-                tracing::info!("[IP] Skipping virtual adapter: {} (IP={})", name, ip_str);
+                tracing::debug!("[IP] Skipping virtual adapter: {} (IP={})", name, ip_str);
                 return false;
             }
             true
@@ -59,7 +59,7 @@ pub fn detect_campus_ip_candidates() -> Vec<(String, String)> {
 pub fn detect_campus_ip() -> Option<String> {
     let candidates = detect_campus_ip_candidates();
     if candidates.len() > 1 {
-        tracing::info!(
+        tracing::debug!(
             "[IP] Multiple campus IPv4 candidates: {:?}, selecting first",
             candidates
         );
@@ -69,7 +69,7 @@ pub fn detect_campus_ip() -> Option<String> {
         None
     } else {
         let (name, ip) = &candidates[0];
-        tracing::info!("[IP] Campus IPv4 selected: {} ({})", ip, name);
+        tracing::debug!("[IP] Campus IPv4 selected: {} ({})", ip, name);
         Some(ip.clone())
     }
 }
@@ -107,7 +107,7 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
         .as_secs()
         .to_string();
 
-    tracing::info!(
+    tracing::debug!(
         "[AuthServer] Probing: url={} campus_ipv4={:?} bound={}",
         url,
         campus_ipv4,
@@ -122,7 +122,7 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
     {
         Ok(resp) => {
             let status = resp.status();
-            tracing::info!(
+            tracing::debug!(
                 "[AuthServer] Reachable: status={} campus_ipv4={:?}",
                 status.as_u16(),
                 campus_ipv4
@@ -167,7 +167,7 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
 
     // Use a well-known HTTP URL. The campus gateway will redirect to the
     // portal if not logged in.
-    tracing::info!(
+    tracing::debug!(
         "[CaptiveProbe] Probing http://www.baidu.com campus_ipv4={:?} bound={}",
         campus_ipv4,
         bound
@@ -177,7 +177,7 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                tracing::info!("[CaptiveProbe] LoggedIn: status={}", status.as_u16());
+                tracing::debug!("[CaptiveProbe] LoggedIn: status={}", status.as_u16());
                 return CampusAuthStatus::LoggedIn;
             }
             if status.is_redirection() {
@@ -187,14 +187,14 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("(missing)");
                 if is_portal_url(location) {
-                    tracing::info!(
+                    tracing::debug!(
                         "[CaptiveProbe] NotLoggedIn: portal redirect location={}",
                         location
                     );
                     return CampusAuthStatus::NotLoggedIn;
                 }
                 // Non-portal redirect (e.g., http→https upgrade) → logged in
-                tracing::info!(
+                tracing::debug!(
                     "[CaptiveProbe] LoggedIn (non-portal redirect): status={} location={}",
                     status.as_u16(),
                     location
@@ -295,11 +295,11 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
     // is completely down or just IPv4-isolated. Only trust CaptivePortal
     // (portal redirect is genuine on any IP version). Treat Reachable as
     // ProbeFailed because it may have succeeded via IPv6 — false positive.
-    tracing::info!("[IPv4] Running unbound fallback probe...");
+    tracing::debug!("[IPv4] Running unbound fallback probe...");
     let unbound_result = run_reachability_probes(None).await;
     match unbound_result {
         Ipv4InternetStatus::CaptivePortal => {
-            tracing::info!("[IPv4] Unbound probe confirms captive portal");
+            tracing::debug!("[IPv4] Unbound probe confirms captive portal");
             Ipv4InternetStatus::CaptivePortal
         }
         Ipv4InternetStatus::Reachable => {
@@ -336,11 +336,11 @@ async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStat
     for check in REACHABILITY_CHECKS {
         match try_single_check(&client, check).await {
             Ok(()) => {
-                tracing::info!("[IPv4] Reachable via: {} bound={}", check.url, bound);
+                tracing::debug!("[IPv4] Reachable via: {} bound={}", check.url, bound);
                 return Ipv4InternetStatus::Reachable;
             }
             Err(CheckError::CaptivePortal { url, location }) => {
-                tracing::info!(
+                tracing::debug!(
                     "[IPv4] CaptivePortal: {} → location={} bound={}",
                     url,
                     location,
