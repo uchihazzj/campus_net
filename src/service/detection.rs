@@ -7,11 +7,65 @@ use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 // ── Campus IPv4 ────────────────────────────────────────────────────
 
 pub fn detect_campus_ip() -> Option<String> {
-    get_network_interfaces()
+    let candidates: Vec<(String, String)> = get_network_interfaces()
         .iter()
-        .filter(|(_, ip)| ip.is_ipv4())
-        .map(|(_, ip)| ip.to_string())
-        .find(|ip| ip.starts_with("10."))
+        .filter(|(name, ip)| {
+            if !ip.is_ipv4() {
+                return false;
+            }
+            let ip_str = ip.to_string();
+            if !ip_str.starts_with("10.") {
+                return false;
+            }
+            // Exclude loopback
+            if ip.is_loopback() {
+                return false;
+            }
+            // Exclude link-local (169.254.x.x)
+            if ip_str.starts_with("169.254.") {
+                return false;
+            }
+            // Exclude common virtual adapter name patterns
+            let lower = name.to_lowercase();
+            if lower.contains("docker")
+                || lower.contains("wsl")
+                || lower.contains("hyper-v")
+                || lower.contains("vethernet")
+                || lower.contains("virtualbox")
+                || lower.contains("vmware")
+                || lower.contains("vpn")
+                || lower.contains("tap")
+                || lower.contains("tun")
+                || lower.contains("wireguard")
+                || lower.contains("tailscale")
+                || lower.contains("zerotier")
+                || lower.contains("pritunl")
+                || lower.contains("openvpn")
+                || lower.contains("hamachi")
+                || lower.contains("bluestacks")
+            {
+                tracing::info!("[IP] Skipping virtual adapter: {} (IP={})", name, ip_str);
+                return false;
+            }
+            true
+        })
+        .map(|(name, ip)| (name.clone(), ip.to_string()))
+        .collect();
+
+    if candidates.len() > 1 {
+        tracing::info!(
+            "[IP] Multiple campus IPv4 candidates: {:?}, selecting first",
+            candidates
+        );
+    }
+    if candidates.is_empty() {
+        tracing::warn!("[IP] No suitable campus IPv4 found");
+        None
+    } else {
+        let (name, ip) = &candidates[0];
+        tracing::info!("[IP] Campus IPv4 selected: {} ({})", ip, name);
+        Some(ip.clone())
+    }
 }
 
 // ── Auth Server Reachability ───────────────────────────────────────

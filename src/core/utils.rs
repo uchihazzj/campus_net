@@ -22,10 +22,52 @@ pub fn get_network_interfaces() -> Vec<(String, IpAddr)> {
 }
 
 pub fn get_ip_by_if_name(if_name: &str) -> Option<String> {
-    get_network_interfaces()
+    let ifaces = get_network_interfaces();
+    let v4: Vec<&(String, IpAddr)> = ifaces.iter().filter(|(_, ip)| ip.is_ipv4()).collect();
+
+    // Prefer exact match
+    if let Some((_, ip)) = v4.iter().find(|(name, _)| name == if_name) {
+        tracing::info!("[IP] if_name exact match: '{}' → {}", if_name, ip);
+        return Some(ip.to_string());
+    }
+
+    // Fallback: contains match (for backward compat with partial names)
+    let contains_matches: Vec<&&(String, IpAddr)> = v4
         .iter()
-        .find(|(name, ip)| name.contains(if_name) && ip.is_ipv4())
-        .map(|(_, ip)| ip.to_string())
+        .filter(|(name, _)| name.contains(if_name))
+        .collect();
+
+    match contains_matches.len() {
+        0 => {
+            tracing::warn!(
+                "[IP] if_name '{}' not found. Available IPv4 interfaces: {:?}",
+                if_name,
+                v4.iter()
+                    .map(|(n, a)| format!("{}={}", n, a))
+                    .collect::<Vec<_>>()
+            );
+            None
+        }
+        1 => {
+            let (name, ip) = contains_matches[0];
+            tracing::info!(
+                "[IP] if_name contains match: '{}' matched by '{}' → {}",
+                if_name,
+                name,
+                ip
+            );
+            Some(ip.to_string())
+        }
+        _ => {
+            let names: Vec<&str> = contains_matches.iter().map(|(n, _)| n.as_str()).collect();
+            tracing::warn!(
+                "[IP] if_name '{}' is ambiguous, contains matches: {:?}. Cannot select one.",
+                if_name,
+                names
+            );
+            None
+        }
+    }
 }
 
 pub async fn tcp_ping(addr: &'static str) -> anyhow::Result<u16> {

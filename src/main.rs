@@ -106,12 +106,16 @@ fn main() -> anyhow::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let backtrace = std::backtrace::Backtrace::capture();
         let msg = format!("=== PANIC ===\n{}\n\nBacktrace:\n{}\n", info, backtrace);
+        let is_new = !panic_log_path.exists();
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&panic_log_path)
         {
             use std::io::Write;
+            if is_new {
+                let _ = file.write_all(b"\xEF\xBB\xBF");
+            }
             let _ = writeln!(file, "{}", msg);
         }
         eprintln!("{}", msg);

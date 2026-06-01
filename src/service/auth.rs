@@ -17,16 +17,16 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         let user = &cfg.users[user_idx];
         // IP resolution priority:
         // 1. if_name real-time resolution (most stable across DHCP changes)
-        // 2. Auto-detect current 10.x.x.x campus IPv4
-        // 3. Legacy user.ip (backward compat, not recommended)
+        // 2. Manually configured user.ip (user's explicit choice)
+        // 3. Auto-detect current 10.x.x.x campus IPv4 (last resort)
         // 4. Empty — SrunClient will try detect_ip if configured
         let ip = user
             .if_name
             .as_ref()
             .and_then(|n| get_ip_by_if_name(n))
             .filter(|i| !i.is_empty())
-            .or_else(detect_campus_ip)
             .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
+            .or_else(detect_campus_ip)
             .unwrap_or_default();
         (
             cfg.server.clone(),
@@ -99,18 +99,22 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                 if user_idx < s.config.users.len() {
                     let uname = s.config.users[user_idx].username.clone();
                     let ip = client.client_ip.clone();
-                    s.user_statuses[user_idx].state = LoginState::Online;
+                    // Portal login succeeded but server (rad_user_info) has not
+                    // yet confirmed. Do NOT mark as Online here.
+                    s.user_statuses[user_idx].state = LoginState::PendingConfirm;
                     s.user_statuses[user_idx].current_ip = ip.clone();
-                    s.add_log(format!("[OK] {}: Login success, IP={}", uname, ip));
-                    // Login success proves the auth server is reachable.
-                    // Clear stale online_info (may belong to a different user) and
-                    // reset fail count so the next sync_online_state starts fresh.
+                    s.add_log(format!(
+                        "[OK] {}: Login request succeeded (portal), IP={}, waiting for server confirmation",
+                        uname, ip
+                    ));
+                    // Clear stale online_info that may belong to a different user.
                     s.online_info = None;
                     s.online_info_fail_count = 0;
-                    s.online_info_stale = false;
+                    // online_info_stale is NOT cleared here — only rad_user_info
+                    // success can clear it (in sync_online_state).
                 }
             }
-            // Refresh online_info to populate online duration, traffic etc.
+            // Refresh online_info to confirm the session and populate details.
             let st = state.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -146,8 +150,8 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
         // IP resolution priority for logout:
         // 1. current_ip from online session (most accurate)
         // 2. if_name real-time resolution
-        // 3. Auto-detect current 10.x.x.x campus IPv4
-        // 4. Legacy user.ip (backward compat, not recommended)
+        // 3. Manually configured user.ip
+        // 4. Auto-detect current 10.x.x.x campus IPv4 (last resort)
         let ip = if !status_ip.is_empty() {
             status_ip
         } else {
@@ -155,8 +159,8 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
                 .as_ref()
                 .and_then(|n| get_ip_by_if_name(n))
                 .filter(|i| !i.is_empty())
-                .or_else(detect_campus_ip)
                 .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
+                .or_else(detect_campus_ip)
                 .unwrap_or_default()
         };
         (
@@ -280,40 +284,63 @@ pub async fn do_one_click_login(state: SharedState) {
 
         do_login(state.clone(), idx).await;
 
-        let success = {
+        let post_state = {
             let s = state.lock().unwrap();
-            if let Some(us) = s.user_statuses.get(idx) {
-                us.state == LoginState::Online
-            } else {
-                false
-            }
+            s.user_statuses
+                .get(idx)
+                .map(|us| us.state.clone())
+                .unwrap_or(LoginState::Error)
         };
 
-        if success {
-            tracing::info!("[OneClickLogin] {} succeeded, stopping", username);
-            {
-                let mut s = state.lock().unwrap();
-                s.add_log(format!("[OK] One-click login: {} succeeded", username));
+        match &post_state {
+            LoginState::Online => {
+                tracing::info!(
+                    "[OneClickLogin] {} confirmed online by server, stopping",
+                    username
+                );
+                {
+                    let mut s = state.lock().unwrap();
+                    s.add_log(format!(
+                        "[OK] One-click login: {} confirmed online by server",
+                        username
+                    ));
+                }
+                crate::service::request_ui_repaint();
+                return;
             }
-            crate::service::request_ui_repaint();
-            return;
-        } else {
-            let error = {
-                let s = state.lock().unwrap();
-                s.user_statuses
-                    .get(idx)
-                    .map(|us| us.last_error.clone())
-                    .unwrap_or_default()
-            };
-            tracing::info!("[OneClickLogin] {} failed: {}", username, error);
-            {
-                let mut s = state.lock().unwrap();
-                s.add_log(format!(
-                    "[ERROR] One-click login: {} failed — {}",
-                    username, error
-                ));
+            LoginState::PendingConfirm => {
+                tracing::info!(
+                    "[OneClickLogin] {} portal login succeeded, waiting for server confirmation, stopping",
+                    username
+                );
+                {
+                    let mut s = state.lock().unwrap();
+                    s.add_log(format!(
+                        "[OK] One-click login: {} login request succeeded, waiting for server confirmation",
+                        username
+                    ));
+                }
+                crate::service::request_ui_repaint();
+                return;
             }
-            crate::service::request_ui_repaint();
+            _ => {
+                let error = {
+                    let s = state.lock().unwrap();
+                    s.user_statuses
+                        .get(idx)
+                        .map(|us| us.last_error.clone())
+                        .unwrap_or_default()
+                };
+                tracing::info!("[OneClickLogin] {} failed: {}", username, error);
+                {
+                    let mut s = state.lock().unwrap();
+                    s.add_log(format!(
+                        "[ERROR] One-click login: {} failed — {}",
+                        username, error
+                    ));
+                }
+                crate::service::request_ui_repaint();
+            }
         }
     }
 
@@ -335,7 +362,9 @@ pub async fn do_one_click_logout(state: SharedState) {
         s.user_statuses
             .iter()
             .enumerate()
-            .filter(|(_, us)| us.state == LoginState::Online)
+            .filter(|(_, us)| {
+                us.state == LoginState::Online || us.state == LoginState::PendingConfirm
+            })
             .map(|(i, _)| i)
             .collect()
     };

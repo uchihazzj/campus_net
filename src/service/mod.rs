@@ -34,6 +34,11 @@ pub mod update;
 pub enum LoginState {
     LoggedOut,
     LoggingIn,
+    /// Login request succeeded at the portal (srun_portal), but the
+    /// server (rad_user_info) has not yet confirmed the session.
+    /// UI must not show "confirmed" in this state.
+    PendingConfirm,
+    /// Server (rad_user_info) has confirmed this user is online.
     Online,
     LoggingOut,
     Error,

@@ -211,7 +211,10 @@ pub fn spawn_monitor(state: SharedState) {
                                 .user_statuses
                                 .iter()
                                 .enumerate()
-                                .filter(|(_, us)| us.state == LoginState::Online)
+                                .filter(|(_, us)| {
+                                    us.state == LoginState::Online
+                                        || us.state == LoginState::PendingConfirm
+                                })
                                 .map(|(i, _)| i)
                                 .collect();
                             if !online.is_empty() {
@@ -236,29 +239,36 @@ pub fn spawn_monitor(state: SharedState) {
                         continue;
                     }
 
-                    // Try each target in order, stop on first success
-                    let mut any_success = false;
+                    // Try each target in order, stop on first portal success
+                    let mut any_portal_ok = false;
                     for idx in &targets {
                         do_login(state.clone(), *idx).await;
-                        let success = {
+                        let post_state = {
                             let s = state.lock().unwrap();
                             s.user_statuses
                                 .get(*idx)
-                                .map(|us| us.state == LoginState::Online)
-                                .unwrap_or(false)
+                                .map(|us| us.state.clone())
+                                .unwrap_or(LoginState::Error)
                         };
-                        if success {
-                            any_success = true;
+                        if post_state == LoginState::PendingConfirm
+                            || post_state == LoginState::Online
+                        {
+                            any_portal_ok = true;
                             break;
                         }
                     }
 
-                    if any_success {
+                    if any_portal_ok {
                         let mut s = state.lock().unwrap();
                         s.reconnect_targets.clear();
+                        // Reset fail count (portal success proves server reachable)
+                        // but do NOT clear online_info_stale — only sync_online_state
+                        // (rad_user_info success) can confirm and clear stale.
                         s.online_info_fail_count = 0;
-                        s.online_info_stale = false;
-                        s.add_log("[OK] Auto-reconnect succeeded".to_string());
+                        s.add_log(
+                            "[OK] Auto-reconnect login request succeeded, waiting for server confirmation"
+                                .to_string(),
+                        );
                         backoff_secs = interval;
                     } else {
                         let mut s = state.lock().unwrap();

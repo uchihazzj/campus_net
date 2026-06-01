@@ -491,7 +491,19 @@ impl CampusNetApp {
                             let c = s
                                 .online_info
                                 .as_ref()
-                                .map(|info| info.user_name == username)
+                                .map(|info| {
+                                    crate::service::online_info::match_account(
+                                        &info.user_name,
+                                        &s.config.users,
+                                    )
+                                })
+                                .map(|mr| match mr {
+                                    crate::service::online_info::MatchResult::Exact(i)
+                                    | crate::service::online_info::MatchResult::UniqueBase(i) => {
+                                        i == user_idx
+                                    }
+                                    _ => false,
+                                })
                                 .unwrap_or(false);
                             (c, s.online_info_stale)
                         };
@@ -500,6 +512,17 @@ impl CampusNetApp {
                             if stale {
                                 ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
                             }
+                        }
+                    }
+                    LoginState::PendingConfirm => {
+                        ui.colored_label(Color32::YELLOW, "◐");
+                        ui.label(RichText::new("Pending confirmation...").color(Color32::YELLOW));
+                        let stale = {
+                            let s = self.state.lock().unwrap();
+                            s.online_info_stale
+                        };
+                        if stale {
+                            ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
                         }
                     }
                     LoginState::LoggingIn => {
@@ -560,7 +583,7 @@ impl CampusNetApp {
                     let is_busy = state == LoginState::LoggingIn || state == LoginState::LoggingOut;
 
                     match &state {
-                        LoginState::Online | LoginState::Error => {
+                        LoginState::Online | LoginState::PendingConfirm | LoginState::Error => {
                             if ui
                                 .add_enabled(!is_busy, egui::Button::new(t.btn_logout))
                                 .clicked()
@@ -596,7 +619,18 @@ impl CampusNetApp {
                 let s = self.state.lock().unwrap();
                 s.online_info
                     .as_ref()
-                    .filter(|info| info.user_name == username)
+                    .filter(|info| {
+                        let mr = crate::service::online_info::match_account(
+                            &info.user_name,
+                            &s.config.users,
+                        );
+                        matches!(
+                            mr,
+                            crate::service::online_info::MatchResult::Exact(i)
+                                | crate::service::online_info::MatchResult::UniqueBase(i)
+                                if i == user_idx
+                        )
+                    })
                     .cloned()
             };
 

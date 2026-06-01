@@ -42,6 +42,7 @@
 
 **UI 显示原则**：
 
+- Portal 登录请求成功后显示「等待确认」(PendingConfirm)，只有认证服务器确认匹配后才显示「已确认」
 - 当前在线账号完整显示在 UI 中
 - 在线时长、剩余流量、套餐名称显示在已登录用户卡片内
 - MAC 地址和真实姓名默认不显示
@@ -125,7 +126,7 @@ cargo build --release
 
 ### 配置文件
 
-程序 exe 所在目录自动生成 `config.json`，可通过 GUI 或手动编辑。
+配置文件存储在 `C:\ProgramData\CampusNetClient\config.json`，首次运行自动生成，可通过 GUI 或手动编辑。旧版本中 exe 所在目录的 `config.json` 会在首次运行时自动迁移到新位置。
 
 ```json
 {
@@ -194,11 +195,11 @@ cargo build --release
 
 登录和登出时，程序按以下优先级确定使用的 IP：
 
-1. 网卡名实时解析（推荐方式，适配 DHCP 变化）
-2. 自动检测当前 `10.x.x.x` 校园网 IP
-3. 用户配置的固定 IP（仅作为兜底）
+1. 网卡名精确匹配 → 实时 IPv4 地址（推荐方式，适配 DHCP 变化）
+2. 用户手动配置的 `user.ip`
+3. 自动检测当前 `10.x.x.x` 校园网 IPv4（自动过滤 Docker、WSL、Hyper‑V、VPN 等虚拟网卡）
 
-新用户默认不保存固定 IP，避免 DHCP 重新分配后登录失败。
+`if_name` 匹配优先精确相等，仅当精确匹配不存在时尝试 contains 模糊匹配（歧义时返回无匹配并记录日志）。
 
 ### 运营商选择
 
@@ -212,7 +213,7 @@ cargo build --release
 
 ## 日志与排错
 
-程序 exe 所在目录自动生成 `app.log`，记录运行状态和错误信息。
+程序运行时自动生成 `app.log`（位于 `C:\ProgramData\CampusNetClient\app.log`），记录运行状态和错误信息。
 
 | 问题 | 排查方向 |
 |------|---------|
@@ -228,6 +229,7 @@ cargo build --release
 - 不同学校的 `acid`、`n`、`type`、认证服务器地址等参数可能需要手动调整
 - 自动更新仅校验文件名，未做 SHA/签名校验
 - IPv4 外网探测仅用于网络诊断，不应作为登录状态的唯一判断依据
+- 账号匹配：服务器返回的 `user_name` 与本地配置精确匹配优先；本地配置带运营商后缀（如 `abc@cmcc`）而服务器返回裸账号（`abc`）时，仅当本地只有一个匹配候选时确认，多个候选同名不同后缀时拒绝匹配
 
 ## 项目结构
 
@@ -235,7 +237,7 @@ cargo build --release
 src/
 ├── main.rs              # 入口：tokio runtime + eframe + CJK 字体加载 + tracing 日志
 ├── app.rs               # GUI 渲染 + 系统托盘 + 用户增删改 + 设置面板
-├── path.rs              # 统一路径：config_path() / log_path() 基于 current_exe()
+├── path.rs              # 统一路径：C:\ProgramData\CampusNetClient\config.json / app.log
 ├── core/
 │   ├── srun.rs          # srun 认证协议（async reqwest）
 │   ├── xencode.rs       # x_encode 加密算法

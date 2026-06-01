@@ -356,14 +356,25 @@ impl SrunClient {
         let double_stack_str = self.double_stack.to_string();
         let time_str = self.time.to_string();
 
-        let mut result = PortalResponse::default();
+        let mut last_error = String::new();
         let retries = if self.retry_times == 0 {
             1
         } else {
             self.retry_times
         };
         for ti in 1..=retries {
-            let client = build_http_client(self.strict_bind, &self.ip)?;
+            let client = match build_http_client(self.strict_bind, &self.ip) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("Failed to build HTTP client: {}", e);
+                    tracing::warn!("Login attempt {}/{}: {}", ti, retries, msg);
+                    last_error = msg;
+                    if ti < retries {
+                        tokio::time::sleep(Duration::from_millis(self.retry_delay as u64)).await;
+                    }
+                    continue;
+                }
+            };
             let url = format!("{}{}", self.auth_server, PATH_PORTAL);
             let query = [
                 ("callback", "sdu"),
@@ -382,33 +393,43 @@ impl SrunClient {
                 ("_", &time_str),
             ];
 
-            result = fetch_json(&client, &url, &query).await?;
-
-            if !result.access_token.is_empty() {
-                tracing::info!(
-                    "Login success: attempt {}/{} access_token={}",
-                    ti,
-                    retries,
-                    result.access_token
-                );
-                return Ok(());
+            match fetch_json::<PortalResponse>(&client, &url, &query).await {
+                Ok(result) => {
+                    if !result.access_token.is_empty() {
+                        tracing::info!(
+                            "Login success: attempt {}/{} access_token={}",
+                            ti,
+                            retries,
+                            result.access_token
+                        );
+                        return Ok(());
+                    }
+                    let msg = if result.error_msg.is_empty() {
+                        "portal returned no access_token".to_string()
+                    } else {
+                        result.error_msg.clone()
+                    };
+                    tracing::warn!("Login attempt {}/{}: {}", ti, retries, msg);
+                    last_error = msg;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "Login attempt {}/{} failed (network/parse): {}",
+                        ti,
+                        retries,
+                        msg
+                    );
+                    last_error = msg;
+                }
             }
 
-            tracing::warn!(
-                "Login attempt {}/{} failed: {}",
-                ti,
-                retries,
-                result.error_msg
-            );
-            tokio::time::sleep(Duration::from_millis(self.retry_delay as u64)).await;
+            if ti < retries {
+                tokio::time::sleep(Duration::from_millis(self.retry_delay as u64)).await;
+            }
         }
 
-        let error_msg = if result.error_msg.is_empty() {
-            "login failed after all retries".to_string()
-        } else {
-            result.error_msg.clone()
-        };
-        anyhow::bail!(error_msg);
+        anyhow::bail!(last_error);
     }
 
     pub async fn logout(&mut self) -> anyhow::Result<()> {

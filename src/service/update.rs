@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -105,11 +104,17 @@ pub async fn check_update() -> Result<Option<(String, String, String)>, String> 
 }
 
 fn app_log(msg: &str) {
+    let log_p = log_path();
+    let is_new = !log_p.exists();
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path())
+        .open(&log_p)
     {
+        use std::io::Write;
+        if is_new {
+            let _ = file.write_all(b"\xEF\xBB\xBF");
+        }
         let _ = writeln!(file, "{}", msg);
     }
 }
