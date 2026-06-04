@@ -132,7 +132,7 @@ pub async fn fetch_online_user_info(
     let url = format!("{}/cgi-bin/rad_user_info", server);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         .to_string();
 

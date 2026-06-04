@@ -103,7 +103,7 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
     let url = format!("{}/cgi-bin/get_challenge", server);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         .to_string();
 

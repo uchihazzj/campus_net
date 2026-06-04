@@ -116,7 +116,12 @@ fn create_tray_icon_rgba() -> Icon {
             }
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("Failed to create tray icon")
+    Icon::from_rgba(rgba, size, size).unwrap_or_else(|e| {
+        tracing::error!("Failed to create tray icon rgba: {}, using fallback", e);
+        // 1x1 transparent fallback — minimal valid RGBA icon
+        Icon::from_rgba(vec![0, 0, 0, 0], 1, 1)
+            .unwrap_or_else(|_| Icon::from_rgba(vec![0, 0, 0, 0], 1, 1).unwrap())
+    })
 }
 
 pub fn create_window_icon() -> egui::IconData {
@@ -146,13 +151,132 @@ pub fn create_window_icon() -> egui::IconData {
     }
 }
 
+/// Spawn a dedicated OS thread that listens for tray menu and icon events.
+/// Only called when the tray icon was created successfully.
+fn spawn_tray_listener(
+    state: SharedState,
+    show_id: tray_icon::menu::MenuId,
+    login_all_id: tray_icon::menu::MenuId,
+    logout_all_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+) {
+    let tokio_handle = tokio::runtime::Handle::current();
+
+    std::thread::spawn(move || {
+        let menu_rx = MenuEvent::receiver();
+        let tray_rx = TrayIconEvent::receiver();
+        tracing::info!("[TrayListener] Thread started, listening for MenuEvent + TrayIconEvent...");
+
+        loop {
+            crossbeam_channel::select! {
+                recv(menu_rx) -> result => {
+                    match result {
+                        Ok(event) => {
+                            let id = event.id;
+                            tracing::info!("[TrayListener] MenuEvent id={:?}", id);
+
+                            if id == show_id {
+                                tracing::info!("[TrayListener] → ShowWindow");
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.add_log("[INFO] Tray menu: show window".to_string());
+                                }
+                                native_show_window();
+                            } else if id == login_all_id {
+                                tracing::info!("[TrayListener] → OneClickLogin");
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.add_log("[INFO] One-click login requested from tray".to_string());
+                                    let count = s.config.users.len().min(s.user_statuses.len());
+                                    if count > 0 {
+                                        for i in 0..count {
+                                            if s.user_statuses[i].state != LoginState::Online {
+                                                s.user_statuses[i].state = LoginState::LoggedOut;
+                                                s.user_statuses[i].last_error.clear();
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::service::request_ui_repaint();
+                                let st = state.clone();
+                                tokio_handle.spawn(async move {
+                                    tracing::info!("[OneClickLogin] Task started from tray");
+                                    auth::do_one_click_login(st).await;
+                                    tracing::info!("[OneClickLogin] Task completed");
+                                });
+                            } else if id == logout_all_id {
+                                tracing::info!("[TrayListener] → OneClickLogout");
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.add_log("[INFO] One-click logout requested from tray".to_string());
+                                }
+                                crate::service::request_ui_repaint();
+                                let st = state.clone();
+                                tokio_handle.spawn(async move {
+                                    tracing::info!("[OneClickLogout] Task started from tray");
+                                    auth::do_one_click_logout(st).await;
+                                    tracing::info!("[OneClickLogout] Task completed");
+                                });
+                            } else if id == quit_id {
+                                tracing::info!("[TrayListener] → Quit");
+                                native_force_quit(&state);
+                            } else {
+                                tracing::warn!("[TrayListener] Unknown MenuEvent id={:?}", id);
+                            }
+                        }
+                        Err(crossbeam_channel::RecvError) => {
+                            tracing::info!("[TrayListener] MenuEvent channel disconnected");
+                            break;
+                        }
+                    }
+                }
+                recv(tray_rx) -> result => {
+                    match result {
+                        Ok(event) => {
+                            tracing::info!("[TrayListener] TrayIconEvent: {:?}", event);
+                            match &event {
+                                TrayIconEvent::Click { button, button_state, .. }
+                                    if matches!(button, tray_icon::MouseButton::Left)
+                                       && matches!(button_state, tray_icon::MouseButtonState::Up) =>
+                                {
+                                    tracing::info!("[TrayListener] Left-click → show window");
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.add_log("[INFO] Tray left-click: show window".to_string());
+                                    }
+                                    native_show_window();
+                                }
+                                TrayIconEvent::DoubleClick { button, .. } => {
+                                    if matches!(button, tray_icon::MouseButton::Left) {
+                                        tracing::info!("[TrayListener] Left double-click → show window");
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.add_log("[INFO] Tray double-click: show window".to_string());
+                                        }
+                                        native_show_window();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(crossbeam_channel::RecvError) => {
+                            tracing::info!("[TrayListener] TrayIconEvent channel disconnected");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn should_show_logout_button(state: &LoginState) -> bool {
     matches!(state, LoginState::Online | LoginState::PendingConfirm)
 }
 
 pub struct CampusNetApp {
     state: SharedState,
-    _tray_icon: TrayIcon,
+    _tray_icon: Option<TrayIcon>,
     quit_requested: bool,
     // UI edit state
     editing_user_idx: Option<usize>,
@@ -217,135 +341,33 @@ impl CampusNetApp {
         let _ = menu.append(&logout_all_item);
         let _ = menu.append(&quit_item);
 
-        // ── Tray event listener thread ──────────────────
-        // Uses blocking select! on both MenuEvent and TrayIconEvent channels.
-        // ALL actions handled directly with native Windows API or tokio spawn —
-        // no dependency on eframe update() loop for tray operations.
-        let tokio_handle = tokio::runtime::Handle::current();
-        let state_for_listener = state.clone();
-
-        std::thread::spawn(move || {
-            let menu_rx = MenuEvent::receiver();
-            let tray_rx = TrayIconEvent::receiver();
-            tracing::info!(
-                "[TrayListener] Thread started, listening for MenuEvent + TrayIconEvent..."
-            );
-
-            loop {
-                crossbeam_channel::select! {
-                    recv(menu_rx) -> result => {
-                        match result {
-                            Ok(event) => {
-                                let id = event.id;
-                                tracing::info!("[TrayListener] MenuEvent id={:?}", id);
-
-                                if id == show_id {
-                                    tracing::info!("[TrayListener] → ShowWindow");
-                                    {
-                                        let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] Tray menu: show window".to_string());
-                                    }
-                                    native_show_window();
-                                } else if id == login_all_id {
-                                    tracing::info!("[TrayListener] → OneClickLogin");
-                                    // Set first user to LoggingIn immediately for UI feedback,
-                                    // then spawn the task which handles the actual login.
-                                    {
-                                        let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] One-click login requested from tray".to_string());
-                                        let count = s.config.users.len().min(s.user_statuses.len());
-                                        if count > 0 {
-                                            // Reset all non-Online users first
-                                            for i in 0..count {
-                                                if s.user_statuses[i].state != LoginState::Online {
-                                                    s.user_statuses[i].state = LoginState::LoggedOut;
-                                                    s.user_statuses[i].last_error.clear();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    crate::service::request_ui_repaint();
-                                    let st = state_for_listener.clone();
-                                    tokio_handle.spawn(async move {
-                                        tracing::info!("[OneClickLogin] Task started from tray");
-                                        auth::do_one_click_login(st).await;
-                                        tracing::info!("[OneClickLogin] Task completed");
-                                    });
-                                } else if id == logout_all_id {
-                                    tracing::info!("[TrayListener] → OneClickLogout");
-                                    {
-                                        let mut s = state_for_listener.lock().unwrap();
-                                        s.add_log("[INFO] One-click logout requested from tray".to_string());
-                                    }
-                                    crate::service::request_ui_repaint();
-                                    let st = state_for_listener.clone();
-                                    tokio_handle.spawn(async move {
-                                        tracing::info!("[OneClickLogout] Task started from tray");
-                                        auth::do_one_click_logout(st).await;
-                                        tracing::info!("[OneClickLogout] Task completed");
-                                    });
-                                } else if id == quit_id {
-                                    tracing::info!("[TrayListener] → Quit");
-                                    native_force_quit(&state_for_listener);
-                                } else {
-                                    tracing::warn!("[TrayListener] Unknown MenuEvent id={:?}", id);
-                                }
-                            }
-                            Err(crossbeam_channel::RecvError) => {
-                                tracing::info!("[TrayListener] MenuEvent channel disconnected");
-                                break;
-                            }
-                        }
-                    }
-                    recv(tray_rx) -> result => {
-                        match result {
-                            Ok(event) => {
-                                tracing::info!("[TrayListener] TrayIconEvent: {:?}", event);
-                                match &event {
-                                    TrayIconEvent::Click { button, button_state, .. }
-                                        if matches!(button, tray_icon::MouseButton::Left)
-                                           && matches!(button_state, tray_icon::MouseButtonState::Up) =>
-                                    {
-                                        tracing::info!("[TrayListener] Left-click → show window");
-                                        {
-                                            let mut s = state_for_listener.lock().unwrap();
-                                            s.add_log("[INFO] Tray left-click: show window".to_string());
-                                        }
-                                        native_show_window();
-                                    }
-                                    TrayIconEvent::DoubleClick { button, .. } => {
-                                        if matches!(button, tray_icon::MouseButton::Left) {
-                                            tracing::info!("[TrayListener] Left double-click → show window");
-                                            {
-                                                let mut s = state_for_listener.lock().unwrap();
-                                                s.add_log("[INFO] Tray double-click: show window".to_string());
-                                            }
-                                            native_show_window();
-                                        }
-                                    }
-                                    _ => {
-                                        // Enter/Move/Leave — no action needed
-                                    }
-                                }
-                            }
-                            Err(crossbeam_channel::RecvError) => {
-                                tracing::info!("[TrayListener] TrayIconEvent channel disconnected");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        let tray_icon = TrayIconBuilder::new()
+        // ── Build tray icon ────────────────────────────────
+        // Build the icon first; only spawn the listener thread if it succeeds.
+        let tray_icon = match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(tray_icon_rgba)
             .with_tooltip(t.tray_tooltip)
             .build()
-            .expect("Failed to create tray icon");
+        {
+            Ok(icon) => {
+                tracing::info!("Tray icon created successfully");
 
-        tracing::info!("Tray icon created successfully");
+                // Spawn tray event listener only after the icon is confirmed working
+                spawn_tray_listener(state.clone(), show_id, login_all_id, logout_all_id, quit_id);
+
+                Some(icon)
+            }
+            Err(e) => {
+                tracing::error!("Failed to create tray icon: {}. Tray features disabled.", e);
+                if let Ok(mut s) = state.lock() {
+                    s.add_log(format!(
+                        "[WARN] System tray unavailable: {}. Minimize-to-tray disabled.",
+                        e
+                    ));
+                }
+                None
+            }
+        };
 
         {
             let s = state.lock().unwrap();
