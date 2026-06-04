@@ -253,7 +253,7 @@ impl CampusNetApp {
                                     {
                                         let mut s = state_for_listener.lock().unwrap();
                                         s.add_log("[INFO] One-click login requested from tray".to_string());
-                                        let count = s.config.users.len();
+                                        let count = s.config.users.len().min(s.user_statuses.len());
                                         if count > 0 {
                                             // Reset all non-Online users first
                                             for i in 0..count {

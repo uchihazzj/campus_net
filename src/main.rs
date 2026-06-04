@@ -147,7 +147,23 @@ fn load_cjk_font() -> Option<egui::FontData> {
 fn main() -> anyhow::Result<()> {
     // Install panic hook early — write panic info + backtrace to app.log
     let panic_log_path = log_path();
+    // Track whether we're already inside the panic hook to prevent
+    // double-panic if the hook itself panics (e.g. file I/O failure).
+    // A double-panic aborts the process without any log output.
+    static PANIC_HOOK_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     std::panic::set_hook(Box::new(move |info| {
+        // Guard against double-panic — if the hook itself panics, abort
+        // with a best-effort message to stderr.
+        if PANIC_HOOK_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"FATAL: double panic in panic hook, aborting\n",
+            );
+            return;
+        }
+
         let backtrace = std::backtrace::Backtrace::capture();
         let msg = format!("=== PANIC ===\n{}\n\nBacktrace:\n{}\n", info, backtrace);
         let is_new = !panic_log_path.exists();
@@ -161,6 +177,9 @@ fn main() -> anyhow::Result<()> {
                 let _ = file.write_all(b"\xEF\xBB\xBF");
             }
             let _ = writeln!(file, "{}", msg);
+            // Must flush — without this, buffered data may not reach disk
+            // before the process terminates (e.g. on abort after panic).
+            let _ = file.flush();
         }
         eprintln!("{}", msg);
     }));

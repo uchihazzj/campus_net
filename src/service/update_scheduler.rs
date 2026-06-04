@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::service::update::UpdateStatus;
 use crate::service::SharedState;
@@ -7,6 +7,7 @@ use crate::service::SharedState;
 const RETRY_DELAYS_SECS: &[u64] = &[60, 300, 900];
 const STEADY_RETRY_SECS: u64 = 1800; // 30 min
 const DAILY_INTERVAL_SECS: u64 = 86400; // 24 h
+const SCHEDULER_CRASH_RESTART_SECS: u64 = 60;
 
 /// Returns true when the update system is busy (checking/downloading/etc.).
 pub fn update_busy(status: &UpdateStatus) -> bool {
@@ -21,7 +22,6 @@ pub fn update_busy(status: &UpdateStatus) -> bool {
 
 /// Perform one update check, update AppState accordingly.
 async fn check_update_once(state: &SharedState) -> Result<(), String> {
-    // Set Checking (if not already busy)
     {
         let s = state.lock().unwrap();
         if update_busy(&s.update_status) {
@@ -62,68 +62,105 @@ async fn check_update_once(state: &SharedState) -> Result<(), String> {
     }
 }
 
+/// Run the scheduler loop body. Each call performs one check cycle.
+/// Returns Ok when a check was performed, Err if skipped or failed.
+async fn run_scheduler_cycle(state: &SharedState) -> bool {
+    // Determine if we should check now
+    let should_check = {
+        let s = state.lock().unwrap();
+        if update_busy(&s.update_status) {
+            false
+        } else if matches!(s.update_status, UpdateStatus::Failed(_)) {
+            true
+        } else {
+            // No state tracking for daily check time — just always check
+            // if not busy and not failed. The sleep between cycles provides
+            // the throttling.
+            true
+        }
+    };
+
+    if !should_check {
+        return false;
+    }
+
+    match check_update_once(state).await {
+        Ok(()) => true,
+        Err(_e) => {
+            // On failure, increase the delay before next attempt
+            true
+        }
+    }
+}
+
 pub fn spawn_update_scheduler(state: SharedState) {
     tokio::spawn(async move {
         // ── Startup check ────────────────────────────────
-        let mut last_check = Instant::now();
-        let mut retry_count: usize = 0;
-
         if let Err(_e) = check_update_once(&state).await {
-            retry_count = 1;
+            // Will retry after RETRY_DELAYS_SECS[0]
         }
+
+        let mut fail_count: usize = 0;
 
         // ── Background loop ──────────────────────────────
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-
-            // Determine if we should check now
-            let should_check = {
-                let s = state.lock().unwrap();
-                if update_busy(&s.update_status) {
-                    false
-                } else if matches!(s.update_status, UpdateStatus::Failed(_)) {
-                    // Retry after failure
-                    true
-                } else {
-                    // Daily check: every 24h since last check
-                    last_check.elapsed().as_secs() >= DAILY_INTERVAL_SECS
-                }
-            };
-
-            if !should_check {
-                continue;
-            }
-
-            // Calculate delay for failed retry
-            let is_retry = {
-                let s = state.lock().unwrap();
-                matches!(s.update_status, UpdateStatus::Failed(_))
-            };
-
-            if is_retry && retry_count > 0 {
-                let delay = if retry_count <= RETRY_DELAYS_SECS.len() {
-                    RETRY_DELAYS_SECS[retry_count - 1]
+            // Compute sleep duration based on last result
+            let sleep_secs = if fail_count > 0 {
+                if fail_count <= RETRY_DELAYS_SECS.len() {
+                    RETRY_DELAYS_SECS[fail_count - 1]
                 } else {
                     STEADY_RETRY_SECS
-                };
-                let elapsed = last_check.elapsed().as_secs();
-                if elapsed < delay {
-                    continue; // wait more
+                }
+            } else {
+                DAILY_INTERVAL_SECS
+            };
+
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Run the check as a separate task so panics are caught
+            let cycle_state = state.clone();
+            let handle = tokio::spawn(async move { run_scheduler_cycle(&cycle_state).await });
+
+            match handle.await {
+                Ok(true) => {
+                    fail_count = 0;
+                }
+                Ok(false) => {
+                    // Skipped (busy), keep current fail_count
+                }
+                Err(e) if e.is_panic() => {
+                    tracing::error!(
+                        "[UpdateScheduler] cycle panicked: {}, restarting in {}s",
+                        e,
+                        SCHEDULER_CRASH_RESTART_SECS
+                    );
+                    if let Ok(mut s) = state.lock() {
+                        s.add_log(format!(
+                            "[ERROR] Update scheduler crashed: {}. Restarting in {}s...",
+                            e, SCHEDULER_CRASH_RESTART_SECS
+                        ));
+                    }
+                    fail_count = 0;
+                    // Sleep handled by next loop iteration
+                    continue;
+                }
+                Err(_) => {
+                    tracing::info!("[UpdateScheduler] task cancelled, exiting");
+                    break;
                 }
             }
 
-            match check_update_once(&state).await {
-                Ok(()) => {
-                    last_check = Instant::now();
-                    retry_count = 0;
-                }
-                Err(_e) => {
-                    last_check = Instant::now();
-                    if retry_count == 0 {
-                        retry_count = 1;
+            // Update fail_count after the result
+            {
+                let s = state.lock().unwrap();
+                if matches!(s.update_status, UpdateStatus::Failed(_)) {
+                    if fail_count == 0 {
+                        fail_count = 1;
                     } else {
-                        retry_count += 1;
+                        fail_count += 1;
                     }
+                } else {
+                    fail_count = 0;
                 }
             }
         }

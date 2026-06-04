@@ -31,6 +31,9 @@ fn mix(buffer: &[u8], append_size: bool) -> Vec<u32> {
 
 fn splite(buffer: Vec<u32>, include_size: bool) -> Vec<u8> {
     let len = buffer.len();
+    if len == 0 {
+        return vec![];
+    }
     let size_record = buffer[len - 1];
     if include_size {
         let size = ((len - 1) * 4) as u32;
