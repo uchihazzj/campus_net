@@ -312,6 +312,17 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
         }
     };
 
+    // Verify download is not empty
+    if bytes.is_empty() {
+        let msg = "Downloaded file is empty (0 bytes)".to_string();
+        let mut s = state.lock().unwrap();
+        s.update_status = UpdateStatus::Failed(msg.clone());
+        s.add_log(format!("[ERROR] {}", msg));
+        app_log(&format!("[ERROR] {}", msg));
+        crate::service::request_ui_repaint();
+        return;
+    }
+
     // Write to .download temp file
     if let Err(e) = std::fs::write(&download_path, &bytes) {
         let msg = format!("Failed to write download: {}", e);
@@ -321,6 +332,34 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
         app_log(&format!("[ERROR] {}", msg));
         crate::service::request_ui_repaint();
         return;
+    }
+
+    // Verify the written file matches expected size
+    match std::fs::metadata(&download_path) {
+        Ok(meta) if meta.len() as usize == bytes.len() => {}
+        Ok(meta) => {
+            let msg = format!(
+                "Download size mismatch: expected {} bytes, got {} bytes on disk",
+                bytes.len(),
+                meta.len()
+            );
+            let mut s = state.lock().unwrap();
+            s.update_status = UpdateStatus::Failed(msg.clone());
+            s.add_log(format!("[ERROR] {}", msg));
+            app_log(&format!("[ERROR] {}", msg));
+            crate::service::request_ui_repaint();
+            let _ = std::fs::remove_file(&download_path);
+            return;
+        }
+        Err(e) => {
+            let msg = format!("Failed to verify downloaded file: {}", e);
+            let mut s = state.lock().unwrap();
+            s.update_status = UpdateStatus::Failed(msg.clone());
+            s.add_log(format!("[ERROR] {}", msg));
+            app_log(&format!("[ERROR] {}", msg));
+            crate::service::request_ui_repaint();
+            return;
+        }
     }
 
     // Rename .download → final name
@@ -349,36 +388,90 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
     let script = r#"param(
     [string]$OldExe,
     [string]$NewExe,
-    [string]$BakExe
+    [string]$BakExe,
+    [string]$LogFile
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+
+function Write-Log($msg) {
+    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$stamp $msg" | Out-File -LiteralPath $LogFile -Append -Encoding utf8
+}
+
+Write-Log "Updater started"
+Write-Log "OldExe=$OldExe"
+Write-Log "NewExe=$NewExe"
+Write-Log "BakExe=$BakExe"
+
+# Verify the new exe exists and has reasonable size
+if (-not (Test-Path -LiteralPath $NewExe)) {
+    Write-Log "FATAL: NewExe not found at $NewExe"
+    exit 1
+}
+$newSize = (Get-Item -LiteralPath $NewExe).Length
+if ($newSize -lt 102400) {
+    Write-Log "FATAL: NewExe too small ($newSize bytes), likely corrupt download"
+    exit 1
+}
+Write-Log "NewExe size: $newSize bytes"
 
 Start-Sleep -Seconds 2
 $timeout = 30
 while ($timeout -gt 0) {
     $proc = Get-Process -Name "campus-net-client" -ErrorAction SilentlyContinue
     if (-not $proc) { break }
+    Write-Log "Waiting for campus-net-client to exit... ($timeout attempts left)"
     Start-Sleep -Seconds 1
     $timeout--
 }
 
-try {
-    if (Test-Path -LiteralPath $OldExe) {
-        Move-Item -LiteralPath $OldExe -Destination $BakExe -Force -ErrorAction Stop
-    }
-    Move-Item -LiteralPath $NewExe -Destination $OldExe -Force -ErrorAction Stop
-    Start-Process -FilePath $OldExe
-    Start-Sleep -Seconds 3
-    if (Test-Path -LiteralPath $BakExe) {
-        Remove-Item -LiteralPath $BakExe -Force
-    }
-} catch {
-    if ((Test-Path -LiteralPath $BakExe) -and (-not (Test-Path -LiteralPath $OldExe))) {
-        Move-Item -LiteralPath $BakExe -Destination $OldExe -Force -ErrorAction SilentlyContinue
+if ($timeout -eq 0) {
+    Write-Log "WARN: Process still running after 30s timeout, attempting forced replacement"
+}
+
+# ── Retry loop for file replacement ──
+$maxRetries = 5
+$success = $false
+for ($i = 1; $i -le $maxRetries; $i++) {
+    try {
+        if (Test-Path -LiteralPath $OldExe) {
+            Write-Log "Moving $OldExe -> $BakExe (attempt $i)"
+            Move-Item -LiteralPath $OldExe -Destination $BakExe -Force -ErrorAction Stop
+        }
+        Write-Log "Moving $NewExe -> $OldExe (attempt $i)"
+        Move-Item -LiteralPath $NewExe -Destination $OldExe -Force -ErrorAction Stop
+        $success = $true
+        Write-Log "File replacement succeeded"
+        break
+    } catch {
+        Write-Log "ERROR (attempt $i): $_"
+        Start-Sleep -Seconds 2
     }
 }
 
+if (-not $success) {
+    Write-Log "FATAL: All $maxRetries file replacement attempts failed"
+    # Attempt rollback
+    if ((Test-Path -LiteralPath $BakExe) -and (-not (Test-Path -LiteralPath $OldExe))) {
+        Write-Log "Rolling back: $BakExe -> $OldExe"
+        Move-Item -LiteralPath $BakExe -Destination $OldExe -Force -ErrorAction SilentlyContinue
+    }
+    exit 1
+}
+
+# Launch new version
+Write-Log "Starting $OldExe"
+Start-Process -FilePath $OldExe
+Start-Sleep -Seconds 3
+
+# Cleanup
+if (Test-Path -LiteralPath $BakExe) {
+    Write-Log "Removing backup $BakExe"
+    Remove-Item -LiteralPath $BakExe -Force -ErrorAction SilentlyContinue
+}
+
+Write-Log "Updater completed successfully"
 # Self-cleanup
 Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 "#
@@ -418,6 +511,8 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     let final_path_str = final_path.to_string_lossy().to_string();
     let bak_exe_str = bak_exe.to_string_lossy().to_string();
     let script_path_str = script_path.to_string_lossy().to_string();
+    let updater_log_path = dir.join("updater.log");
+    let updater_log_str = updater_log_path.to_string_lossy().to_string();
 
     match std::process::Command::new("powershell.exe")
         .args([
@@ -433,6 +528,8 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
             &final_path_str,
             "-BakExe",
             &bak_exe_str,
+            "-LogFile",
+            &updater_log_str,
         ])
         .spawn()
     {

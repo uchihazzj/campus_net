@@ -254,6 +254,58 @@ fn main() -> anyhow::Result<()> {
         tracing::info!("config_migration: {}", msg);
     }
 
+    // ── Detect leftover update artifacts ────────────────────
+    // Store a message for the UI log (AppState not yet created at this point).
+    let mut startup_update_warning: Option<String> = None;
+
+    if let Ok(exe_dir) = std::env::current_exe().and_then(|p| {
+        p.parent()
+            .map(|d| d.to_path_buf())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+    }) {
+        // Check for updater log from previous failed update
+        let updater_log = exe_dir.join("updater.log");
+        if updater_log.exists() {
+            match std::fs::read_to_string(&updater_log) {
+                Ok(contents) => {
+                    let last_lines: Vec<&str> = contents.lines().rev().take(5).collect();
+                    let summary = last_lines
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    tracing::warn!(
+                        "Found updater.log from previous update attempt. Last lines:\n{}",
+                        summary
+                    );
+                    startup_update_warning = Some(format!(
+                        "[WARN] Last update may have failed. Updater log:\n{}",
+                        summary
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("Found unreadable updater.log: {}", e);
+                }
+            }
+            let _ = std::fs::remove_file(&updater_log);
+        }
+
+        // Clean up leftover download artifacts
+        for entry in std::fs::read_dir(&exe_dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".download") || name_str.ends_with(".exe.bak") {
+                tracing::warn!("Cleaning up leftover update artifact: {}", name_str);
+                startup_update_warning = Some(format!(
+                    "[WARN] Found leftover update artifact: {}",
+                    name_str
+                ));
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     // Build tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -276,6 +328,13 @@ fn main() -> anyhow::Result<()> {
     let window_h = config.window_height.unwrap_or(350.0);
 
     let state: SharedState = Arc::new(Mutex::new(service::AppState::new(config)));
+
+    // Surface any updater artifact warnings in the UI log
+    if let Some(ref msg) = startup_update_warning {
+        if let Ok(mut s) = state.lock() {
+            s.add_log(msg.clone());
+        }
+    }
 
     // Spawn update scheduler (startup check + retry + daily)
     service::update_scheduler::spawn_update_scheduler(state.clone());
