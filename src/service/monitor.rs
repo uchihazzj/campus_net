@@ -103,6 +103,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         let mut s = state.lock().unwrap();
         s.campus_ip = campus_ipv4.clone();
     }
+    crate::service::request_ui_repaint();
 
     let has_usable_ip = {
         let s = state.lock().unwrap();
@@ -122,6 +123,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         s.add_log(
             "[WARN] No campus IPv4 detected and no user-bound IP available; waiting".to_string(),
         );
+        crate::service::request_ui_repaint();
         return interval;
     }
 
@@ -132,6 +134,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             "[WARN] No global campus IPv4 detected, but user-bound IP exists; preserving current auth status and continuing auto-reconnect evaluation"
                 .to_string(),
         );
+        crate::service::request_ui_repaint();
     }
     let ip = campus_ipv4.as_deref();
 
@@ -175,6 +178,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     }
                 }
             }
+            crate::service::request_ui_repaint();
         } else {
             let mut s = state.lock().unwrap();
             s.ipv4_internet = Ipv4InternetStatus::ProbeFailed;
@@ -182,10 +186,12 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                 "[WARN] IPv4 probe skipped: no global campus IPv4 for bound probe, but user-bound IP exists"
                     .to_string(),
             );
+            crate::service::request_ui_repaint();
         }
     } else {
         let mut s = state.lock().unwrap();
         s.ipv4_internet = Ipv4InternetStatus::Disabled;
+        crate::service::request_ui_repaint();
     }
 
     // ── Auto-reconnect ──────────────────────────
@@ -219,6 +225,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             let mut s = state.lock().unwrap();
             if !s.reconnect_targets.is_empty() {
                 s.reconnect_targets.clear();
+                crate::service::request_ui_repaint();
             }
             interval
         }
@@ -226,8 +233,9 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         ReconnectDecision::Wait => interval,
 
         ReconnectDecision::Reconnect => {
-            let targets = {
+            let (targets, created_targets) = {
                 let mut s = state.lock().unwrap();
+                let mut created_targets = false;
                 if s.reconnect_targets.is_empty() {
                     let online: Vec<usize> = s
                         .user_statuses
@@ -248,11 +256,15 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                         "[INFO] Auto-reconnect: trying {} user(s)",
                         target_count
                     ));
+                    created_targets = true;
                 }
                 let user_len = s.config.users.len();
                 s.reconnect_targets.retain(|&i| i < user_len);
-                s.reconnect_targets.clone()
+                (s.reconnect_targets.clone(), created_targets)
             };
+            if created_targets {
+                crate::service::request_ui_repaint();
+            }
 
             if targets.is_empty() {
                 return interval;
@@ -282,6 +294,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     "[OK] Auto-reconnect login request succeeded, waiting for server confirmation"
                         .to_string(),
                 );
+                crate::service::request_ui_repaint();
                 interval
             } else {
                 let mut s = state.lock().unwrap();
@@ -290,6 +303,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     "[WARN] Auto-reconnect failed, will retry in {}s",
                     next
                 ));
+                crate::service::request_ui_repaint();
                 next
             }
         }

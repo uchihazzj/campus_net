@@ -496,15 +496,15 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction Silent
     }
     crate::service::request_ui_repaint();
 
-    // Save config before exit
-    {
+    let config = {
         let s = state.lock().unwrap();
-        if let Err(e) = crate::service::config::write_config(config_path(), &s.config) {
-            app_log(&format!(
-                "[ERROR] Failed to save config before update: {}",
-                e
-            ));
-        }
+        s.config.clone()
+    };
+    if let Err(e) = crate::service::config::write_config(config_path(), &config) {
+        app_log(&format!(
+            "[ERROR] Failed to save config before update: {}",
+            e
+        ));
     }
 
     let old_exe_str = old_exe.to_string_lossy().to_string();

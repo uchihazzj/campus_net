@@ -55,14 +55,18 @@ fn native_show_window() {
 
 fn native_force_quit(state: &SharedState) {
     tracing::info!("[Native] Force quit from tray");
-    // Save config before exiting
-    if let Ok(mut s) = state.lock() {
-        if let Err(e) = write_config(config_path(), &s.config) {
+    let config = if let Ok(mut s) = state.lock() {
+        s.add_log("[INFO] Quit from tray menu".to_string());
+        Some(s.config.clone())
+    } else {
+        None
+    };
+    if let Some(config) = config {
+        if let Err(e) = write_config(config_path(), &config) {
             tracing::error!("Failed to save config on quit: {}", e);
         }
-        s.add_log("[INFO] Quit from tray menu".to_string());
-        tracing::info!("[Native] Config saved, initiating quit");
     }
+    tracing::info!("[Native] Config saved, initiating quit");
     FORCE_QUIT.store(true, Ordering::SeqCst);
     if let Some(&hwnd) = MAIN_HWND.get() {
         tracing::info!("[Native] Posting WM_CLOSE to hwnd={}", hwnd);
@@ -288,6 +292,8 @@ pub struct CampusNetApp {
     edit_original_ip: String,
     edit_original_if_name: String,
     show_add_dialog: bool,
+    edit_detected_ip: Option<String>,
+    edit_interfaces: Vec<(String, std::net::IpAddr)>,
     cached_lang: Lang,
 }
 
@@ -389,8 +395,33 @@ impl CampusNetApp {
             edit_original_ip: String::new(),
             edit_original_if_name: String::new(),
             show_add_dialog: false,
+            edit_detected_ip: None,
+            edit_interfaces: Vec::new(),
             cached_lang: lang,
         }
+    }
+
+    fn refresh_edit_network_cache(&mut self) -> Vec<(String, String)> {
+        let candidates = crate::service::detection::detect_campus_ip_candidates();
+        self.edit_detected_ip = candidates.first().map(|(_, ip)| ip.clone());
+        self.edit_interfaces = get_network_interfaces();
+        candidates
+    }
+
+    fn open_add_dialog(&mut self) {
+        self.editing_user_idx = None;
+        self.edit_username.clear();
+        self.edit_password.clear();
+        self.edit_ip.clear();
+        self.edit_if_name.clear();
+        self.edit_original_username.clear();
+        self.edit_original_ip.clear();
+        self.edit_original_if_name.clear();
+        let candidates = self.refresh_edit_network_cache();
+        if let Some((name, _ip)) = candidates.first() {
+            self.edit_if_name = name.clone();
+        }
+        self.show_add_dialog = true;
     }
 
     fn t(&mut self) -> UiText {
@@ -590,16 +621,20 @@ impl CampusNetApp {
                     }
 
                     if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
-                        let s = self.state.lock().unwrap();
-                        if let Some(user) = s.config.users.get(user_idx) {
+                        let user = {
+                            let s = self.state.lock().unwrap();
+                            s.config.users.get(user_idx).cloned()
+                        };
+                        if let Some(user) = user {
+                            self.refresh_edit_network_cache();
                             self.editing_user_idx = Some(user_idx);
                             self.edit_username = user.username.clone();
                             self.edit_password.clear();
                             self.edit_ip = user.ip.clone().unwrap_or_default();
                             self.edit_if_name = user.if_name.clone().unwrap_or_default();
-                            self.edit_original_username = user.username.clone();
-                            self.edit_original_ip = user.ip.clone().unwrap_or_default();
-                            self.edit_original_if_name = user.if_name.clone().unwrap_or_default();
+                            self.edit_original_username = user.username;
+                            self.edit_original_ip = user.ip.unwrap_or_default();
+                            self.edit_original_if_name = user.if_name.unwrap_or_default();
                             self.show_add_dialog = false;
                         }
                     }
@@ -732,19 +767,7 @@ impl CampusNetApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button(t.btn_add_user).clicked() {
-                self.editing_user_idx = None;
-                self.edit_username.clear();
-                self.edit_password.clear();
-                self.edit_ip.clear();
-                self.edit_if_name.clear();
-                self.edit_original_username.clear();
-                self.edit_original_ip.clear();
-                self.edit_original_if_name.clear();
-                let candidates = crate::service::detection::detect_campus_ip_candidates();
-                if let Some((name, _ip)) = candidates.first() {
-                    self.edit_if_name = name.clone();
-                }
-                self.show_add_dialog = true;
+                self.open_add_dialog();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -811,9 +834,7 @@ impl CampusNetApp {
                 ui.text_edit_singleline(&mut self.edit_ip)
                     .on_hover_text(t.field_ip_hint);
 
-                // Show current detected campus IP as readonly info
-                let detected_ip = crate::service::detection::detect_campus_ip();
-                if let Some(ref dip) = detected_ip {
+                if let Some(ref dip) = self.edit_detected_ip {
                     ui.colored_label(Color32::GRAY, t.ip_detected.replace("{}", dip));
                 }
 
@@ -821,10 +842,9 @@ impl CampusNetApp {
                 ui.text_edit_singleline(&mut self.edit_if_name)
                     .on_hover_text(t.field_if_name_hint);
 
-                let interfaces = get_network_interfaces();
-                if !interfaces.is_empty() {
+                if !self.edit_interfaces.is_empty() {
                     ui.label(t.available_interfaces);
-                    for (name, ip) in &interfaces {
+                    for (name, ip) in &self.edit_interfaces {
                         if ui.button(format!("  {} — {}", name, ip)).clicked() {
                             self.edit_if_name.clone_from(name);
                         }
@@ -955,16 +975,14 @@ impl CampusNetApp {
                 tokio::spawn(async move {
                     match crate::service::update::check_update().await {
                         Ok(Some((latest, _release_url, download_url))) => {
-                            {
-                                let mut s = state.lock().unwrap();
-                                s.add_log(format!(
-                                    "[INFO] New version {} found, starting automatic update",
-                                    latest
-                                ));
-                            }
+                            let mut s = state.lock().unwrap();
+                            s.add_log(format!("[INFO] New version available: {}", latest));
+                            s.update_status = UpdateStatus::Available {
+                                latest,
+                                release_url: _release_url,
+                                download_url,
+                            };
                             crate::service::request_ui_repaint();
-                            crate::service::update::perform_update(state, latest, download_url)
-                                .await;
                         }
                         Ok(None) => {
                             let mut s = state.lock().unwrap();
@@ -1220,10 +1238,11 @@ impl CampusNetApp {
     }
 
     fn save_config(&self) {
-        let result = {
+        let config = {
             let s = self.state.lock().unwrap();
-            write_config(config_path(), &s.config)
+            s.config.clone()
         };
+        let result = write_config(config_path(), &config);
         if let Err(ref e) = result {
             tracing::error!("Failed to save config: {}", e);
             if let Ok(mut s) = self.state.lock() {

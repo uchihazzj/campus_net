@@ -8,7 +8,7 @@ use crate::service::online_info::sync_online_state;
 use crate::service::{LoginState, SharedState};
 
 pub async fn do_login(state: SharedState, user_idx: usize) {
-    let (server, username, ip, detect_ip, strict_bind, double_stack, test_before_login) = {
+    let (server, username, user_ip, if_name, detect_ip, strict_bind, double_stack) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -20,24 +20,25 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         // 2. Manually configured user.ip (user's explicit choice)
         // 3. Auto-detect current 10.x.x.x campus IPv4 (last resort)
         // 4. Empty — SrunClient will try detect_ip if configured
-        let ip = user
-            .if_name
-            .as_ref()
-            .and_then(|n| get_ip_by_if_name(n))
-            .filter(|i| !i.is_empty())
-            .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
-            .or_else(detect_campus_ip)
-            .unwrap_or_default();
         (
             cfg.server.clone(),
             user.username.clone(),
-            ip,
+            user.ip.clone(),
+            user.if_name.clone(),
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.double_stack,
-            false,
         )
     };
+
+    let ip = if_name
+        .as_ref()
+        .and_then(|n| get_ip_by_if_name(n))
+        .filter(|i| !i.is_empty())
+        .or_else(|| user_ip.clone().filter(|i| !i.is_empty()))
+        .or_else(detect_campus_ip)
+        .unwrap_or_default();
+    let test_before_login = false;
 
     // Guard: block login if a different local account is already confirmed online
     {
@@ -82,6 +83,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                 s.user_statuses[user_idx].last_error = format!("Password decrypt failed: {}", e);
                 s.add_log(format!("[ERROR] {}: Failed to decrypt password", uname));
             }
+            crate::service::request_ui_repaint();
             return;
         }
     };
@@ -97,6 +99,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         s.suppress_auto_reconnect = false;
         s.add_log(format!("[INFO] {}: Logging in...", uname));
     }
+    crate::service::request_ui_repaint();
 
     let mut client = SrunClient::new(&server, &username, &password, &ip)
         .set_detect_ip(detect_ip)
@@ -157,10 +160,11 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
             }
         }
     }
+    crate::service::request_ui_repaint();
 }
 
 pub async fn do_logout(state: SharedState, user_idx: usize) {
-    let (server, username, ip, detect_ip, strict_bind, acid) = {
+    let (server, username, status_ip, user_ip, if_name, detect_ip, strict_bind, acid) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -177,25 +181,28 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
         // 2. if_name real-time resolution
         // 3. Manually configured user.ip
         // 4. Auto-detect current 10.x.x.x campus IPv4 (last resort)
-        let ip = if !status_ip.is_empty() {
-            status_ip
-        } else {
-            user.if_name
-                .as_ref()
-                .and_then(|n| get_ip_by_if_name(n))
-                .filter(|i| !i.is_empty())
-                .or_else(|| user.ip.clone().filter(|i| !i.is_empty()))
-                .or_else(detect_campus_ip)
-                .unwrap_or_default()
-        };
         (
             cfg.server.clone(),
             user.username.clone(),
-            ip,
+            status_ip,
+            user.ip.clone(),
+            user.if_name.clone(),
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.acid,
         )
+    };
+
+    let ip = if !status_ip.is_empty() {
+        status_ip
+    } else {
+        if_name
+            .as_ref()
+            .and_then(|n| get_ip_by_if_name(n))
+            .filter(|i| !i.is_empty())
+            .or_else(|| user_ip.clone().filter(|i| !i.is_empty()))
+            .or_else(detect_campus_ip)
+            .unwrap_or_default()
     };
 
     {
@@ -207,6 +214,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
         s.user_statuses[user_idx].state = LoginState::LoggingOut;
         s.add_log(format!("[INFO] {}: Logging out...", uname));
     }
+    crate::service::request_ui_repaint();
 
     let mut client = SrunClient::new_for_logout(&server, &username, &ip, acid)
         .set_detect_ip(detect_ip)
@@ -243,6 +251,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             }
         }
     }
+    crate::service::request_ui_repaint();
 }
 
 #[allow(dead_code)]

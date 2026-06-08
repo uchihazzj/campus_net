@@ -68,7 +68,9 @@ async fn run_scheduler_cycle(state: &SharedState) -> bool {
     // Determine if we should check now
     let should_check = {
         let s = state.lock().unwrap();
-        if update_busy(&s.update_status) {
+        if update_busy(&s.update_status)
+            || matches!(s.update_status, UpdateStatus::Available { .. })
+        {
             false
         } else if matches!(s.update_status, UpdateStatus::Failed(_)) {
             true
@@ -122,9 +124,7 @@ pub fn spawn_update_scheduler(state: SharedState) {
             let handle = tokio::spawn(async move { run_scheduler_cycle(&cycle_state).await });
 
             match handle.await {
-                Ok(true) => {
-                    fail_count = 0;
-                }
+                Ok(true) => {}
                 Ok(false) => {
                     // Skipped (busy), keep current fail_count
                 }
