@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::service::detection::{check_auth_server, check_auth_status, detect_campus_ip};
+use crate::service::user_ip;
 use crate::service::{AuthServerStatus, CampusAuthStatus, LoginState, SharedState};
 
 /// Parsed from /cgi-bin/rad_user_info?callback=sdu JSONP response.
@@ -262,15 +263,13 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     // 3. reconnect_targets 中第一个有 user.ip 的用户
     for &idx in &s.reconnect_targets {
         if let Some(user) = s.config.users.get(idx) {
-            if let Some(ref ip) = user.ip {
-                if !ip.is_empty() {
-                    tracing::info!(
-                        "[OnlineInfo] Using reconnect_target[{}] user.ip={} for status query",
-                        idx,
-                        ip
-                    );
-                    return Some(ip.clone());
-                }
+            if let Some(ip) = user_ip::configured_static_ip(user) {
+                tracing::info!(
+                    "[OnlineInfo] Using reconnect_target[{}] user.ip={} for status query",
+                    idx,
+                    ip
+                );
+                return Some(ip);
             }
         }
     }
@@ -282,14 +281,12 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     }
     // 5. 任一配置用户的 user.ip（last resort）
     for user in &s.config.users {
-        if let Some(ref ip) = user.ip {
-            if !ip.is_empty() {
-                tracing::info!(
-                    "[OnlineInfo] Using first configured user.ip={} for status query (fallback)",
-                    ip
-                );
-                return Some(ip.clone());
-            }
+        if let Some(ip) = user_ip::configured_static_ip(user) {
+            tracing::info!(
+                "[OnlineInfo] Using first configured user.ip={} for status query (fallback)",
+                ip
+            );
+            return Some(ip);
         }
     }
     None

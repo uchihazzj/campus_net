@@ -236,7 +236,14 @@ cargo build --release
 ```
 src/
 ├── main.rs              # 入口：tokio runtime + eframe + CJK 字体加载 + tracing 日志
-├── app.rs               # GUI 渲染 + 系统托盘 + 用户增删改 + 设置面板
+├── app.rs               # GUI 入口：CampusNetApp + 顶部栏 + 主渲染循环
+├── app/
+│   ├── edit_dialog.rs   # 添加 / 编辑用户弹窗
+│   ├── icon.rs          # 窗口和托盘图标生成
+│   ├── settings.rs      # 设置面板
+│   ├── tray.rs          # 系统托盘 + Win32 显示 / 隐藏 / 退出
+│   ├── update_ui.rs     # 版本检查和自动更新 UI
+│   └── users.rs         # 用户列表和用户卡片
 ├── path.rs              # 统一路径：C:\ProgramData\CampusNetClient\config.json / app.log
 ├── core/
 │   ├── srun.rs          # srun 认证协议（async reqwest）
@@ -250,7 +257,9 @@ src/
 │   ├── monitor.rs       # 后台监控 + 自动重连 + 指数退避
 │   ├── online_info.rs   # rad_user_info 查询 + 在线状态同步 + 启动任务编排
 │   ├── mod.rs           # AppState / SharedState / 状态枚举
-│   └── update.rs        # 版本更新检查 + 下载 + PowerShell 更新脚本
+│   ├── update.rs        # 版本更新检查 + 下载 + PowerShell 更新脚本
+│   ├── update_scheduler.rs # 后台定时检查更新
+│   └── user_ip.rs       # 用户 IP 解析优先级 helper
 ├── platform/
 │   ├── autostart.rs     # Windows 注册表开机自启
 │   └── secure_store.rs  # 密码 base64 编解码存储

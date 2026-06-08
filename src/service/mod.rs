@@ -30,6 +30,7 @@ pub mod monitor;
 pub mod online_info;
 pub mod update;
 pub mod update_scheduler;
+pub mod user_ip;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginState {

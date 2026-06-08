@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::service::auth::do_login;
 use crate::service::detection::{check_ipv4_reachability, detect_campus_ip};
 use crate::service::online_info::sync_online_state;
+use crate::service::user_ip;
 use crate::service::{
     AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState,
 };
@@ -30,18 +31,8 @@ fn any_usable_ip(s: &crate::service::AppState) -> bool {
         return true;
     }
     for (i, us) in s.user_statuses.iter().enumerate() {
-        if !us.current_ip.is_empty() {
+        if user_ip::has_usable_user_ip(s.config.users.get(i), Some(us)) {
             return true;
-        }
-        if let Some(user) = s.config.users.get(i) {
-            if user.ip.as_ref().is_some_and(|ip| !ip.is_empty()) {
-                return true;
-            }
-            if let Some(ref name) = user.if_name {
-                if crate::core::utils::get_ip_by_if_name(name).is_some() {
-                    return true;
-                }
-            }
         }
     }
     false

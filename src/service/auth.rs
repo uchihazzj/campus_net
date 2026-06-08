@@ -1,43 +1,30 @@
 use std::time::Duration;
 
 use crate::core::srun::SrunClient;
-use crate::core::utils::get_ip_by_if_name;
 use crate::platform::secure_store;
-use crate::service::detection::detect_campus_ip;
 use crate::service::online_info::sync_online_state;
+use crate::service::user_ip;
 use crate::service::{LoginState, SharedState};
 
 pub async fn do_login(state: SharedState, user_idx: usize) {
-    let (server, username, user_ip, if_name, detect_ip, strict_bind, double_stack) = {
+    let (server, username, user, detect_ip, strict_bind, double_stack) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
             return;
         }
         let user = &cfg.users[user_idx];
-        // IP resolution priority:
-        // 1. if_name real-time resolution (most stable across DHCP changes)
-        // 2. Manually configured user.ip (user's explicit choice)
-        // 3. Auto-detect current 10.x.x.x campus IPv4 (last resort)
-        // 4. Empty — SrunClient will try detect_ip if configured
         (
             cfg.server.clone(),
             user.username.clone(),
-            user.ip.clone(),
-            user.if_name.clone(),
+            user.clone(),
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.double_stack,
         )
     };
 
-    let ip = if_name
-        .as_ref()
-        .and_then(|n| get_ip_by_if_name(n))
-        .filter(|i| !i.is_empty())
-        .or_else(|| user_ip.clone().filter(|i| !i.is_empty()))
-        .or_else(detect_campus_ip)
-        .unwrap_or_default();
+    let ip = user_ip::resolve_login_ip(&user);
     let test_before_login = false;
 
     // Guard: block login if a different local account is already confirmed online
@@ -164,7 +151,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
 }
 
 pub async fn do_logout(state: SharedState, user_idx: usize) {
-    let (server, username, status_ip, user_ip, if_name, detect_ip, strict_bind, acid) = {
+    let (server, username, user, status_ip, detect_ip, strict_bind, acid) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -176,34 +163,18 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             .get(user_idx)
             .map(|us| us.current_ip.clone())
             .unwrap_or_default();
-        // IP resolution priority for logout:
-        // 1. current_ip from online session (most accurate)
-        // 2. if_name real-time resolution
-        // 3. Manually configured user.ip
-        // 4. Auto-detect current 10.x.x.x campus IPv4 (last resort)
         (
             cfg.server.clone(),
             user.username.clone(),
+            user.clone(),
             status_ip,
-            user.ip.clone(),
-            user.if_name.clone(),
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.acid,
         )
     };
 
-    let ip = if !status_ip.is_empty() {
-        status_ip
-    } else {
-        if_name
-            .as_ref()
-            .and_then(|n| get_ip_by_if_name(n))
-            .filter(|i| !i.is_empty())
-            .or_else(|| user_ip.clone().filter(|i| !i.is_empty()))
-            .or_else(detect_campus_ip)
-            .unwrap_or_default()
-    };
+    let ip = user_ip::resolve_logout_ip(&user, &status_ip);
 
     {
         let mut s = state.lock().unwrap();
