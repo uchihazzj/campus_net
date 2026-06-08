@@ -2,9 +2,28 @@ use std::time::Duration;
 
 use crate::core::srun::SrunClient;
 use crate::platform::secure_store;
+use crate::service::config::StoredUser;
 use crate::service::online_info::sync_online_state;
 use crate::service::user_ip;
 use crate::service::{LoginState, SharedState};
+
+fn same_user(user: &StoredUser, username: &str, original: &StoredUser) -> bool {
+    user.username == username
+        && user.ip == original.ip
+        && user.if_name == original.if_name
+        && user.encrypted_password == original.encrypted_password
+}
+
+fn user_still_matches(
+    users: &[StoredUser],
+    user_idx: usize,
+    username: &str,
+    original: &StoredUser,
+) -> bool {
+    users
+        .get(user_idx)
+        .is_some_and(|user| same_user(user, username, original))
+}
 
 pub async fn do_login(state: SharedState, user_idx: usize) {
     let (server, username, user, detect_ip, strict_bind, double_stack) = {
@@ -77,14 +96,17 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
 
     {
         let mut s = state.lock().unwrap();
-        if user_idx >= s.config.users.len() {
+        if !user_still_matches(&s.config.users, user_idx, &username, &user) {
+            s.add_log(format!(
+                "[WARN] {}: Login cancelled because the user entry changed",
+                username
+            ));
             return;
         }
-        let uname = s.config.users[user_idx].username.clone();
         s.user_statuses[user_idx].state = LoginState::LoggingIn;
         s.user_statuses[user_idx].last_error.clear();
         s.suppress_auto_reconnect = false;
-        s.add_log(format!("[INFO] {}: Logging in...", uname));
+        s.add_log(format!("[INFO] {}: Logging in...", username));
     }
     crate::service::request_ui_repaint();
 
@@ -111,8 +133,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         Ok(()) => {
             {
                 let mut s = state.lock().unwrap();
-                if user_idx < s.config.users.len() {
-                    let uname = s.config.users[user_idx].username.clone();
+                if user_still_matches(&s.config.users, user_idx, &username, &user) {
                     let ip = client.client_ip.clone();
                     // Portal login succeeded but server (rad_user_info) has not
                     // yet confirmed. Do NOT mark as Online here.
@@ -120,13 +141,18 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                     s.user_statuses[user_idx].current_ip = ip.clone();
                     s.add_log(format!(
                         "[OK] {}: Login request succeeded (portal), IP={}, waiting for server confirmation",
-                        uname, ip
+                        username, ip
                     ));
                     // Clear stale online_info that may belong to a different user.
                     s.online_info = None;
                     s.online_info_fail_count = 0;
                     // online_info_stale is NOT cleared here — only rad_user_info
                     // success can clear it (in sync_online_state).
+                } else {
+                    s.add_log(format!(
+                        "[WARN] {}: Login result ignored because the user entry changed",
+                        username
+                    ));
                 }
             }
             // Refresh online_info to confirm the session and populate details.
@@ -138,12 +164,16 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         }
         Err(e) => {
             let mut s = state.lock().unwrap();
-            if user_idx < s.config.users.len() {
-                let uname = s.config.users[user_idx].username.clone();
+            if user_still_matches(&s.config.users, user_idx, &username, &user) {
                 let err = e.to_string();
                 s.user_statuses[user_idx].state = LoginState::Error;
                 s.user_statuses[user_idx].last_error = err.clone();
-                s.add_log(format!("[ERROR] {}: Login failed - {}", uname, err));
+                s.add_log(format!("[ERROR] {}: Login failed - {}", username, err));
+            } else {
+                s.add_log(format!(
+                    "[WARN] {}: Login error ignored because the user entry changed",
+                    username
+                ));
             }
         }
     }
@@ -178,12 +208,15 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
 
     {
         let mut s = state.lock().unwrap();
-        if user_idx >= s.config.users.len() {
+        if !user_still_matches(&s.config.users, user_idx, &username, &user) {
+            s.add_log(format!(
+                "[WARN] {}: Logout cancelled because the user entry changed",
+                username
+            ));
             return;
         }
-        let uname = s.config.users[user_idx].username.clone();
         s.user_statuses[user_idx].state = LoginState::LoggingOut;
-        s.add_log(format!("[INFO] {}: Logging out...", uname));
+        s.add_log(format!("[INFO] {}: Logging out...", username));
     }
     crate::service::request_ui_repaint();
 
@@ -195,13 +228,17 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
         Ok(()) => {
             {
                 let mut s = state.lock().unwrap();
-                if user_idx < s.config.users.len() {
-                    let uname = s.config.users[user_idx].username.clone();
+                if user_still_matches(&s.config.users, user_idx, &username, &user) {
                     s.user_statuses[user_idx].state = LoginState::LoggedOut;
                     s.user_statuses[user_idx].current_ip.clear();
                     s.reconnect_targets.retain(|&i| i != user_idx);
                     s.suppress_auto_reconnect = true;
-                    s.add_log(format!("[OK] {}: Logout success", uname));
+                    s.add_log(format!("[OK] {}: Logout success", username));
+                } else {
+                    s.add_log(format!(
+                        "[WARN] {}: Logout result ignored because the user entry changed",
+                        username
+                    ));
                 }
             }
             // Refresh online_info to confirm server state after logout
@@ -212,13 +249,17 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
         }
         Err(e) => {
             let mut s = state.lock().unwrap();
-            if user_idx < s.config.users.len() {
-                let uname = s.config.users[user_idx].username.clone();
+            if user_still_matches(&s.config.users, user_idx, &username, &user) {
                 let err = e.to_string();
                 s.user_statuses[user_idx].state = LoginState::Error;
                 s.user_statuses[user_idx].last_error = err.clone();
                 s.reconnect_targets.retain(|&i| i != user_idx);
-                s.add_log(format!("[ERROR] {}: Logout failed - {}", uname, err));
+                s.add_log(format!("[ERROR] {}: Logout failed - {}", username, err));
+            } else {
+                s.add_log(format!(
+                    "[WARN] {}: Logout error ignored because the user entry changed",
+                    username
+                ));
             }
         }
     }

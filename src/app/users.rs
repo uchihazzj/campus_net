@@ -127,6 +127,14 @@ impl CampusNetApp {
                             }
                             s.add_log("[INFO] Removed user".to_string());
                         }
+                        if let Some(edit_idx) = self.editing_user_idx {
+                            if edit_idx == user_idx {
+                                self.editing_user_idx = None;
+                                self.show_add_dialog = false;
+                            } else if edit_idx > user_idx {
+                                self.editing_user_idx = Some(edit_idx - 1);
+                            }
+                        }
                         self.save_config();
                         return;
                     }

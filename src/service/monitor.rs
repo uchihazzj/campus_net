@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use crate::service::auth::do_login;
+use crate::service::config::StoredUser;
 use crate::service::detection::{check_ipv4_reachability, detect_campus_ip};
 use crate::service::online_info::sync_online_state;
 use crate::service::user_ip;
 use crate::service::{
-    AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState,
+    AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState, UserStatus,
 };
 
 const MIN_INTERVAL_SECS: u64 = 15;
@@ -30,12 +31,16 @@ fn any_usable_ip(s: &crate::service::AppState) -> bool {
     if s.campus_ip.is_some() {
         return true;
     }
-    for (i, us) in s.user_statuses.iter().enumerate() {
-        if user_ip::has_usable_user_ip(s.config.users.get(i), Some(us)) {
-            return true;
-        }
-    }
-    false
+    let users = s.config.users.clone();
+    let statuses = s.user_statuses.clone();
+    any_usable_user_ip(&users, &statuses)
+}
+
+fn any_usable_user_ip(users: &[StoredUser], statuses: &[UserStatus]) -> bool {
+    statuses
+        .iter()
+        .enumerate()
+        .any(|(i, us)| user_ip::has_usable_user_ip(users.get(i), Some(us)))
 }
 
 /// Evaluate whether auto-reconnect should fire based on current state.
@@ -98,7 +103,10 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
 
     let has_usable_ip = {
         let s = state.lock().unwrap();
-        any_usable_ip(&s)
+        let users = s.config.users.clone();
+        let statuses = s.user_statuses.clone();
+        drop(s);
+        any_usable_user_ip(&users, &statuses)
     };
 
     if campus_ipv4.is_none() && !has_usable_ip {

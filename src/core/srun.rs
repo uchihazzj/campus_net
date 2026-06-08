@@ -237,8 +237,15 @@ impl SrunClient {
             ("_", &time_str),
         ];
         let challenge: ChallengeResponse = fetch_json(&client, &url, &query).await?;
-        if !challenge.online_ip.is_empty() {
-            self.client_ip = challenge.online_ip;
+        let detected_ip = if !challenge.online_ip.is_empty() {
+            Some(challenge.online_ip)
+        } else if !challenge.client_ip.is_empty() {
+            Some(challenge.client_ip)
+        } else {
+            None
+        };
+        if let Some(ip) = detected_ip {
+            self.client_ip = ip;
             return Ok(());
         }
 
@@ -388,10 +395,9 @@ impl SrunClient {
                 Ok(result) => {
                     if !result.access_token.is_empty() {
                         tracing::info!(
-                            "Login success: attempt {}/{} access_token={}",
+                            "Login success: attempt {}/{} access_token=<redacted>",
                             ti,
-                            retries,
-                            result.access_token
+                            retries
                         );
                         return Ok(());
                     }

@@ -97,12 +97,13 @@ async fn run_scheduler_cycle(state: &SharedState) -> bool {
 
 pub fn spawn_update_scheduler(state: SharedState) {
     tokio::spawn(async move {
+        let mut fail_count: usize = 0;
+
         // ── Startup check ────────────────────────────────
         if let Err(_e) = check_update_once(&state).await {
             // Will retry after RETRY_DELAYS_SECS[0]
+            fail_count = 1;
         }
-
-        let mut fail_count: usize = 0;
 
         // ── Background loop ──────────────────────────────
         loop {
