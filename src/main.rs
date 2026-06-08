@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use path::{config_path, ensure_data_dir, log_path, migrate_config};
-use service::config::read_config;
+use service::config::{read_config_with_report, ConfigLoadSource};
 use service::SharedState;
 
 /// Rotate log files: app.log → app.log.1 → app.log.2 → app.log.3 (deleted).
@@ -314,11 +314,27 @@ fn main() -> anyhow::Result<()> {
     let _rt_guard = rt.enter();
 
     // Load config
-    let config = match read_config(config_path()) {
-        Ok(c) => c,
+    let (config, config_load_messages) = match read_config_with_report(config_path()) {
+        Ok(report) => {
+            for msg in &report.messages {
+                match report.source {
+                    ConfigLoadSource::Main | ConfigLoadSource::DefaultMissing => {
+                        tracing::info!("{}", msg);
+                    }
+                    ConfigLoadSource::Backup | ConfigLoadSource::DefaultAfterFailure => {
+                        tracing::warn!("{}", msg);
+                    }
+                }
+            }
+            (report.config, report.messages)
+        }
         Err(e) => {
-            tracing::warn!("Failed to load config, using defaults: {}", e);
-            service::config::AppConfig::default()
+            let msg = format!(
+                "[WARN] Failed to load config after recovery attempts, using defaults: {}",
+                e
+            );
+            tracing::warn!("{}", msg);
+            (service::config::AppConfig::default(), vec![msg])
         }
     };
     tracing::info!("Config loaded: {} users", config.users.len());
@@ -333,6 +349,13 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref msg) = startup_update_warning {
         if let Ok(mut s) = state.lock() {
             s.add_log(msg.clone());
+        }
+    }
+    if !config_load_messages.is_empty() {
+        if let Ok(mut s) = state.lock() {
+            for msg in config_load_messages {
+                s.add_log(msg);
+            }
         }
     }
 
