@@ -163,17 +163,134 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
             });
         }
         Err(e) => {
-            let mut s = state.lock().unwrap();
-            if user_still_matches(&s.config.users, user_idx, &username, &user) {
-                let err = e.to_string();
-                s.user_statuses[user_idx].state = LoginState::Error;
-                s.user_statuses[user_idx].last_error = err.clone();
-                s.add_log(format!("[ERROR] {}: Login failed - {}", username, err));
+            let err = e.to_string();
+            let is_err_code_2 = err.contains("err_code=2");
+
+            if is_err_code_2 {
+                // Auto-logout first, then retry login once
+                {
+                    let mut s = state.lock().unwrap();
+                    s.add_log(format!(
+                        "[INFO] {}: Login failed with err_code=2, auto-logging out then retrying...",
+                        username
+                    ));
+                }
+                crate::service::request_ui_repaint();
+
+                let mut logout_client =
+                    SrunClient::new_for_logout(&server, &username, &client.client_ip, client.acid)
+                        .set_detect_ip(detect_ip)
+                        .set_strict_bind(strict_bind);
+                match logout_client.logout().await {
+                    Ok(()) => {
+                        {
+                            let mut s = state.lock().unwrap();
+                            s.add_log(format!(
+                                "[OK] {}: Auto-logout done, retrying login...",
+                                username
+                            ));
+                        }
+                        crate::service::request_ui_repaint();
+
+                        // Build fresh login client for retry
+                        let mut retry_client =
+                            SrunClient::new(&server, &username, &password, &ip)
+                                .set_detect_ip(detect_ip)
+                                .set_strict_bind(strict_bind)
+                                .set_double_stack(double_stack)
+                                .set_test_before_login(test_before_login);
+                        {
+                            let s = state.lock().unwrap();
+                            let cfg = &s.config;
+                            retry_client = retry_client
+                                .set_n(cfg.n)
+                                .set_type(cfg.utype)
+                                .set_acid(cfg.acid)
+                                .set_os(&cfg.os)
+                                .set_name(&cfg.name)
+                                .set_retry_delay(cfg.retry_delay)
+                                .set_retry_times(cfg.retry_times);
+                        }
+
+                        match retry_client.login().await {
+                            Ok(()) => {
+                                let mut s = state.lock().unwrap();
+                                if user_still_matches(
+                                    &s.config.users,
+                                    user_idx,
+                                    &username,
+                                    &user,
+                                ) {
+                                    let ip = retry_client.client_ip.clone();
+                                    s.user_statuses[user_idx].state =
+                                        LoginState::PendingConfirm;
+                                    s.user_statuses[user_idx].current_ip = ip.clone();
+                                    s.add_log(format!(
+                                        "[OK] {}: Login retry succeeded, IP={}",
+                                        username, ip
+                                    ));
+                                    s.online_info = None;
+                                    s.online_info_fail_count = 0;
+                                }
+                                let st = state.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(500))
+                                        .await;
+                                    sync_online_state(&st).await;
+                                });
+                            }
+                            Err(e2) => {
+                                let mut s = state.lock().unwrap();
+                                if user_still_matches(
+                                    &s.config.users,
+                                    user_idx,
+                                    &username,
+                                    &user,
+                                ) {
+                                    let err2 = e2.to_string();
+                                    s.user_statuses[user_idx].state = LoginState::Error;
+                                    s.user_statuses[user_idx].last_error = err2.clone();
+                                    s.add_log(format!(
+                                        "[ERROR] {}: Login retry failed - {}",
+                                        username, err2
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(logout_err) => {
+                        let mut s = state.lock().unwrap();
+                        if user_still_matches(
+                            &s.config.users,
+                            user_idx,
+                            &username,
+                            &user,
+                        ) {
+                            let logout_err_str = logout_err.to_string();
+                            s.user_statuses[user_idx].state = LoginState::Error;
+                            s.user_statuses[user_idx].last_error = format!(
+                                "err_code=2, auto-logout also failed: {}",
+                                logout_err_str
+                            );
+                            s.add_log(format!(
+                                "[ERROR] {}: err_code=2 and auto-logout failed - {}",
+                                username, logout_err_str
+                            ));
+                        }
+                    }
+                }
             } else {
-                s.add_log(format!(
-                    "[WARN] {}: Login error ignored because the user entry changed",
-                    username
-                ));
+                let mut s = state.lock().unwrap();
+                if user_still_matches(&s.config.users, user_idx, &username, &user) {
+                    s.user_statuses[user_idx].state = LoginState::Error;
+                    s.user_statuses[user_idx].last_error = err.clone();
+                    s.add_log(format!("[ERROR] {}: Login failed - {}", username, err));
+                } else {
+                    s.add_log(format!(
+                        "[WARN] {}: Login error ignored because the user entry changed",
+                        username
+                    ));
+                }
             }
         }
     }
