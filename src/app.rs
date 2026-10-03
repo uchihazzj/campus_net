@@ -15,6 +15,7 @@ mod settings;
 mod tray;
 mod update_ui;
 mod users;
+pub(crate) mod window;
 
 pub use icon::create_window_icon;
 pub(crate) use tray::FORCE_QUIT;
@@ -23,6 +24,7 @@ pub struct CampusNetApp {
     state: SharedState,
     _tray_icon: Option<TrayIcon>,
     quit_requested: bool,
+    window_hidden: bool,
     editing_user_idx: Option<usize>,
     edit_username: String,
     edit_password: String,
@@ -68,6 +70,7 @@ impl CampusNetApp {
             state,
             _tray_icon: tray_icon,
             quit_requested: false,
+            window_hidden: false,
             editing_user_idx: None,
             edit_username: String::new(),
             edit_password: String::new(),
@@ -103,7 +106,7 @@ impl CampusNetApp {
                     (
                         s.campus_ip.clone(),
                         s.ipv4_internet.clone(),
-                        s.online_info.clone(),
+                        s.current_online_info().cloned(),
                     )
                 };
 
@@ -162,23 +165,34 @@ impl CampusNetApp {
                 .on_hover_text(t.server_tooltip);
             if resp.changed() {
                 let mut s = self.state.lock().unwrap();
-                if !s.authentication_busy() {
-                    s.config.server = server.clone();
-                    s.invalidate_auth_context();
-                }
+                let changed = s.set_server(server.clone());
                 drop(s);
-                self.save_config();
+                if changed {
+                    self.save_config();
+                }
             }
             if resp.lost_focus() {
                 let mut s = self.state.lock().unwrap();
-                if !s.authentication_busy() {
-                    s.config.server = SrunClient::normalize_server_url(&server);
-                    s.invalidate_auth_context();
-                }
+                let changed = s.set_server(SrunClient::normalize_server_url(&server));
                 drop(s);
-                self.save_config();
+                if changed {
+                    self.save_config();
+                }
             }
-            if ui.button(t.btn_refresh_status).clicked() {
+            let (query_busy, auth_busy) = {
+                let s = self.state.lock().unwrap();
+                (s.online_query_busy, s.authentication_busy())
+            };
+            if query_busy {
+                ui.spinner();
+            }
+            if ui
+                .add_enabled(
+                    !query_busy && !auth_busy,
+                    egui::Button::new(t.btn_refresh_status),
+                )
+                .clicked()
+            {
                 let state = self.state.clone();
                 tokio::spawn(async move {
                     crate::service::online_info::sync_online_state(&state).await;
@@ -201,8 +215,14 @@ impl eframe::App for CampusNetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         tray::capture_main_hwnd();
         crate::service::set_egui_ctx(ctx.clone());
-        tray::sync_visible_after_native_show(ctx);
         self.poll_edit_network_cache();
+
+        let viewport = ctx.input(|i| i.viewport().clone());
+        window::remember_normal_size(
+            &mut self.state.lock().unwrap().config,
+            &viewport,
+            self.window_hidden,
+        );
 
         if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
             tracing::info!(
@@ -215,34 +235,7 @@ impl eframe::App for CampusNetApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
-                let size = rect.size();
-                let mut s = self.state.lock().unwrap();
-                s.config.window_width = Some(size.x);
-                s.config.window_height = Some(size.y);
-                drop(s);
-                self.save_config();
-            }
-
-            let force = FORCE_QUIT.load(Ordering::SeqCst);
-            let minimize = if force {
-                false
-            } else {
-                let s = self.state.lock().unwrap();
-                s.config.minimize_to_tray && self._tray_icon.is_some()
-            };
-            if minimize {
-                tracing::info!("[MainLoop] Close requested → hiding to tray (Visible(false))");
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.add_log("[INFO] Minimizing to tray (hiding window)".to_string());
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                tray::hide_window();
-            } else {
-                tracing::info!("[MainLoop] Close requested → real quit (minimize_to_tray=false)");
-            }
+            self.save_config();
         }
 
         self.render_edit_dialog(ctx);
@@ -268,6 +261,30 @@ impl eframe::App for CampusNetApp {
                 ui.add_space(4.0);
             });
         });
+
+        // Resolve tray requests after rendering so an in-flight close event
+        // cannot append a hide command after a request to show the window.
+        let hide_on_close =
+            self.state.lock().unwrap().config.minimize_to_tray && self._tray_icon.is_some();
+        match window::apply_visibility(
+            ctx,
+            tray::take_show_request(),
+            hide_on_close,
+            self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst),
+        ) {
+            window::WindowAction::Show => {
+                self.window_hidden = false;
+                tray::show_window();
+            }
+            window::WindowAction::Hide => {
+                self.window_hidden = true;
+                self.state
+                    .lock()
+                    .unwrap()
+                    .add_log("[INFO] Minimizing to tray (hiding window)".into());
+            }
+            window::WindowAction::None | window::WindowAction::Quit => {}
+        }
 
         ctx.request_repaint_after(Duration::from_secs(1));
     }

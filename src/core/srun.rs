@@ -4,7 +4,7 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn decode_body(bytes: &[u8]) -> String {
+pub(crate) fn decode_body(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }

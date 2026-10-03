@@ -341,7 +341,7 @@ fn main() -> anyhow::Result<()> {
     let _rt_guard = rt.enter();
 
     // Load config
-    let (config, config_load_messages) = match read_config_with_report(config_path()) {
+    let (mut config, config_load_messages) = match read_config_with_report(config_path()) {
         Ok(report) => {
             for msg in &report.messages {
                 match report.source {
@@ -367,8 +367,9 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("Config loaded: {} users", config.users.len());
 
     // Read saved window size or use default
-    let window_w = config.window_width.unwrap_or(520.0);
-    let window_h = config.window_height.unwrap_or(350.0);
+    let [window_w, window_h] = app::window::startup_size(config.window_width, config.window_height);
+    config.window_width = Some(window_w);
+    config.window_height = Some(window_h);
 
     let state: SharedState = Arc::new(Mutex::new(service::AppState::new(config)));
 
@@ -398,6 +399,7 @@ fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([window_w, window_h])
+            .with_min_inner_size(app::window::MIN_SIZE)
             .with_title("Campus Net Client")
             .with_icon(icon_data),
         ..Default::default()

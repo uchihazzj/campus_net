@@ -127,6 +127,7 @@ pub struct AppState {
     pub auth_busy: bool,
     pub auth_generation: u64,
     pub online_query_generation: u64,
+    pub online_query_busy: bool,
     pub config_save_pending: bool,
     pub autostart_busy: bool,
     pub update_status: UpdateStatus,
@@ -157,6 +158,7 @@ impl AppState {
             auth_busy: false,
             auth_generation: 0,
             online_query_generation: 0,
+            online_query_busy: false,
             config_save_pending: false,
             autostart_busy: false,
             update_status: UpdateStatus::Idle,
@@ -187,12 +189,84 @@ impl AppState {
 
     pub fn invalidate_auth_context(&mut self) {
         self.auth_generation = self.auth_generation.wrapping_add(1);
+        self.online_query_generation = self.online_query_generation.wrapping_add(1);
+        self.online_query_busy = false;
+    }
+
+    pub fn set_server(&mut self, server: String) -> bool {
+        if self.authentication_busy() || self.config.server == server {
+            return false;
+        }
+        let same_endpoint =
+            crate::core::srun::SrunClient::normalize_server_url(&self.config.server)
+                == crate::core::srun::SrunClient::normalize_server_url(&server);
+        self.config.server = server;
+        self.invalidate_auth_context();
+        if !same_endpoint {
+            self.user_statuses = vec![UserStatus::new(); self.config.users.len()];
+            self.invalidate_online_info();
+            self.auth_server = AuthServerStatus::Unknown;
+            self.reconnect_targets.clear();
+            self.internet_fail_count = 0;
+            self.ipv4_internet = if self.config.enable_ipv4_internet_probe {
+                Ipv4InternetStatus::Checking
+            } else {
+                Ipv4InternetStatus::Disabled
+            };
+        }
+        true
+    }
+
+    fn invalidate_online_info(&mut self) {
+        self.online_info = None;
+        self.online_info_stale = true;
+        self.online_info_fail_count = 0;
+        self.campus_auth = CampusAuthStatus::Unknown;
+    }
+
+    fn invalidate_user_online_info(&mut self, idx: usize) {
+        let related =
+            self.online_info.as_ref().is_some_and(|info| {
+                match online_info::match_account(&info.user_name, &self.config.users) {
+                    online_info::MatchResult::Exact(i)
+                    | online_info::MatchResult::UniqueBase(i) => i == idx,
+                    online_info::MatchResult::Ambiguous(indices) => indices.contains(&idx),
+                    online_info::MatchResult::NoMatch => false,
+                }
+            });
+        if related {
+            self.invalidate_online_info();
+        }
+    }
+
+    pub fn current_online_info(&self) -> Option<&OnlineUserInfo> {
+        if self.online_info_stale || self.campus_auth != CampusAuthStatus::LoggedIn {
+            return None;
+        }
+        self.online_info.as_ref()
+    }
+
+    pub fn definitely_offline(&self) -> bool {
+        self.campus_auth == CampusAuthStatus::NotLoggedIn
+            || (self.online_info_fail_count >= 3
+                && self.config.enable_ipv4_internet_probe
+                && self.ipv4_internet == Ipv4InternetStatus::CaptivePortal)
+    }
+
+    pub fn confirmed_user_info(&self, idx: usize) -> Option<&OnlineUserInfo> {
+        if self.user_statuses.get(idx)?.state != LoginState::Online {
+            return None;
+        }
+        let info = self.current_online_info()?;
+        (online_info::confirmed_online_user_idx(Some(info), &self.config.users) == Some(idx))
+            .then_some(info)
     }
 
     pub fn replace_user(&mut self, idx: usize, user: crate::service::config::StoredUser) {
         if self.authentication_busy() || idx >= self.config.users.len() {
             return;
         }
+        self.invalidate_user_online_info(idx);
         self.config.users[idx] = user;
         self.ensure_statuses();
         self.user_statuses[idx] = UserStatus::new();
@@ -205,6 +279,7 @@ impl AppState {
             return false;
         }
         self.ensure_statuses();
+        self.invalidate_user_online_info(idx);
         self.config.users.remove(idx);
         self.user_statuses.remove(idx);
         self.reconnect_targets.retain(|&i| i != idx);
@@ -246,12 +321,75 @@ mod tests {
         s.ensure_statuses();
         s.user_statuses[0].state = LoginState::Online;
         s.user_statuses[0].current_ip = "10.0.0.1".into();
+        s.online_info = Some(OnlineUserInfo {
+            user_name: "test-user".into(),
+            error: "ok".into(),
+            ..Default::default()
+        });
+        s.campus_auth = CampusAuthStatus::LoggedIn;
         s.reconnect_targets.push(0);
         s.replace_user(0, user);
+        assert!(s.online_info.is_none());
+        assert_eq!(s.campus_auth, CampusAuthStatus::Unknown);
         assert_eq!(s.user_statuses[0].state, LoginState::LoggedOut);
         assert!(s.user_statuses[0].current_ip.is_empty());
         assert!(s.reconnect_targets.is_empty());
         assert_eq!(s.auth_generation, 1);
+    }
+
+    #[test]
+    fn changing_server_discards_old_session_state() {
+        let mut s = AppState::new(AppConfig::default());
+        s.config.users.push(crate::service::config::StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.1".into();
+        s.online_info = Some(OnlineUserInfo {
+            error: "ok".into(),
+            user_name: "test-user".into(),
+            ..Default::default()
+        });
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        s.reconnect_targets.push(0);
+        s.internet_fail_count = 3;
+        assert!(s.set_server("http://other.invalid".into()));
+        assert!(s.online_info.is_none());
+        assert_eq!(s.campus_auth, CampusAuthStatus::Unknown);
+        assert_eq!(s.user_statuses[0].state, LoginState::LoggedOut);
+        assert!(s.user_statuses[0].current_ip.is_empty());
+        assert!(s.reconnect_targets.is_empty());
+        assert_eq!(s.internet_fail_count, 0);
+    }
+
+    #[test]
+    fn stale_or_inactive_account_is_not_presented_as_confirmed() {
+        let mut s = AppState::new(AppConfig::default());
+        s.config.users.push(crate::service::config::StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.online_info = Some(OnlineUserInfo {
+            error: "ok".into(),
+            user_name: "test-user".into(),
+            ..Default::default()
+        });
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        assert!(s.confirmed_user_info(0).is_some());
+        s.online_info_stale = true;
+        assert!(s.confirmed_user_info(0).is_none());
+        assert!(s.current_online_info().is_none());
+        s.online_info_stale = false;
+        s.user_statuses[0].state = LoginState::LoggedOut;
+        assert!(s.confirmed_user_info(0).is_none());
     }
 
     #[test]

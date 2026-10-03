@@ -14,7 +14,10 @@ enum AuthMode {
     Auto,
 }
 
-struct AuthOperation(SharedState);
+struct AuthOperation {
+    state: SharedState,
+    previous_states: Vec<LoginState>,
+}
 
 impl AuthOperation {
     fn begin(
@@ -29,7 +32,7 @@ impl AuthOperation {
                 s.config.users.get(idx) != Some(user) || s.auth_generation != generation
             })
             || (matches!(mode, AuthMode::Auto)
-                && (!s.config.auto_reconnect || s.suppress_auto_reconnect))
+                && !crate::service::monitor::reconnect_needed(&s, true))
         {
             return None;
         }
@@ -40,22 +43,47 @@ impl AuthOperation {
             AuthMode::Logout => s.suppress_auto_reconnect = true,
             AuthMode::Auto => {}
         }
-        Some(Self(state.clone()))
+        let previous_states = s
+            .user_statuses
+            .iter()
+            .map(|status| status.state.clone())
+            .collect();
+        Some(Self {
+            state: state.clone(),
+            previous_states,
+        })
     }
 }
 
 impl Drop for AuthOperation {
     fn drop(&mut self) {
-        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.auth_busy = false;
         s.invalidate_auth_context();
-        for status in &mut s.user_statuses {
+        let mut interrupted = false;
+        for (idx, status) in s.user_statuses.iter_mut().enumerate() {
             if matches!(status.state, LoginState::LoggingIn | LoginState::LoggingOut) {
-                status.state = LoginState::Error;
-                status.last_error =
-                    "Authentication operation interrupted; please retry".to_string();
+                interrupted = true;
+                if status.state == LoginState::LoggingOut {
+                    apply_logout_failure(
+                        status,
+                        self.previous_states
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or(LoginState::Error),
+                        "Authentication operation interrupted; please retry",
+                    );
+                } else {
+                    status.state = LoginState::Error;
+                    status.last_error =
+                        "Authentication operation interrupted; please retry".to_string();
+                }
             }
         }
+        if interrupted {
+            s.online_info_stale = true;
+        }
+        drop(s);
         crate::service::request_ui_repaint();
     }
 }
@@ -121,6 +149,38 @@ fn requires_logout_retry(error: &str) -> bool {
         .any(|part| part == "err_code=2")
 }
 
+fn apply_logout_failure(
+    status: &mut crate::service::UserStatus,
+    previous: LoginState,
+    error: &str,
+) {
+    status.state = if matches!(previous, LoginState::Online | LoginState::PendingConfirm) {
+        previous
+    } else {
+        LoginState::Error
+    };
+    status.last_error = error.to_string();
+}
+
+fn login_blocking_account(s: &crate::service::AppState) -> Option<usize> {
+    // Keep the protection while state is uncertain, but do not let a last-seen
+    // account block fallback after the server/probe has established offline.
+    if s.definitely_offline() {
+        return None;
+    }
+    crate::service::online_info::confirmed_online_user_idx(s.online_info.as_ref(), &s.config.users)
+}
+
+fn mark_pending_login(s: &mut crate::service::AppState, idx: usize, ip: String) {
+    s.user_statuses[idx].state = LoginState::PendingConfirm;
+    s.user_statuses[idx].current_ip = ip;
+    s.user_statuses[idx].last_error.clear();
+    s.online_info = None;
+    s.online_info_fail_count = 0;
+    s.online_info_stale = true;
+    s.campus_auth = crate::service::CampusAuthStatus::Unknown;
+}
+
 pub async fn do_login(state: SharedState, user_idx: usize) {
     let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) else {
         return;
@@ -153,10 +213,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
     // Guard: block login if a different local account is already confirmed online
     {
         let mut s = state.lock().unwrap();
-        if let Some(online_idx) = crate::service::online_info::confirmed_online_user_idx(
-            s.online_info.as_ref(),
-            &s.config.users,
-        ) {
+        if let Some(online_idx) = login_blocking_account(&s) {
             if online_idx != user_idx && user_idx < s.config.users.len() {
                 let target_uname = s.config.users[user_idx].username.clone();
                 let online_uname = s.config.users[online_idx].username.clone();
@@ -169,6 +226,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                     "[WARN] {}: login blocked because {} is already online",
                     target_uname, online_uname
                 ));
+                drop(s);
                 crate::service::request_ui_repaint();
                 return;
             }
@@ -185,6 +243,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                 s.user_statuses[user_idx].last_error = format!("Password decrypt failed: {}", e);
                 s.add_log(format!("[ERROR] {}: Failed to decrypt password", uname));
             }
+            drop(s);
             crate::service::request_ui_repaint();
             return;
         }
@@ -232,17 +291,11 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                     let ip = client.client_ip.clone();
                     // Portal login succeeded but server (rad_user_info) has not
                     // yet confirmed. Do NOT mark as Online here.
-                    s.user_statuses[user_idx].state = LoginState::PendingConfirm;
-                    s.user_statuses[user_idx].current_ip = ip.clone();
+                    mark_pending_login(&mut s, user_idx, ip.clone());
                     s.add_log(format!(
                         "[OK] {}: Login request succeeded (portal), IP={}, waiting for server confirmation",
                         username, ip
                     ));
-                    // Clear stale online_info that may belong to a different user.
-                    s.online_info = None;
-                    s.online_info_fail_count = 0;
-                    // online_info_stale is NOT cleared here — only rad_user_info
-                    // success can clear it (in sync_online_state).
                 } else {
                     s.add_log(format!(
                         "[WARN] {}: Login result ignored because the user entry changed",
@@ -310,14 +363,11 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                                 let mut s = state.lock().unwrap();
                                 if user_still_matches(&s.config.users, user_idx, &username, &user) {
                                     let ip = retry_client.client_ip.clone();
-                                    s.user_statuses[user_idx].state = LoginState::PendingConfirm;
-                                    s.user_statuses[user_idx].current_ip = ip.clone();
+                                    mark_pending_login(&mut s, user_idx, ip.clone());
                                     s.add_log(format!(
                                         "[OK] {}: Login retry succeeded, IP={}",
                                         username, ip
                                     ));
-                                    s.online_info = None;
-                                    s.online_info_fail_count = 0;
                                 }
                                 let st = state.clone();
                                 tokio::spawn(async move {
@@ -380,7 +430,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
 }
 
 async fn do_logout_inner(state: SharedState, user_idx: usize) {
-    let (server, username, user, status_ip, detect_ip, strict_bind, acid) = {
+    let (server, username, user, status_ip, previous_state, detect_ip, strict_bind, acid) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -397,6 +447,7 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
             user.username.clone(),
             user.clone(),
             status_ip,
+            s.user_statuses[user_idx].state.clone(),
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.acid,
@@ -415,6 +466,8 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
             return;
         }
         s.user_statuses[user_idx].state = LoginState::LoggingOut;
+        s.user_statuses[user_idx].last_error.clear();
+        s.online_info_stale = true;
         s.add_log(format!("[INFO] {}: Logging out...", username));
     }
     crate::service::request_ui_repaint();
@@ -430,6 +483,15 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
                 if user_still_matches(&s.config.users, user_idx, &username, &user) {
                     s.user_statuses[user_idx].state = LoginState::LoggedOut;
                     s.user_statuses[user_idx].current_ip.clear();
+                    s.user_statuses[user_idx].last_error.clear();
+                    if crate::service::online_info::confirmed_online_user_idx(
+                        s.online_info.as_ref(),
+                        &s.config.users,
+                    ) == Some(user_idx)
+                    {
+                        s.online_info = None;
+                        s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+                    }
                     s.reconnect_targets.retain(|&i| i != user_idx);
                     s.suppress_auto_reconnect = true;
                     s.add_log(format!("[OK] {}: Logout success", username));
@@ -451,8 +513,7 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
             let mut s = state.lock().unwrap();
             if user_still_matches(&s.config.users, user_idx, &username, &user) {
                 let err = e.to_string();
-                s.user_statuses[user_idx].state = LoginState::Error;
-                s.user_statuses[user_idx].last_error = err.clone();
+                apply_logout_failure(&mut s.user_statuses[user_idx], previous_state, &err);
                 s.reconnect_targets.retain(|&i| i != user_idx);
                 s.add_log(format!("[ERROR] {}: Logout failed - {}", username, err));
             } else {
@@ -498,8 +559,12 @@ pub async fn do_one_click_login(state: SharedState) {
     drop(operation);
 }
 
-pub async fn do_startup_login(state: SharedState) {
-    let Some(operation) = AuthOperation::begin(&state, AuthMode::Auto, None) else {
+pub async fn do_startup_login(state: SharedState, expected: StoredUser, expected_generation: u64) {
+    let Some(operation) = AuthOperation::begin(
+        &state,
+        AuthMode::Auto,
+        Some((0, &expected, expected_generation)),
+    ) else {
         return;
     };
     do_one_click_login_inner(state).await;
@@ -640,28 +705,8 @@ pub async fn do_one_click_logout(state: SharedState) {
         return;
     }
 
-    // ── Step 2: collect usernames, then set to LoggingOut ──
-    {
-        let mut s = state.lock().unwrap();
-        let names: Vec<String> = online_indices
-            .iter()
-            .map(|&idx| {
-                s.config
-                    .users
-                    .get(idx)
-                    .map(|u| u.username.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
-        for (i, &idx) in online_indices.iter().enumerate() {
-            if let Some(us) = s.user_statuses.get_mut(idx) {
-                us.state = LoginState::LoggingOut;
-                us.last_error.clear();
-                tracing::info!("[OneClickLogout] {} state -> LoggingOut", names[i]);
-                s.add_log(format!("[INFO] {}: Logging out...", names[i]));
-            }
-        }
-    }
+    // auth_busy disables all controls. Each account enters LoggingOut only
+    // when its request starts, retaining its previous state for failed retries.
     crate::service::request_ui_repaint();
 
     tracing::info!(
@@ -669,7 +714,8 @@ pub async fn do_one_click_logout(state: SharedState) {
         online_indices.len()
     );
 
-    // ── Step 3: actually log out each user ──
+    // ── Step 2: actually log out each user ──
+    let mut failed = 0;
     for &idx in &online_indices {
         let (username, ip) = {
             let s = state.lock().unwrap();
@@ -702,13 +748,29 @@ pub async fn do_one_click_logout(state: SharedState) {
         crate::service::request_ui_repaint();
 
         do_logout_inner(state.clone(), idx).await;
+        if state
+            .lock()
+            .unwrap()
+            .user_statuses
+            .get(idx)
+            .is_some_and(|status| status.state != LoginState::LoggedOut)
+        {
+            failed += 1;
+        }
     }
 
     tracing::info!("[OneClickLogout] Completed");
     {
         let mut s = state.lock().unwrap();
         s.suppress_auto_reconnect = true;
-        s.add_log("[OK] One-click logout: completed".to_string());
+        if failed == 0 {
+            s.add_log("[OK] One-click logout: completed".to_string());
+        } else {
+            s.add_log(format!(
+                "[WARN] One-click logout: {} request(s) failed; please retry",
+                failed
+            ));
+        }
     }
     crate::service::request_ui_repaint();
     drop(operation);
@@ -722,6 +784,81 @@ mod tests {
 
     fn state() -> SharedState {
         Arc::new(Mutex::new(AppState::new(AppConfig::default())))
+    }
+
+    #[test]
+    fn failed_logout_preserves_the_session_for_retry() {
+        for previous in [LoginState::Online, LoginState::PendingConfirm] {
+            let mut status = crate::service::UserStatus::new();
+            status.state = LoginState::LoggingOut;
+            status.current_ip = "10.0.0.1".into();
+            apply_logout_failure(&mut status, previous.clone(), "test timeout");
+            assert_eq!(status.state, previous);
+            assert_eq!(status.current_ip, "10.0.0.1");
+            assert_eq!(status.last_error, "test timeout");
+        }
+    }
+
+    #[test]
+    fn automatic_claim_rechecks_current_auth_status() {
+        let state = state();
+        state.lock().unwrap().config.auto_reconnect = true;
+        state.lock().unwrap().campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+        assert!(AuthOperation::begin(&state, AuthMode::Auto, None).is_none());
+        state.lock().unwrap().campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+        state.lock().unwrap().online_query_busy = true;
+        assert!(AuthOperation::begin(&state, AuthMode::Auto, None).is_none());
+        state.lock().unwrap().online_query_busy = false;
+        assert!(AuthOperation::begin(&state, AuthMode::Auto, None).is_some());
+    }
+
+    #[test]
+    fn portal_success_does_not_repeat_login_before_confirmation() {
+        let mut s = AppState::new(AppConfig::default());
+        s.config.auto_reconnect = true;
+        s.config.users.push(StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.ensure_statuses();
+        s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+        mark_pending_login(&mut s, 0, "10.0.0.1".into());
+        assert!(!crate::service::monitor::reconnect_needed(&s, true));
+        assert_eq!(s.user_statuses[0].state, LoginState::PendingConfirm);
+    }
+
+    #[test]
+    fn old_online_cache_cannot_block_confirmed_offline_reconnect() {
+        let mut s = AppState::new(AppConfig::default());
+        s.config.users.push(StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        });
+        s.online_info = Some(crate::service::OnlineUserInfo {
+            user_name: "test-user".into(),
+            ..Default::default()
+        });
+        s.campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+        assert_eq!(login_blocking_account(&s), Some(0));
+        s.online_info_stale = true;
+        s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+        assert_eq!(login_blocking_account(&s), None);
+        s.config.enable_ipv4_internet_probe = true;
+        s.online_info_fail_count = 3;
+        s.ipv4_internet = crate::service::Ipv4InternetStatus::CaptivePortal;
+        for status in [
+            crate::service::CampusAuthStatus::Unknown,
+            crate::service::CampusAuthStatus::LoggedIn,
+        ] {
+            s.campus_auth = status;
+            assert_eq!(login_blocking_account(&s), None);
+        }
+        s.config.enable_ipv4_internet_probe = false;
+        assert_eq!(login_blocking_account(&s), Some(0));
     }
 
     #[test]
@@ -768,6 +905,31 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_logout_retains_retry_and_suppression() {
+        let state = state();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.users.push(StoredUser {
+                username: "test-user".into(),
+                encrypted_password: String::new(),
+                ip: None,
+                if_name: None,
+            });
+            s.ensure_statuses();
+            s.user_statuses[0].state = LoginState::Online;
+            s.user_statuses[0].current_ip = "10.0.0.1".into();
+        }
+        let operation = AuthOperation::begin(&state, AuthMode::Logout, None).unwrap();
+        state.lock().unwrap().user_statuses[0].state = LoginState::LoggingOut;
+        drop(operation);
+        let s = state.lock().unwrap();
+        assert_eq!(s.user_statuses[0].state, LoginState::Online);
+        assert!(!s.authentication_busy());
+        assert!(s.suppress_auto_reconnect);
+        assert!(s.online_info_stale);
+    }
+
+    #[test]
     fn auth_operations_are_exclusive_and_invalidate_old_queries() {
         let state = state();
         let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
@@ -809,6 +971,7 @@ mod tests {
     #[test]
     fn manual_authentication_invalidates_an_older_reconnect_batch() {
         let state = state();
+        state.lock().unwrap().campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
         let user = StoredUser {
             username: "test-user".into(),
             encrypted_password: String::new(),
@@ -833,6 +996,7 @@ mod tests {
     #[test]
     fn reconnect_batch_can_continue_after_its_own_failed_attempt() {
         let state = state();
+        state.lock().unwrap().campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
         let user = StoredUser {
             username: "test-user".into(),
             encrypted_password: String::new(),

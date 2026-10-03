@@ -25,6 +25,13 @@ enum ReconnectDecision {
     Reconnect,
 }
 
+pub(crate) fn reconnect_needed(s: &crate::service::AppState, has_usable_ip: bool) -> bool {
+    matches!(
+        evaluate_reconnect(s, has_usable_ip),
+        ReconnectDecision::Reconnect
+    )
+}
+
 /// Check whether any user has a usable login IP (current_ip, user.ip, or
 /// if_name that resolves). Returns true if at least one source is available.
 #[cfg(test)]
@@ -60,7 +67,7 @@ fn evaluate_reconnect(s: &crate::service::AppState, has_usable_ip: bool) -> Reco
     if s.suppress_auto_reconnect {
         return ReconnectDecision::Wait;
     }
-    if s.authentication_busy() {
+    if s.authentication_busy() || s.online_query_busy {
         return ReconnectDecision::Wait;
     }
     if s.campus_ip.is_none() && !has_usable_ip {
@@ -82,25 +89,59 @@ fn evaluate_reconnect(s: &crate::service::AppState, has_usable_ip: bool) -> Reco
     }
 
     // Degraded: use fallback (captive portal / IPv4 probe)
-    if s.campus_auth == CampusAuthStatus::NotLoggedIn {
-        return ReconnectDecision::Reconnect;
-    }
-    if s.config.enable_ipv4_internet_probe
-        && matches!(s.ipv4_internet, Ipv4InternetStatus::CaptivePortal)
-    {
+    if s.definitely_offline() {
         return ReconnectDecision::Reconnect;
     }
 
     ReconnectDecision::Wait
 }
 
+fn apply_ipv4_probe(
+    s: &mut crate::service::AppState,
+    status: Ipv4InternetStatus,
+    auth_generation: u64,
+    query_generation: u64,
+    ip: &Option<String>,
+) -> bool {
+    if !s.config.enable_ipv4_internet_probe
+        || s.authentication_busy()
+        || s.online_query_busy
+        || s.auth_generation != auth_generation
+        || s.online_query_generation != query_generation
+        || &s.campus_ip != ip
+    {
+        return false;
+    }
+    match status {
+        Ipv4InternetStatus::Reachable => {
+            s.internet_fail_count = 0;
+            s.ipv4_internet = Ipv4InternetStatus::Reachable;
+            if !s.reconnect_targets.is_empty() {
+                s.add_log("[INFO] IPv4 internet restored, clearing reconnect targets".to_string());
+                s.reconnect_targets.clear();
+            }
+        }
+        _ => {
+            s.internet_fail_count = s.internet_fail_count.saturating_add(1);
+            if s.internet_fail_count >= FAILURE_THRESHOLD {
+                s.ipv4_internet = status;
+            }
+        }
+    }
+    true
+}
+
 /// Run one full monitor iteration. Returns the next backoff_secs value.
 /// This is run as a separate tokio task so panics are caught by the outer loop.
 async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs: u64) -> u64 {
     // ── Layer 1: Campus IPv4 ────────────────────
+    let auth_generation = state.lock().unwrap().auth_generation;
     let campus_ipv4 = detect_campus_ip();
     {
         let mut s = state.lock().unwrap();
+        if s.authentication_busy() || s.auth_generation != auth_generation {
+            return interval;
+        }
         s.campus_ip = campus_ipv4.clone();
     }
     crate::service::request_ui_repaint();
@@ -115,6 +156,9 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
 
     if campus_ipv4.is_none() && !has_usable_ip {
         let mut s = state.lock().unwrap();
+        if s.authentication_busy() || s.auth_generation != auth_generation {
+            return interval;
+        }
         s.auth_server = AuthServerStatus::Unknown;
         s.campus_auth = CampusAuthStatus::Unknown;
         s.ipv4_internet = if s.config.enable_ipv4_internet_probe {
@@ -126,6 +170,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         s.add_log(
             "[WARN] No campus IPv4 detected and no user-bound IP available; waiting".to_string(),
         );
+        drop(s);
         crate::service::request_ui_repaint();
         return interval;
     }
@@ -137,6 +182,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             "[WARN] No global campus IPv4 detected, but user-bound IP exists; preserving current auth status and continuing auto-reconnect evaluation"
                 .to_string(),
         );
+        drop(s);
         crate::service::request_ui_repaint();
     }
     let ip = campus_ipv4.as_deref();
@@ -145,9 +191,13 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
     sync_online_state(state).await;
 
     // ── Layer 4: IPv4 Internet (conditional) ─────
-    let probe_enabled = {
+    let (probe_enabled, probe_auth_generation, probe_query_generation) = {
         let s = state.lock().unwrap();
-        s.config.enable_ipv4_internet_probe
+        (
+            s.config.enable_ipv4_internet_probe,
+            s.auth_generation,
+            s.online_query_generation,
+        )
     };
 
     if probe_enabled {
@@ -157,33 +207,18 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                 let mut s = state.lock().unwrap();
                 if !s.config.enable_ipv4_internet_probe {
                     s.ipv4_internet = Ipv4InternetStatus::Disabled;
+                    drop(s);
                     crate::service::request_ui_repaint();
                     return interval;
                 }
-                match &ipv4_status {
-                    Ipv4InternetStatus::Reachable => {
-                        s.internet_fail_count = 0;
-                        s.ipv4_internet = Ipv4InternetStatus::Reachable;
-                        if !s.reconnect_targets.is_empty() {
-                            s.add_log(
-                                "[INFO] IPv4 internet restored, clearing reconnect targets"
-                                    .to_string(),
-                            );
-                            s.reconnect_targets.clear();
-                        }
-                    }
-                    Ipv4InternetStatus::CaptivePortal => {
-                        s.internet_fail_count += 1;
-                        if s.internet_fail_count >= FAILURE_THRESHOLD {
-                            s.ipv4_internet = Ipv4InternetStatus::CaptivePortal;
-                        }
-                    }
-                    _ => {
-                        s.internet_fail_count += 1;
-                        if s.internet_fail_count >= FAILURE_THRESHOLD {
-                            s.ipv4_internet = ipv4_status.clone();
-                        }
-                    }
+                if !apply_ipv4_probe(
+                    &mut s,
+                    ipv4_status,
+                    probe_auth_generation,
+                    probe_query_generation,
+                    &campus_ipv4,
+                ) {
+                    return interval;
                 }
             }
             crate::service::request_ui_repaint();
@@ -194,11 +229,13 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                 "[WARN] IPv4 probe skipped: no global campus IPv4 for bound probe, but user-bound IP exists"
                     .to_string(),
             );
+            drop(s);
             crate::service::request_ui_repaint();
         }
     } else {
         let mut s = state.lock().unwrap();
         s.ipv4_internet = Ipv4InternetStatus::Disabled;
+        drop(s);
         crate::service::request_ui_repaint();
     }
 
@@ -233,6 +270,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             let mut s = state.lock().unwrap();
             if !s.reconnect_targets.is_empty() {
                 s.reconnect_targets.clear();
+                drop(s);
                 crate::service::request_ui_repaint();
             }
             interval
@@ -326,6 +364,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     "[OK] Auto-reconnect login request succeeded, waiting for server confirmation"
                         .to_string(),
                 );
+                drop(s);
                 crate::service::request_ui_repaint();
                 interval
             } else {
@@ -338,6 +377,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     "[WARN] Auto-reconnect failed, will retry in {}s",
                     next
                 ));
+                drop(s);
                 crate::service::request_ui_repaint();
                 next
             }
@@ -412,6 +452,35 @@ mod tests {
 
     fn make_state() -> AppState {
         AppState::new(AppConfig::default())
+    }
+
+    #[test]
+    fn delayed_ipv4_probe_does_not_overwrite_a_new_context() {
+        for change in 0..4 {
+            let mut s = make_state();
+            s.config.enable_ipv4_internet_probe = true;
+            s.campus_ip = Some("10.0.0.1".into());
+            s.internet_fail_count = 1;
+            s.ipv4_internet = Ipv4InternetStatus::Checking;
+            let ip = s.campus_ip.clone();
+            let auth_generation = s.auth_generation;
+            let query_generation = s.online_query_generation;
+            match change {
+                0 => s.invalidate_auth_context(),
+                1 => s.online_query_generation += 1,
+                2 => s.campus_ip = Some("10.0.0.2".into()),
+                _ => s.config.enable_ipv4_internet_probe = false,
+            }
+            assert!(!apply_ipv4_probe(
+                &mut s,
+                Ipv4InternetStatus::CaptivePortal,
+                auth_generation,
+                query_generation,
+                &ip
+            ));
+            assert_eq!(s.internet_fail_count, 1);
+            assert_eq!(s.ipv4_internet, Ipv4InternetStatus::Checking);
+        }
     }
 
     #[test]

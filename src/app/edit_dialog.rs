@@ -98,8 +98,15 @@ impl CampusNetApp {
                                 String::new()
                             }
                         } else {
-                            secure_store::encrypt_password(&self.edit_password)
-                                .unwrap_or_else(|_| String::new())
+                            match secure_store::encrypt_password(&self.edit_password) {
+                                Ok(encrypted) => encrypted,
+                                Err(_) => {
+                                    self.state.lock().unwrap().add_log(
+                                        "[ERROR] Failed to encrypt password; account was not changed".to_string(),
+                                    );
+                                    return;
+                                }
+                            }
                         };
 
                         let new_user = StoredUser {

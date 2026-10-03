@@ -51,66 +51,48 @@ impl CampusNetApp {
         self.show_add_dialog = true;
     }
 
-    fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) {
+    fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) -> bool {
         let t = self.t();
-        let (username, state, current_ip, last_error, auth_busy) = {
+        let (user, state, current_ip, last_error, auth_busy, confirmed_info, stale) = {
             let s = self.state.lock().unwrap();
             let Some(user) = s.config.users.get(user_idx) else {
-                return;
+                return false;
             };
             let Some(us) = s.user_statuses.get(user_idx) else {
-                return;
+                return false;
             };
             (
-                user.username.clone(),
+                user.clone(),
                 us.state.clone(),
                 us.current_ip.clone(),
                 us.last_error.clone(),
                 s.authentication_busy(),
+                s.confirmed_user_info(user_idx).cloned(),
+                s.online_info_stale,
             )
         };
+        let mut delete_requested = false;
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 match &state {
                     LoginState::Online => {
-                        ui.colored_label(Color32::GREEN, "●");
-                        ui.label(RichText::new(t.status_online).color(Color32::GREEN));
-                        let (confirmed, stale) = {
-                            let s = self.state.lock().unwrap();
-                            let c = s
-                                .online_info
-                                .as_ref()
-                                .map(|info| {
-                                    crate::service::online_info::match_account(
-                                        &info.user_name,
-                                        &s.config.users,
-                                    )
-                                })
-                                .map(|mr| match mr {
-                                    crate::service::online_info::MatchResult::Exact(i)
-                                    | crate::service::online_info::MatchResult::UniqueBase(i) => {
-                                        i == user_idx
-                                    }
-                                    _ => false,
-                                })
-                                .unwrap_or(false);
-                            (c, s.online_info_stale)
+                        let color = if confirmed_info.is_some() {
+                            Color32::GREEN
+                        } else {
+                            Color32::GRAY
                         };
-                        if confirmed {
+                        ui.colored_label(color, "●");
+                        ui.label(RichText::new(t.status_online).color(color));
+                        if confirmed_info.is_some() {
                             ui.colored_label(Color32::GREEN, t.campus_auth_confirmed);
-                            if stale {
-                                ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
-                            }
+                        } else {
+                            ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
                         }
                     }
                     LoginState::PendingConfirm => {
                         ui.colored_label(Color32::YELLOW, "◐");
                         ui.label(RichText::new(t.status_pending_confirm).color(Color32::YELLOW));
-                        let stale = {
-                            let s = self.state.lock().unwrap();
-                            s.online_info_stale
-                        };
                         if stale {
                             ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
                         }
@@ -139,22 +121,7 @@ impl CampusNetApp {
                         .on_hover_text(t.hint_delete)
                         .clicked()
                     {
-                        {
-                            let mut s = self.state.lock().unwrap();
-                            if !s.remove_user(user_idx) {
-                                return;
-                            }
-                            s.add_log("[INFO] Removed user".to_string());
-                        }
-                        if let Some(edit_idx) = self.editing_user_idx {
-                            if edit_idx == user_idx {
-                                self.editing_user_idx = None;
-                                self.show_add_dialog = false;
-                            } else if edit_idx > user_idx {
-                                self.editing_user_idx = Some(edit_idx - 1);
-                            }
-                        }
-                        self.save_config();
+                        delete_requested = true;
                         return;
                     }
 
@@ -201,27 +168,8 @@ impl CampusNetApp {
 
             ui.horizontal(|ui| {
                 ui.label(t.user_label);
-                ui.label(RichText::new(&username).strong());
+                ui.label(RichText::new(&user.username).strong());
             });
-
-            let confirmed_info = {
-                let s = self.state.lock().unwrap();
-                s.online_info
-                    .as_ref()
-                    .filter(|info| {
-                        let mr = crate::service::online_info::match_account(
-                            &info.user_name,
-                            &s.config.users,
-                        );
-                        matches!(
-                            mr,
-                            crate::service::online_info::MatchResult::Exact(i)
-                                | crate::service::online_info::MatchResult::UniqueBase(i)
-                                if i == user_idx
-                        )
-                    })
-                    .cloned()
-            };
 
             if let Some(ref info) = confirmed_info {
                 ui.label(format!("{} {}", t.ip_label, info.online_ip));
@@ -246,34 +194,30 @@ impl CampusNetApp {
             } else if !current_ip.is_empty() {
                 ui.label(format!("{} {}", t.ip_label, current_ip));
             } else {
-                let s = self.state.lock().unwrap();
-                if let Some(user) = s.config.users.get(user_idx) {
-                    if let Some(ref ip) = user.ip {
-                        if !ip.is_empty() {
-                            ui.label(format!(
-                                "{} {}",
-                                t.ip_label,
-                                t.ip_configured.replace("{}", ip)
-                            ));
-                        } else if let Some(ref if_name) = user.if_name {
-                            ui.label(t.ip_interface.replace("{}", if_name));
-                        } else {
-                            ui.label(t.ip_auto_detect);
-                        }
+                if let Some(ref ip) = user.ip {
+                    if !ip.is_empty() {
+                        ui.label(format!(
+                            "{} {}",
+                            t.ip_label,
+                            t.ip_configured.replace("{}", ip)
+                        ));
                     } else if let Some(ref if_name) = user.if_name {
                         ui.label(t.ip_interface.replace("{}", if_name));
                     } else {
                         ui.label(t.ip_auto_detect);
                     }
+                } else if let Some(ref if_name) = user.if_name {
+                    ui.label(t.ip_interface.replace("{}", if_name));
+                } else {
+                    ui.label(t.ip_auto_detect);
                 }
             }
 
-            if let LoginState::Error = &state {
-                if !last_error.is_empty() {
-                    ui.colored_label(Color32::RED, format!("Error: {}", last_error));
-                }
+            if !last_error.is_empty() {
+                ui.colored_label(Color32::RED, format!("Error: {}", last_error));
             }
         });
+        delete_requested
     }
 
     pub(super) fn render_user_list(&mut self, ui: &mut egui::Ui) {
@@ -283,6 +227,7 @@ impl CampusNetApp {
             s.config.users.len()
         };
 
+        let mut delete_idx = None;
         if user_count == 0 {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
@@ -291,7 +236,9 @@ impl CampusNetApp {
             });
         } else {
             for idx in 0..user_count {
-                self.render_user_card(ui, idx);
+                if self.render_user_card(ui, idx) {
+                    delete_idx = Some(idx);
+                }
                 ui.add_space(4.0);
             }
         }
@@ -324,6 +271,28 @@ impl CampusNetApp {
                 }
             });
         });
+
+        // Keep indices stable for the entire frame; remove after every card
+        // and button has finished using its snapshot.
+        if let Some(idx) = delete_idx {
+            let removed = self.state.lock().unwrap().remove_user(idx);
+            if removed {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .add_log("[INFO] Removed user".into());
+                if let Some(edit_idx) = self.editing_user_idx {
+                    if edit_idx == idx {
+                        self.editing_user_idx = None;
+                        self.show_add_dialog = false;
+                    } else if edit_idx > idx {
+                        self.editing_user_idx = Some(edit_idx - 1);
+                    }
+                }
+                self.save_config();
+                ui.ctx().request_repaint();
+            }
+        }
     }
 }
 

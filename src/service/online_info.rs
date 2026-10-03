@@ -11,7 +11,7 @@ use crate::service::{AuthServerStatus, CampusAuthStatus, LoginState, SharedState
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct OnlineUserInfo {
-    /// "ok" means logged in; any other value means not logged in or error.
+    /// "ok" means logged in; explicit not_online codes mean offline.
     pub error: String,
     pub user_name: String,
     pub online_ip: String,
@@ -112,7 +112,7 @@ pub fn confirmed_online_user_idx(
 ///
 /// Returns:
 /// - `Ok(Some(info))` — successfully fetched and `error == "ok"` (logged in)
-/// - `Ok(None)` — request succeeded but `error != "ok"` (not logged in)
+/// - `Ok(None)` — server explicitly reports `not_online` / `not_online_error`
 /// - `Err(msg)` — request or parse failed entirely (server unreachable etc.)
 pub async fn fetch_online_user_info(
     server: &str,
@@ -148,23 +148,31 @@ pub async fn fetch_online_user_info(
         .query(&[("callback", "sdu"), ("_", &ts)])
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Request failed: {}", e.without_url()))?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
 
     let body = resp
-        .text()
+        .bytes()
         .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .map_err(|e| format!("Failed to read response body: {}", e.without_url()))?;
 
+    parse_online_user_info(&body)
+}
+
+fn parse_online_user_info(bytes: &[u8]) -> Result<Option<OnlineUserInfo>, String> {
+    let body = crate::core::srun::decode_body(bytes);
     let json_str = crate::core::jsonp::strip_jsonp(&body)?;
 
     let info: OnlineUserInfo =
-        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        serde_json::from_str(json_str).map_err(|_| "Invalid rad_user_info JSON".to_string())?;
 
     if info.error == "ok" {
+        if info.user_name.trim().is_empty() {
+            return Err("Online status is missing the account name".to_string());
+        }
         tracing::debug!(
             "[OnlineInfo] User online: user_name={} ip={} sum_seconds={}",
             info.user_name,
@@ -172,9 +180,11 @@ pub async fn fetch_online_user_info(
             info.sum_seconds
         );
         Ok(Some(info))
-    } else {
+    } else if matches!(info.error.as_str(), "not_online" | "not_online_error") {
         tracing::debug!("[OnlineInfo] Not logged in: error={}", info.error);
         Ok(None)
+    } else {
+        Err("Unrecognized rad_user_info status; login state is unknown".to_string())
     }
 }
 
@@ -296,9 +306,10 @@ struct StatusQuery {
 
 impl StatusQuery {
     fn begin(s: &mut crate::service::AppState) -> Option<Self> {
-        if s.authentication_busy() {
+        if s.authentication_busy() || s.online_query_busy {
             return None;
         }
+        s.online_query_busy = true;
         s.online_query_generation = s.online_query_generation.wrapping_add(1);
         Some(Self {
             server: s.config.server.clone(),
@@ -315,6 +326,26 @@ impl StatusQuery {
             && self.server == s.config.server
             && self.ip == best_status_query_ip(s)
     }
+
+    fn finish(&self, s: &mut crate::service::AppState) {
+        if self.query_generation == s.online_query_generation {
+            s.online_query_busy = false;
+        }
+    }
+}
+
+struct StatusQueryGuard {
+    state: SharedState,
+    query: StatusQuery,
+}
+
+impl Drop for StatusQueryGuard {
+    fn drop(&mut self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.query.finish(&mut s);
+        drop(s);
+        crate::service::request_ui_repaint();
+    }
 }
 
 pub async fn sync_online_state(state: &SharedState) {
@@ -325,6 +356,12 @@ pub async fn sync_online_state(state: &SharedState) {
         };
         query
     };
+    let guard = StatusQueryGuard {
+        state: state.clone(),
+        query,
+    };
+    let query = &guard.query;
+    crate::service::request_ui_repaint();
     let (server, query_ip) = (&query.server, &query.ip);
 
     match fetch_online_user_info(server, query_ip.as_deref()).await {
@@ -382,6 +419,7 @@ pub async fn sync_online_state(state: &SharedState) {
                     ));
                 }
             }
+            drop(s);
             crate::service::request_ui_repaint();
         }
 
@@ -404,6 +442,7 @@ pub async fn sync_online_state(state: &SharedState) {
                 }
             }
             s.add_log("[INFO] Auth server reachable, no user logged in".to_string());
+            drop(s);
             crate::service::request_ui_repaint();
         }
 
@@ -505,18 +544,20 @@ pub fn spawn_startup_tasks(state: SharedState) {
         sync_online_state(&state).await;
 
         // ── Phase 4: Conditional auto-login ────────────
-        let (auto_reconnect, should_login, has_online) = {
+        let (auto_reconnect, should_login, has_online, campus_auth, generation, first_user) = {
             let s = state.lock().unwrap();
             let has_online = s
                 .user_statuses
                 .iter()
                 .any(|us| us.state == LoginState::Online || us.state == LoginState::PendingConfirm);
-            (s.config.auto_reconnect, s.config.users.len(), has_online)
-        };
-
-        let campus_auth = {
-            let s = state.lock().unwrap();
-            s.campus_auth.clone()
+            (
+                s.config.auto_reconnect,
+                s.config.users.len(),
+                has_online,
+                s.campus_auth.clone(),
+                s.auth_generation,
+                s.config.users.first().cloned(),
+            )
         };
         if should_auto_login(auto_reconnect, has_online, should_login, &campus_auth) {
             tracing::info!(
@@ -527,7 +568,9 @@ pub fn spawn_startup_tasks(state: SharedState) {
                 s.add_log("[INFO] Auto-login on startup...".to_string());
             }
             crate::service::request_ui_repaint();
-            crate::service::auth::do_startup_login(state.clone()).await;
+            if let Some(user) = first_user {
+                crate::service::auth::do_startup_login(state.clone(), user, generation).await;
+            }
             // Re-sync after login attempt
             sync_online_state(&state).await;
         } else if auto_reconnect
@@ -565,17 +608,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn malformed_status_is_unknown_instead_of_offline() {
+        for body in [r#"{}"#, r#"{"error":"ip_error"}"#, r#"{"error":"ok"}"#] {
+            let response = format!("sdu({body})");
+            assert!(
+                parse_online_user_info(response.as_bytes()).is_err(),
+                "misclassified response: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_offline_status_and_online_gbk_are_supported() {
+        for error in ["not_online", "not_online_error"] {
+            let body = format!(r#"sdu({{"error":"{error}"}})"#);
+            assert!(parse_online_user_info(body.as_bytes()).unwrap().is_none());
+        }
+        let body = r#"sdu({"error":"ok","user_name":"测试账号","online_ip":"10.0.0.1"})"#;
+        let (bytes, _, had_errors) = encoding_rs::GBK.encode(body);
+        assert!(!had_errors);
+        let info = parse_online_user_info(&bytes).unwrap().unwrap();
+        assert_eq!(info.user_name, "测试账号");
+    }
+
     // ── match_account tests ───────────────────────────────
 
     #[test]
     fn outdated_status_queries_are_discarded() {
         let mut s = make_app_state();
         let first = StatusQuery::begin(&mut s).unwrap();
+        s.invalidate_auth_context();
         let second = StatusQuery::begin(&mut s).unwrap();
         assert!(!first.is_current(&s));
         assert!(second.is_current(&s));
         s.invalidate_auth_context();
         assert!(!second.is_current(&s));
+    }
+
+    #[test]
+    fn repeated_refresh_does_not_discard_a_running_status_query() {
+        let mut s = make_app_state();
+        let first = StatusQuery::begin(&mut s).unwrap();
+        assert!(StatusQuery::begin(&mut s).is_none());
+        assert!(first.is_current(&s));
     }
 
     #[test]
@@ -588,9 +664,36 @@ mod tests {
         s.auth_busy = false;
         s.config.server = "http://other.invalid".into();
         assert!(!query.is_current(&s));
+        query.finish(&mut s);
         let query = StatusQuery::begin(&mut s).unwrap();
         s.campus_ip = Some("10.0.0.2".into());
         assert!(!query.is_current(&s));
+    }
+
+    #[test]
+    fn old_status_completion_cannot_release_a_new_query() {
+        let mut s = make_app_state();
+        let old = StatusQuery::begin(&mut s).unwrap();
+        s.invalidate_auth_context();
+        let new = StatusQuery::begin(&mut s).unwrap();
+        old.finish(&mut s);
+        assert!(s.online_query_busy);
+        assert!(new.is_current(&s));
+        new.finish(&mut s);
+        assert!(!s.online_query_busy);
+    }
+
+    #[test]
+    fn dropped_status_task_releases_refresh_controls() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(make_app_state()));
+        let query = StatusQuery::begin(&mut state.lock().unwrap()).unwrap();
+        let guard = StatusQueryGuard {
+            state: state.clone(),
+            query,
+        };
+        assert!(state.lock().unwrap().online_query_busy);
+        drop(guard);
+        assert!(!state.lock().unwrap().online_query_busy);
     }
 
     #[test]
