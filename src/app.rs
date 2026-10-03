@@ -5,9 +5,7 @@ use egui::{Color32, RichText, ScrollArea};
 use tray_icon::TrayIcon;
 
 use crate::core::srun::SrunClient;
-use crate::path::config_path;
 use crate::platform::autostart;
-use crate::service::config::write_config;
 use crate::service::{Ipv4InternetStatus, SharedState};
 use crate::ui::l10n::{self, Lang, UiText};
 
@@ -36,6 +34,7 @@ pub struct CampusNetApp {
     show_add_dialog: bool,
     edit_detected_ip: Option<String>,
     edit_interfaces: Vec<(String, std::net::IpAddr)>,
+    edit_network_rx: Option<crossbeam_channel::Receiver<Vec<(String, std::net::IpAddr)>>>,
     cached_lang: Lang,
 }
 
@@ -48,11 +47,21 @@ impl CampusNetApp {
         let t = l10n::get_text(lang);
         let tray_icon = tray::create_tray_icon(state.clone(), &t);
 
-        {
-            let s = state.lock().unwrap();
-            if s.config.auto_start {
-                let _ = autostart::enable_autostart();
-            }
+        let auto_start = state.lock().unwrap().config.auto_start;
+        if auto_start {
+            state.lock().unwrap().autostart_busy = true;
+            let startup_state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = autostart::enable_autostart() {
+                    tracing::error!("Failed to enable autostart: {}", e);
+                    startup_state
+                        .lock()
+                        .unwrap()
+                        .add_log(format!("[ERROR] Failed to enable autostart: {}", e));
+                }
+                startup_state.lock().unwrap().autostart_busy = false;
+                crate::service::request_ui_repaint();
+            });
         }
 
         Self {
@@ -70,6 +79,7 @@ impl CampusNetApp {
             show_add_dialog: false,
             edit_detected_ip: None,
             edit_interfaces: Vec::new(),
+            edit_network_rx: None,
             cached_lang: lang,
         }
     }
@@ -145,12 +155,28 @@ impl CampusNetApp {
                 s.config.server.clone()
             };
             let resp = ui
-                .add(egui::TextEdit::singleline(&mut server).hint_text(t.server_hint))
+                .add_enabled(
+                    !self.state.lock().unwrap().authentication_busy(),
+                    egui::TextEdit::singleline(&mut server).hint_text(t.server_hint),
+                )
                 .on_hover_text(t.server_tooltip);
             if resp.changed() {
-                let normalized = SrunClient::normalize_server_url(&server);
                 let mut s = self.state.lock().unwrap();
-                s.config.server = normalized;
+                if !s.authentication_busy() {
+                    s.config.server = server.clone();
+                    s.invalidate_auth_context();
+                }
+                drop(s);
+                self.save_config();
+            }
+            if resp.lost_focus() {
+                let mut s = self.state.lock().unwrap();
+                if !s.authentication_busy() {
+                    s.config.server = SrunClient::normalize_server_url(&server);
+                    s.invalidate_auth_context();
+                }
+                drop(s);
+                self.save_config();
             }
             if ui.button(t.btn_refresh_status).clicked() {
                 let state = self.state.clone();
@@ -167,17 +193,7 @@ impl CampusNetApp {
     }
 
     fn save_config(&self) {
-        let config = {
-            let s = self.state.lock().unwrap();
-            s.config.clone()
-        };
-        let result = write_config(config_path(), &config);
-        if let Err(ref e) = result {
-            tracing::error!("Failed to save config: {}", e);
-            if let Ok(mut s) = self.state.lock() {
-                s.add_log(format!("[ERROR] Failed to save config: {}", e));
-            }
-        }
+        crate::service::config::schedule_config_save(self.state.clone());
     }
 }
 
@@ -186,6 +202,7 @@ impl eframe::App for CampusNetApp {
         tray::capture_main_hwnd();
         crate::service::set_egui_ctx(ctx.clone());
         tray::sync_visible_after_native_show(ctx);
+        self.poll_edit_network_cache();
 
         if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
             tracing::info!(
@@ -212,7 +229,7 @@ impl eframe::App for CampusNetApp {
                 false
             } else {
                 let s = self.state.lock().unwrap();
-                s.config.minimize_to_tray
+                s.config.minimize_to_tray && self._tray_icon.is_some()
             };
             if minimize {
                 tracing::info!("[MainLoop] Close requested → hiding to tray (Visible(false))");

@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::platform::secure_store;
 use crate::ui::l10n::Lang;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+static CONFIG_IO_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredUser {
     pub username: String,
     pub encrypted_password: String,
@@ -199,6 +202,15 @@ fn backup_damaged_config(path: &Path, messages: &mut Vec<String>) {
 }
 
 fn atomic_write_config(path: &Path, content: &str, keep_backup: bool) -> anyhow::Result<()> {
+    let _guard = CONFIG_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    atomic_write_config_unlocked(path, content, keep_backup)
+}
+
+fn atomic_write_config_unlocked(
+    path: &Path,
+    content: &str,
+    keep_backup: bool,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -241,8 +253,13 @@ pub fn read_config_with_report(path: impl AsRef<Path>) -> anyhow::Result<ConfigL
     match parse_config_file(path) {
         Ok(mut config) => {
             if fill_required_defaults(&mut config) {
-                write_config(path, &config)?;
-                messages.push("[INFO] Filled missing config defaults".to_string());
+                match write_config(path, &config) {
+                    Ok(()) => messages.push("[INFO] Filled missing config defaults".to_string()),
+                    Err(e) => messages.push(format!(
+                        "[WARN] Failed to save filled config defaults: {}",
+                        e
+                    )),
+                }
             }
             return Ok(ConfigLoadReport {
                 config,
@@ -251,13 +268,17 @@ pub fn read_config_with_report(path: impl AsRef<Path>) -> anyhow::Result<ConfigL
             });
         }
         Err(ConfigReadFailure::NotFound) => {
-            tracing::info!("Config file not found, using defaults");
-            messages.push("[INFO] Config file not found, using defaults".to_string());
-            return Ok(ConfigLoadReport {
-                config: AppConfig::default(),
-                source: ConfigLoadSource::DefaultMissing,
-                messages,
-            });
+            if config_backup_path(path).exists() {
+                messages.push("[WARN] Main config is missing; trying its backup".to_string());
+            } else {
+                tracing::info!("Config file not found, using defaults");
+                messages.push("[INFO] Config file not found, using defaults".to_string());
+                return Ok(ConfigLoadReport {
+                    config: AppConfig::default(),
+                    source: ConfigLoadSource::DefaultMissing,
+                    messages,
+                });
+            }
         }
         Err(e) => {
             messages.push(format!(
@@ -319,6 +340,46 @@ pub fn write_config(path: impl AsRef<Path>, config: &AppConfig) -> anyhow::Resul
     atomic_write_config(path.as_ref(), &content, true)
 }
 
+/// Serialize saves and take the snapshot only when this write owns the file,
+/// so a queued UI save cannot overwrite a newer quit/update save.
+pub fn save_shared_config(
+    path: impl AsRef<Path>,
+    state: &crate::service::SharedState,
+) -> anyhow::Result<()> {
+    let _guard = CONFIG_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let config = state.lock().unwrap().config.clone();
+    let content = serde_json::to_string_pretty(&config)?;
+    atomic_write_config_unlocked(path.as_ref(), &content, true)
+}
+
+pub fn schedule_config_save(state: crate::service::SharedState) {
+    {
+        let mut s = state.lock().unwrap();
+        if s.config_save_pending {
+            return;
+        }
+        s.config_save_pending = true;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let save_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            save_state.lock().unwrap().config_save_pending = false;
+            save_shared_config(crate::path::config_path(), &save_state)
+        })
+        .await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
+        tracing::error!("Failed to save config: {}", error);
+        let mut s = state.lock().unwrap();
+        s.add_log(format!("[ERROR] Failed to save config: {}", error));
+        crate::service::request_ui_repaint();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,13 +392,44 @@ mod tests {
     }
 
     #[test]
+    fn read_config_recovers_when_main_is_missing() {
+        let dir = temp_dir("missing_main");
+        let path = dir.join("config.json");
+        std::fs::write(
+            dir.join("config.json.bak"),
+            r#"{"server":"http://backup","users":[]}"#,
+        )
+        .unwrap();
+        let report = read_config_with_report(&path).unwrap();
+        assert_eq!(report.source, ConfigLoadSource::Backup);
+        assert_eq!(report.config.server, "http://backup");
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_valid_config_survives_default_save_failure() {
+        let dir = temp_dir("defaults_save_failure");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"server":"","acid":42,"users":[]}"#).unwrap();
+        std::fs::create_dir(dir.join("config.json.tmp")).unwrap();
+        let report = read_config_with_report(&path).unwrap();
+        assert_eq!(report.config.acid, 42);
+        assert_eq!(report.source, ConfigLoadSource::Main);
+        assert!(report
+            .messages
+            .iter()
+            .any(|msg| msg.contains("Failed to save")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_config_creates_backup_and_removes_temp() {
         let dir = temp_dir("atomic_write");
         let path = dir.join("config.json");
         std::fs::write(&path, r#"{"server":"old","users":[]}"#).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.server = "http://10.0.0.55".to_string();
+        let cfg = AppConfig::default();
         write_config(&path, &cfg).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -357,7 +449,7 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, "{bad json").unwrap();
         std::fs::write(
-            &dir.join("config.json.bak"),
+            dir.join("config.json.bak"),
             r#"{"server":"http://backup","users":[]}"#,
         )
         .unwrap();
@@ -389,7 +481,7 @@ mod tests {
         let dir = temp_dir("default_after_failure");
         let path = dir.join("config.json");
         std::fs::write(&path, "{bad json").unwrap();
-        std::fs::write(&dir.join("config.json.bak"), "{also bad").unwrap();
+        std::fs::write(dir.join("config.json.bak"), "{also bad").unwrap();
 
         let report = read_config_with_report(&path).unwrap();
 
@@ -415,8 +507,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.server = "http://new-default".to_string();
+        let cfg = AppConfig {
+            server: "http://new-default".to_string(),
+            ..AppConfig::default()
+        };
         write_config(&path, &cfg).unwrap();
 
         assert!(std::fs::read_to_string(&path)

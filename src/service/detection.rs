@@ -10,7 +10,13 @@ use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 /// exclude loopback, link-local, and common virtual adapters (VPN, Docker,
 /// WSL, Hyper‑V, VMware, etc.). Use this for both IP selection and UI.
 pub fn detect_campus_ip_candidates() -> Vec<(String, String)> {
-    get_network_interfaces()
+    campus_ip_candidates_from_interfaces(&get_network_interfaces())
+}
+
+pub fn campus_ip_candidates_from_interfaces(
+    interfaces: &[(String, std::net::IpAddr)],
+) -> Vec<(String, String)> {
+    interfaces
         .iter()
         .filter(|(name, ip)| {
             if !ip.is_ipv4() {
@@ -449,6 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual network test; contacts the campus authentication server"]
     async fn test_check_auth_server() {
         let ip = detect_campus_ip();
         let status = check_auth_server("http://10.0.0.55", ip.as_deref()).await;
@@ -456,6 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_auth_status() {
         let ip = detect_campus_ip();
         let status = check_auth_status(ip.as_deref()).await;
@@ -463,6 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_ipv4_reachability() {
         let ip = detect_campus_ip();
         let result = check_ipv4_reachability(ip.as_deref()).await;

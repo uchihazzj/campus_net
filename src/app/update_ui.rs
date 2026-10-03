@@ -31,41 +31,12 @@ impl CampusNetApp {
                 .clicked()
             {
                 let state = self.state.clone();
-                {
-                    let mut s = self.state.lock().unwrap();
-                    s.update_status = UpdateStatus::Checking;
+                if crate::service::update_scheduler::try_begin_update_check(&state) {
+                    tokio::spawn(async move {
+                        let _ =
+                            crate::service::update_scheduler::check_update_claimed(&state).await;
+                    });
                 }
-                crate::service::request_ui_repaint();
-                tokio::spawn(async move {
-                    match crate::service::update::check_update().await {
-                        Ok(Some((latest, release_url, download_url))) => {
-                            {
-                                let mut s = state.lock().unwrap();
-                                s.add_log(format!("[INFO] New version available: {}", latest));
-                                s.update_status = UpdateStatus::Available {
-                                    latest,
-                                    release_url,
-                                    download_url,
-                                };
-                            }
-                            crate::service::request_ui_repaint();
-                        }
-                        Ok(None) => {
-                            {
-                                let mut s = state.lock().unwrap();
-                                s.update_status = UpdateStatus::UpToDate;
-                            }
-                            crate::service::request_ui_repaint();
-                        }
-                        Err(e) => {
-                            {
-                                let mut s = state.lock().unwrap();
-                                s.update_status = UpdateStatus::Failed(e);
-                            }
-                            crate::service::request_ui_repaint();
-                        }
-                    }
-                });
             }
         });
 
@@ -94,11 +65,7 @@ impl CampusNetApp {
                     });
                 }
 
-                if ui.button(t.btn_open_release).clicked() {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", "", release_url.as_str()])
-                        .spawn();
-                }
+                ui.hyperlink_to(t.btn_open_release, release_url);
             }
             UpdateStatus::Downloading => {
                 ui.colored_label(Color32::YELLOW, t.update_downloading);

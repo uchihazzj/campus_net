@@ -4,6 +4,25 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn decode_body(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // UTF-8 failed, try GBK (common for Chinese campus network servers)
+    if let Some(s) = encoding_rs::Encoding::for_label("gbk".as_bytes()).and_then(|enc| {
+        let (cow, _enc, had_errors) = enc.decode(bytes);
+        if had_errors {
+            None
+        } else {
+            Some(cow.into_owned())
+        }
+    }) {
+        return s;
+    }
+    // Last resort: lossy UTF-8
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 const PATH_GET_CHALLENGE: &str = "/cgi-bin/get_challenge";
 const PATH_PORTAL: &str = "/cgi-bin/srun_portal";
 
@@ -89,24 +108,59 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
     url: &str,
     query: &[(&str, &str)],
 ) -> anyhow::Result<T> {
-    let resp = client.get(url).query(query).send().await?;
+    let resp = client
+        .get(url)
+        .query(query)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("HTTP {}: {}", status.as_u16(), body);
+        anyhow::bail!("Authentication server returned HTTP {}", status.as_u16());
     }
 
-    let body = resp.text().await?;
-    let json_str = crate::core::jsonp::strip_jsonp(&body).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
+    let body = decode_body(&bytes);
+    let json_str = crate::core::jsonp::strip_jsonp(&body)
+        .map_err(|_| anyhow::anyhow!("Authentication server returned invalid JSONP"))?;
 
+    parse_json_response(json_str)
+}
+
+fn parse_json_response<T: for<'de> Deserialize<'de>>(json_str: &str) -> anyhow::Result<T> {
     serde_json::from_str(json_str).map_err(|e| {
         anyhow::anyhow!(
-            "JSON parse error: {}. Body: {}",
-            e,
-            crate::core::jsonp::safe_truncate(json_str, 200)
+            "Authentication response JSON error at line {}, column {} ({:?})",
+            e.line(),
+            e.column(),
+            e.classify()
         )
     })
+}
+
+fn validate_logout_response(result: &PortalResponse) -> anyhow::Result<()> {
+    if result.error == "not_online"
+        || result.error == "ok"
+        || (result.error.is_empty() && (result.res == "ok" || result.suc_msg == "logout_ok"))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Logout rejected: error={}, error_msg={}, res={}",
+        result.error,
+        result.error_msg,
+        result.res
+    )
+}
+
+fn validate_challenge(token: &str) -> anyhow::Result<()> {
+    // The existing encoder indexes four u32 key words. Short replies are
+    // protocol failures, not usable challenges; never pass them to x_encode.
+    if token.len() < 13 {
+        anyhow::bail!("get_challenge returned an empty or truncated challenge");
+    }
+    Ok(())
 }
 
 impl SrunClient {
@@ -296,10 +350,26 @@ impl SrunClient {
         let challenge: ChallengeResponse = fetch_json(&client, &url, &query).await?;
         match challenge.challenge {
             Some(token) => {
+                validate_challenge(&token)?;
                 self.token = token;
                 Ok(self.token.clone())
             }
-            None => anyhow::bail!("get_challenge returned no token"),
+            None => {
+                let mut reason = String::new();
+                if !challenge.error_msg.is_empty() {
+                    reason.push_str(&format!("error_msg={}", challenge.error_msg));
+                }
+                if !challenge.res.is_empty() && challenge.res != "ok" {
+                    if !reason.is_empty() {
+                        reason.push_str(", ");
+                    }
+                    reason.push_str(&format!("res={}", challenge.res));
+                }
+                if reason.is_empty() {
+                    reason = "no token".to_string();
+                }
+                anyhow::bail!("get_challenge failed: {}", reason)
+            }
         }
     }
 
@@ -401,10 +471,20 @@ impl SrunClient {
                         );
                         return Ok(());
                     }
-                    let msg = if result.error_msg.is_empty() {
+                    let mut parts: Vec<String> = Vec::new();
+                    if !result.error.is_empty() {
+                        parts.push(format!("error={}", result.error));
+                    }
+                    if !result.error_msg.is_empty() {
+                        parts.push(format!("error_msg={}", result.error_msg));
+                    }
+                    if !result.res.is_empty() && result.res != "ok" {
+                        parts.push(format!("res={}", result.res));
+                    }
+                    let msg = if parts.is_empty() {
                         "portal returned no access_token".to_string()
                     } else {
-                        result.error_msg.clone()
+                        parts.join(", ")
                     };
                     tracing::warn!("Login attempt {}/{}: {}", ti, retries, msg);
                     last_error = msg;
@@ -448,6 +528,7 @@ impl SrunClient {
         ];
 
         let result: PortalResponse = fetch_json(&client, &url, &query).await?;
+        validate_logout_response(&result)?;
         tracing::info!(
             "Logout: username={}, suc_msg={}, error_msg={}",
             self.username,
@@ -504,4 +585,57 @@ struct PortalResponse {
     username: String,
     wallet_balance: i32,
     st: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_empty_and_short_challenges() {
+        for token in ["", "a", "123456789012"] {
+            assert!(validate_challenge(token).is_err());
+        }
+        assert!(validate_challenge("1234567890123").is_ok());
+        assert!(validate_challenge("0123456789abcdef0123456789abcdef").is_ok());
+    }
+
+    #[test]
+    fn logout_rejects_explicit_failure_and_missing_result() {
+        for json in [r#"{}"#, r#"{"error":"logout_error","error_msg":"failed"}"#] {
+            let response: PortalResponse = serde_json::from_str(json).unwrap();
+            assert!(validate_logout_response(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn logout_accepts_success_and_already_offline() {
+        for json in [
+            r#"{"error":"ok","suc_msg":"logout_ok","res":"ok"}"#,
+            r#"{"res":"ok","suc_msg":"logout_ok"}"#,
+            r#"{"error":"not_online","error_msg":"already offline"}"#,
+        ] {
+            let response: PortalResponse = serde_json::from_str(json).unwrap();
+            assert!(validate_logout_response(&response).is_ok());
+        }
+    }
+
+    #[test]
+    fn malformed_response_does_not_expose_token_payload() {
+        let error = parse_json_response::<PortalResponse>(
+            r#"{"access_token":"test-sensitive-sentinel", broken}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("test-sensitive-sentinel"));
+    }
+
+    #[test]
+    fn response_decoder_handles_utf8_and_gbk() {
+        let body = "sdu({\"error_msg\":\"认证失败\"})";
+        assert_eq!(decode_body(body.as_bytes()), body);
+        let (encoded, _, errors) = encoding_rs::GBK.encode(body);
+        assert!(!errors);
+        assert_eq!(decode_body(&encoded), body);
+    }
 }

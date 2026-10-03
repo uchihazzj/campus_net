@@ -195,6 +195,9 @@ pub fn apply_match_result(
     match match_result {
         MatchResult::Exact(idx) | MatchResult::UniqueBase(idx) => {
             for (i, us) in user_statuses.iter_mut().enumerate() {
+                if matches!(us.state, LoginState::LoggingIn | LoginState::LoggingOut) {
+                    continue;
+                }
                 if i == *idx {
                     us.state = LoginState::Online;
                     us.current_ip = server_ip.to_string();
@@ -264,11 +267,6 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     for &idx in &s.reconnect_targets {
         if let Some(user) = s.config.users.get(idx) {
             if let Some(ip) = user_ip::configured_static_ip(user) {
-                tracing::info!(
-                    "[OnlineInfo] Using reconnect_target[{}] user.ip={} for status query",
-                    idx,
-                    ip
-                );
                 return Some(ip);
             }
         }
@@ -282,10 +280,6 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     // 5. 任一配置用户的 user.ip（last resort）
     for user in &s.config.users {
         if let Some(ip) = user_ip::configured_static_ip(user) {
-            tracing::info!(
-                "[OnlineInfo] Using first configured user.ip={} for status query (fallback)",
-                ip
-            );
             return Some(ip);
         }
     }
@@ -293,16 +287,52 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
 }
 
 /// Called at startup and periodically by the monitor.
-pub async fn sync_online_state(state: &SharedState) {
-    let (server, query_ip) = {
-        let s = state.lock().unwrap();
-        let best_ip = best_status_query_ip(&s);
-        (s.config.server.clone(), best_ip)
-    };
+struct StatusQuery {
+    server: String,
+    ip: Option<String>,
+    auth_generation: u64,
+    query_generation: u64,
+}
 
-    match fetch_online_user_info(&server, query_ip.as_deref()).await {
+impl StatusQuery {
+    fn begin(s: &mut crate::service::AppState) -> Option<Self> {
+        if s.authentication_busy() {
+            return None;
+        }
+        s.online_query_generation = s.online_query_generation.wrapping_add(1);
+        Some(Self {
+            server: s.config.server.clone(),
+            ip: best_status_query_ip(s),
+            auth_generation: s.auth_generation,
+            query_generation: s.online_query_generation,
+        })
+    }
+
+    fn is_current(&self, s: &crate::service::AppState) -> bool {
+        !s.authentication_busy()
+            && self.auth_generation == s.auth_generation
+            && self.query_generation == s.online_query_generation
+            && self.server == s.config.server
+            && self.ip == best_status_query_ip(s)
+    }
+}
+
+pub async fn sync_online_state(state: &SharedState) {
+    let query = {
+        let mut s = state.lock().unwrap();
+        let Some(query) = StatusQuery::begin(&mut s) else {
+            return;
+        };
+        query
+    };
+    let (server, query_ip) = (&query.server, &query.ip);
+
+    match fetch_online_user_info(server, query_ip.as_deref()).await {
         Ok(Some(info)) => {
             let mut s = state.lock().unwrap();
+            if !query.is_current(&s) {
+                return;
+            }
             s.auth_server = AuthServerStatus::Reachable;
             s.campus_auth = CampusAuthStatus::LoggedIn;
             s.online_info = Some(info.clone());
@@ -357,6 +387,9 @@ pub async fn sync_online_state(state: &SharedState) {
 
         Ok(None) => {
             let mut s = state.lock().unwrap();
+            if !query.is_current(&s) {
+                return;
+            }
             s.auth_server = AuthServerStatus::Reachable;
             s.campus_auth = CampusAuthStatus::NotLoggedIn;
             s.online_info = None;
@@ -377,7 +410,10 @@ pub async fn sync_online_state(state: &SharedState) {
         Err(msg) => {
             let (_fail_count, degraded) = {
                 let mut s = state.lock().unwrap();
-                s.online_info_fail_count += 1;
+                if !query.is_current(&s) {
+                    return;
+                }
+                s.online_info_fail_count = s.online_info_fail_count.saturating_add(1);
                 s.online_info_stale = true;
                 let fc = s.online_info_fail_count;
                 if fc <= 2 {
@@ -396,7 +432,7 @@ pub async fn sync_online_state(state: &SharedState) {
             }; // MutexGuard dropped here before any await
 
             if degraded {
-                let auth_server = check_auth_server(&server, query_ip.as_deref()).await;
+                let auth_server = check_auth_server(server, query_ip.as_deref()).await;
                 let reachable = auth_server == AuthServerStatus::Reachable;
                 let probe_enabled = {
                     let s = state.lock().unwrap();
@@ -404,6 +440,9 @@ pub async fn sync_online_state(state: &SharedState) {
                 };
                 {
                     let mut s = state.lock().unwrap();
+                    if !query.is_current(&s) {
+                        return;
+                    }
                     s.auth_server = auth_server;
                     if !reachable {
                         s.campus_auth = CampusAuthStatus::Unknown;
@@ -413,11 +452,17 @@ pub async fn sync_online_state(state: &SharedState) {
                     if probe_enabled {
                         let auth_status = check_auth_status(query_ip.as_deref()).await;
                         let mut s = state.lock().unwrap();
+                        if !query.is_current(&s) || !s.config.enable_ipv4_internet_probe {
+                            return;
+                        }
                         s.campus_auth = auth_status;
                     } else {
                         // IPv4 internet probe disabled — do NOT call check_auth_status()
                         // which would access http://www.baidu.com
                         let mut s = state.lock().unwrap();
+                        if !query.is_current(&s) {
+                            return;
+                        }
                         s.campus_auth = CampusAuthStatus::Unknown;
                         s.add_log(
                             "[WARN] rad_user_info failed, IPv4 internet probe disabled; skipping captive portal probe, auth state remains Unknown".to_string(),
@@ -479,11 +524,10 @@ pub fn spawn_startup_tasks(state: SharedState) {
             );
             {
                 let mut s = state.lock().unwrap();
-                s.suppress_auto_reconnect = false;
                 s.add_log("[INFO] Auto-login on startup...".to_string());
             }
             crate::service::request_ui_repaint();
-            crate::service::auth::do_one_click_login(state.clone()).await;
+            crate::service::auth::do_startup_login(state.clone()).await;
             // Re-sync after login attempt
             sync_online_state(&state).await;
         } else if auto_reconnect
@@ -522,6 +566,32 @@ mod tests {
     }
 
     // ── match_account tests ───────────────────────────────
+
+    #[test]
+    fn outdated_status_queries_are_discarded() {
+        let mut s = make_app_state();
+        let first = StatusQuery::begin(&mut s).unwrap();
+        let second = StatusQuery::begin(&mut s).unwrap();
+        assert!(!first.is_current(&s));
+        assert!(second.is_current(&s));
+        s.invalidate_auth_context();
+        assert!(!second.is_current(&s));
+    }
+
+    #[test]
+    fn status_queries_cannot_overwrite_auth_or_changed_server_ip() {
+        let mut s = make_app_state();
+        let query = StatusQuery::begin(&mut s).unwrap();
+        s.auth_busy = true;
+        assert!(!query.is_current(&s));
+        assert!(StatusQuery::begin(&mut s).is_none());
+        s.auth_busy = false;
+        s.config.server = "http://other.invalid".into();
+        assert!(!query.is_current(&s));
+        let query = StatusQuery::begin(&mut s).unwrap();
+        s.campus_ip = Some("10.0.0.2".into());
+        assert!(!query.is_current(&s));
+    }
 
     #[test]
     fn match_exact() {
@@ -757,6 +827,20 @@ mod tests {
             state,
             current_ip: String::new(),
             last_error: String::new(),
+        }
+    }
+
+    #[test]
+    fn status_sync_preserves_active_authentication() {
+        for login_state in [LoginState::LoggingIn, LoginState::LoggingOut] {
+            let mut statuses = vec![make_status(login_state.clone())];
+            apply_match_result(
+                &MatchResult::Exact(0),
+                &mut statuses,
+                "test-user",
+                "10.0.0.1",
+            );
+            assert_eq!(statuses[0].state, login_state);
         }
     }
 

@@ -64,6 +64,28 @@ fn rotate_log_if_needed(path: &Path, max_bytes: u64, keep: usize) {
 const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 const LOG_KEEP: usize = 3;
 
+fn is_own_download_artifact(name: &str) -> bool {
+    let Some(version) = name
+        .strip_prefix("campus-net-client-v")
+        .and_then(|s| s.strip_suffix(".exe.download"))
+    else {
+        return false;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn updater_log_failed(contents: &str) -> bool {
+    let latest = contents
+        .rsplit("Updater started")
+        .next()
+        .unwrap_or(contents);
+    !latest.contains("Updater completed successfully") && latest.contains("FATAL:")
+}
+
 /// Owned writer that holds an Arc<Mutex<File>>. Each call to write()
 /// acquires the lock, writes, and releases.
 struct FileWriterGuard {
@@ -150,13 +172,14 @@ fn main() -> anyhow::Result<()> {
     // Track whether we're already inside the panic hook to prevent
     // double-panic if the hook itself panics (e.g. file I/O failure).
     // A double-panic aborts the process without any log output.
-    static PANIC_HOOK_ACTIVE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    std::thread_local! {
+        static PANIC_HOOK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     std::panic::set_hook(Box::new(move |info| {
         // Guard against double-panic — if the hook itself panics, abort
         // with a best-effort message to stderr.
-        if PANIC_HOOK_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if PANIC_HOOK_ACTIVE.with(|active| active.replace(true)) {
             let _ = std::io::Write::write_all(
                 &mut std::io::stderr(),
                 b"FATAL: double panic in panic hook, aborting\n",
@@ -182,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             let _ = file.flush();
         }
         eprintln!("{}", msg);
+        PANIC_HOOK_ACTIVE.with(|active| active.set(false));
     }));
 
     // Ensure C:\ProgramData\CampusNetClient exists before any file I/O
@@ -275,27 +299,30 @@ fn main() -> anyhow::Result<()> {
                         .cloned()
                         .collect::<Vec<_>>()
                         .join("\n");
-                    tracing::warn!(
-                        "Found updater.log from previous update attempt. Last lines:\n{}",
-                        summary
-                    );
-                    startup_update_warning = Some(format!(
-                        "[WARN] Last update may have failed. Updater log:\n{}",
-                        summary
-                    ));
+                    if updater_log_failed(&contents) {
+                        tracing::warn!("Previous updater failure: {}", summary);
+                        startup_update_warning = Some(format!(
+                            "[WARN] Previous update failed; see updater.log:\n{}",
+                            summary
+                        ));
+                    } else {
+                        tracing::info!(
+                            "Previous updater log retained at {}",
+                            updater_log.display()
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Found unreadable updater.log: {}", e);
                 }
             }
-            let _ = std::fs::remove_file(&updater_log);
         }
 
         // Clean up leftover download artifacts
         for entry in std::fs::read_dir(&exe_dir).into_iter().flatten().flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.ends_with(".download") || name_str.ends_with(".exe.bak") {
+            if is_own_download_artifact(&name_str) {
                 tracing::warn!("Cleaning up leftover update artifact: {}", name_str);
                 startup_update_warning = Some(format!(
                     "[WARN] Found leftover update artifact: {}",
@@ -376,7 +403,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let app = app::CampusNetApp::new(state);
+    let app = app::CampusNetApp::new(state.clone());
 
     eframe::run_native(
         "Campus Net Client",
@@ -402,6 +429,10 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 
+    if let Err(e) = service::config::save_shared_config(config_path(), &state) {
+        tracing::error!("Failed to save config on window exit: {}", e);
+    }
+
     drop(_rt_guard);
     drop(rt);
 
@@ -411,6 +442,38 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_only_selects_owned_incomplete_downloads() {
+        assert!(is_own_download_artifact(
+            "campus-net-client-v1.1.11.exe.download"
+        ));
+        for name in [
+            "other.download",
+            "campus-net-client.exe.bak",
+            "other.exe.bak",
+            "campus-net-client-v1.1.11.exe",
+            "campus-net-client-vbad.exe.download",
+        ] {
+            assert!(
+                !is_own_download_artifact(name),
+                "selected unrelated file: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_warning_uses_the_latest_attempt() {
+        assert!(updater_log_failed(
+            "Updater started\nFATAL: replacement failed\nRollback succeeded"
+        ));
+        assert!(!updater_log_failed(
+            "Updater started\nFATAL: old failure\nUpdater started\nUpdater completed successfully"
+        ));
+        assert!(!updater_log_failed(
+            "Updater started\nERROR (attempt 1): busy\nUpdater completed successfully"
+        ));
+    }
 
     #[test]
     fn rotate_no_file() {

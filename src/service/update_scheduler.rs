@@ -21,22 +21,33 @@ pub fn update_busy(status: &UpdateStatus) -> bool {
 }
 
 /// Perform one update check, update AppState accordingly.
-async fn check_update_once(state: &SharedState) -> Result<(), String> {
-    {
-        let s = state.lock().unwrap();
-        if update_busy(&s.update_status) {
-            return Err("Update already in progress".to_string());
-        }
+pub fn try_begin_update_check(state: &SharedState) -> bool {
+    let mut s = state.lock().unwrap();
+    if update_busy(&s.update_status) {
+        return false;
     }
-    {
-        let mut s = state.lock().unwrap();
-        s.update_status = UpdateStatus::Checking;
-    }
-    crate::service::request_ui_repaint();
+    s.update_status = UpdateStatus::Checking;
+    true
+}
 
-    match crate::service::update::check_update().await {
+async fn check_update_once(state: &SharedState) -> Result<(), String> {
+    if !try_begin_update_check(state) {
+        return Err("Update already in progress".to_string());
+    }
+    check_update_claimed(state).await
+}
+
+pub async fn check_update_claimed(state: &SharedState) -> Result<(), String> {
+    crate::service::request_ui_repaint();
+    let result = tokio::spawn(crate::service::update::check_update())
+        .await
+        .unwrap_or_else(|e| Err(format!("Update check task failed: {}", e)));
+    let mut s = state.lock().unwrap();
+    if s.update_status != UpdateStatus::Checking {
+        return Err("Update check no longer owns its state".to_string());
+    }
+    match result {
         Ok(Some((latest, release_url, download_url))) => {
-            let mut s = state.lock().unwrap();
             s.add_log(format!("[INFO] New version available: {}", latest));
             s.update_status = UpdateStatus::Available {
                 latest,
@@ -47,13 +58,11 @@ async fn check_update_once(state: &SharedState) -> Result<(), String> {
             Ok(())
         }
         Ok(None) => {
-            let mut s = state.lock().unwrap();
             s.update_status = UpdateStatus::UpToDate;
             crate::service::request_ui_repaint();
             Ok(())
         }
         Err(e) => {
-            let mut s = state.lock().unwrap();
             s.add_log(format!("[WARN] Update check failed: {}", e));
             s.update_status = UpdateStatus::Failed(e.clone());
             crate::service::request_ui_repaint();
@@ -141,7 +150,14 @@ pub fn spawn_update_scheduler(state: SharedState) {
                             e, SCHEDULER_CRASH_RESTART_SECS
                         ));
                     }
-                    fail_count = 0;
+                    if let Ok(mut s) = state.lock() {
+                        if s.update_status == UpdateStatus::Checking {
+                            s.update_status =
+                                UpdateStatus::Failed("Update scheduler interrupted".into());
+                        }
+                    }
+                    crate::service::request_ui_repaint();
+                    fail_count = 1;
                     // Sleep handled by next loop iteration
                     continue;
                 }
@@ -171,6 +187,21 @@ pub fn spawn_update_scheduler(state: SharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_claim_is_exclusive_and_preserves_downloads() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::service::AppState::new(
+            crate::service::config::AppConfig::default(),
+        )));
+        assert!(try_begin_update_check(&state));
+        assert!(!try_begin_update_check(&state));
+        state.lock().unwrap().update_status = UpdateStatus::Downloading;
+        assert!(!try_begin_update_check(&state));
+        assert_eq!(
+            state.lock().unwrap().update_status,
+            UpdateStatus::Downloading
+        );
+    }
 
     #[test]
     fn busy_checking() {

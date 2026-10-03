@@ -7,6 +7,96 @@ use crate::service::online_info::sync_online_state;
 use crate::service::user_ip;
 use crate::service::{LoginState, SharedState};
 
+#[derive(Clone, Copy)]
+enum AuthMode {
+    Login,
+    Logout,
+    Auto,
+}
+
+struct AuthOperation(SharedState);
+
+impl AuthOperation {
+    fn begin(
+        state: &SharedState,
+        mode: AuthMode,
+        expected: Option<(usize, &StoredUser, u64)>,
+    ) -> Option<Self> {
+        let mut s = state.lock().unwrap();
+        s.ensure_statuses();
+        if s.authentication_busy()
+            || expected.is_some_and(|(idx, user, generation)| {
+                s.config.users.get(idx) != Some(user) || s.auth_generation != generation
+            })
+            || (matches!(mode, AuthMode::Auto)
+                && (!s.config.auto_reconnect || s.suppress_auto_reconnect))
+        {
+            return None;
+        }
+        s.auth_busy = true;
+        s.invalidate_auth_context();
+        match mode {
+            AuthMode::Login => s.suppress_auto_reconnect = false,
+            AuthMode::Logout => s.suppress_auto_reconnect = true,
+            AuthMode::Auto => {}
+        }
+        Some(Self(state.clone()))
+    }
+}
+
+impl Drop for AuthOperation {
+    fn drop(&mut self) {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        s.auth_busy = false;
+        s.invalidate_auth_context();
+        for status in &mut s.user_statuses {
+            if matches!(status.state, LoginState::LoggingIn | LoginState::LoggingOut) {
+                status.state = LoginState::Error;
+                status.last_error =
+                    "Authentication operation interrupted; please retry".to_string();
+            }
+        }
+        crate::service::request_ui_repaint();
+    }
+}
+
+pub fn spawn_login(state: SharedState, user_idx: usize) {
+    if let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) {
+        tokio::spawn(async move {
+            do_login_inner(state, user_idx).await;
+            drop(operation);
+        });
+    }
+}
+
+pub fn spawn_logout(state: SharedState, user_idx: usize) {
+    if let Some(operation) = AuthOperation::begin(&state, AuthMode::Logout, None) {
+        tokio::spawn(async move {
+            do_logout_inner(state, user_idx).await;
+            drop(operation);
+        });
+    }
+}
+
+pub async fn do_auto_login(
+    state: SharedState,
+    user_idx: usize,
+    expected: &StoredUser,
+    expected_generation: u64,
+) -> bool {
+    if let Some(operation) = AuthOperation::begin(
+        &state,
+        AuthMode::Auto,
+        Some((user_idx, expected, expected_generation)),
+    ) {
+        do_login_inner(state, user_idx).await;
+        drop(operation);
+        true
+    } else {
+        false
+    }
+}
+
 fn same_user(user: &StoredUser, username: &str, original: &StoredUser) -> bool {
     user.username == username
         && user.ip == original.ip
@@ -25,7 +115,21 @@ fn user_still_matches(
         .is_some_and(|user| same_user(user, username, original))
 }
 
+fn requires_logout_retry(error: &str) -> bool {
+    error
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '=')
+        .any(|part| part == "err_code=2")
+}
+
 pub async fn do_login(state: SharedState, user_idx: usize) {
+    let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) else {
+        return;
+    };
+    do_login_inner(state, user_idx).await;
+    drop(operation);
+}
+
+async fn do_login_inner(state: SharedState, user_idx: usize) {
     let (server, username, user, detect_ip, strict_bind, double_stack) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
@@ -71,15 +175,7 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         }
     }
 
-    let encrypted_password = {
-        let s = state.lock().unwrap();
-        match s.config.users.get(user_idx) {
-            Some(user) => user.encrypted_password.clone(),
-            None => return,
-        }
-    };
-
-    let password = match secure_store::decrypt_password(&encrypted_password) {
+    let password = match secure_store::decrypt_password(&user.encrypted_password) {
         Ok(p) => p,
         Err(e) => {
             let mut s = state.lock().unwrap();
@@ -105,7 +201,6 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         }
         s.user_statuses[user_idx].state = LoginState::LoggingIn;
         s.user_statuses[user_idx].last_error.clear();
-        s.suppress_auto_reconnect = false;
         s.add_log(format!("[INFO] {}: Logging in...", username));
     }
     crate::service::request_ui_repaint();
@@ -164,9 +259,8 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
         }
         Err(e) => {
             let err = e.to_string();
-            let is_err_code_2 = err.contains("err_code=2");
 
-            if is_err_code_2 {
+            if requires_logout_retry(&err) {
                 // Auto-logout first, then retry login once
                 {
                     let mut s = state.lock().unwrap();
@@ -193,12 +287,11 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                         crate::service::request_ui_repaint();
 
                         // Build fresh login client for retry
-                        let mut retry_client =
-                            SrunClient::new(&server, &username, &password, &ip)
-                                .set_detect_ip(detect_ip)
-                                .set_strict_bind(strict_bind)
-                                .set_double_stack(double_stack)
-                                .set_test_before_login(test_before_login);
+                        let mut retry_client = SrunClient::new(&server, &username, &password, &ip)
+                            .set_detect_ip(detect_ip)
+                            .set_strict_bind(strict_bind)
+                            .set_double_stack(double_stack)
+                            .set_test_before_login(test_before_login);
                         {
                             let s = state.lock().unwrap();
                             let cfg = &s.config;
@@ -215,15 +308,9 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                         match retry_client.login().await {
                             Ok(()) => {
                                 let mut s = state.lock().unwrap();
-                                if user_still_matches(
-                                    &s.config.users,
-                                    user_idx,
-                                    &username,
-                                    &user,
-                                ) {
+                                if user_still_matches(&s.config.users, user_idx, &username, &user) {
                                     let ip = retry_client.client_ip.clone();
-                                    s.user_statuses[user_idx].state =
-                                        LoginState::PendingConfirm;
+                                    s.user_statuses[user_idx].state = LoginState::PendingConfirm;
                                     s.user_statuses[user_idx].current_ip = ip.clone();
                                     s.add_log(format!(
                                         "[OK] {}: Login retry succeeded, IP={}",
@@ -234,19 +321,13 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                                 }
                                 let st = state.clone();
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(500))
-                                        .await;
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
                                     sync_online_state(&st).await;
                                 });
                             }
                             Err(e2) => {
                                 let mut s = state.lock().unwrap();
-                                if user_still_matches(
-                                    &s.config.users,
-                                    user_idx,
-                                    &username,
-                                    &user,
-                                ) {
+                                if user_still_matches(&s.config.users, user_idx, &username, &user) {
                                     let err2 = e2.to_string();
                                     s.user_statuses[user_idx].state = LoginState::Error;
                                     s.user_statuses[user_idx].last_error = err2.clone();
@@ -260,18 +341,11 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
                     }
                     Err(logout_err) => {
                         let mut s = state.lock().unwrap();
-                        if user_still_matches(
-                            &s.config.users,
-                            user_idx,
-                            &username,
-                            &user,
-                        ) {
+                        if user_still_matches(&s.config.users, user_idx, &username, &user) {
                             let logout_err_str = logout_err.to_string();
                             s.user_statuses[user_idx].state = LoginState::Error;
-                            s.user_statuses[user_idx].last_error = format!(
-                                "err_code=2, auto-logout also failed: {}",
-                                logout_err_str
-                            );
+                            s.user_statuses[user_idx].last_error =
+                                format!("err_code=2, auto-logout also failed: {}", logout_err_str);
                             s.add_log(format!(
                                 "[ERROR] {}: err_code=2 and auto-logout failed - {}",
                                 username, logout_err_str
@@ -298,6 +372,14 @@ pub async fn do_login(state: SharedState, user_idx: usize) {
 }
 
 pub async fn do_logout(state: SharedState, user_idx: usize) {
+    let Some(operation) = AuthOperation::begin(&state, AuthMode::Logout, None) else {
+        return;
+    };
+    do_logout_inner(state, user_idx).await;
+    drop(operation);
+}
+
+async fn do_logout_inner(state: SharedState, user_idx: usize) {
     let (server, username, user, status_ip, detect_ip, strict_bind, acid) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
@@ -361,6 +443,7 @@ pub async fn do_logout(state: SharedState, user_idx: usize) {
             // Refresh online_info to confirm server state after logout
             let st = state.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 sync_online_state(&st).await;
             });
         }
@@ -408,6 +491,22 @@ pub async fn do_logout_all(state: SharedState) {
 /// Try users in order, stop at the first successful login.
 /// Only one user should be online at a time.
 pub async fn do_one_click_login(state: SharedState) {
+    let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) else {
+        return;
+    };
+    do_one_click_login_inner(state).await;
+    drop(operation);
+}
+
+pub async fn do_startup_login(state: SharedState) {
+    let Some(operation) = AuthOperation::begin(&state, AuthMode::Auto, None) else {
+        return;
+    };
+    do_one_click_login_inner(state).await;
+    drop(operation);
+}
+
+async fn do_one_click_login_inner(state: SharedState) {
     let user_count = {
         let s = state.lock().unwrap();
         s.config.users.len()
@@ -422,7 +521,6 @@ pub async fn do_one_click_login(state: SharedState) {
 
     {
         let mut s = state.lock().unwrap();
-        s.suppress_auto_reconnect = false;
         s.add_log("[INFO] One-click login: starting...".to_string());
     }
     crate::service::request_ui_repaint();
@@ -445,7 +543,7 @@ pub async fn do_one_click_login(state: SharedState) {
         }
         crate::service::request_ui_repaint();
 
-        do_login(state.clone(), idx).await;
+        do_login_inner(state.clone(), idx).await;
 
         let post_state = {
             let s = state.lock().unwrap();
@@ -518,6 +616,9 @@ pub async fn do_one_click_login(state: SharedState) {
 /// Log out the currently online user(s). Typically only one user is online
 /// at a time; if multiple show as Online (stale state), log out all of them.
 pub async fn do_one_click_logout(state: SharedState) {
+    let Some(operation) = AuthOperation::begin(&state, AuthMode::Logout, None) else {
+        return;
+    };
     // ── Step 1: find Online users BEFORE changing any state ──
     // This must run first; otherwise LoggingOut users won't match.
     let online_indices: Vec<usize> = {
@@ -600,7 +701,7 @@ pub async fn do_one_click_logout(state: SharedState) {
         }
         crate::service::request_ui_repaint();
 
-        do_logout(state.clone(), idx).await;
+        do_logout_inner(state.clone(), idx).await;
     }
 
     tracing::info!("[OneClickLogout] Completed");
@@ -610,4 +711,144 @@ pub async fn do_one_click_logout(state: SharedState) {
         s.add_log("[OK] One-click logout: completed".to_string());
     }
     crate::service::request_ui_repaint();
+    drop(operation);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::{config::AppConfig, AppState};
+    use std::sync::{Arc, Mutex};
+
+    fn state() -> SharedState {
+        Arc::new(Mutex::new(AppState::new(AppConfig::default())))
+    }
+
+    #[test]
+    fn logout_retry_requires_the_exact_error_code() {
+        assert!(requires_logout_retry(
+            "Login failed: err_code=2, error=login_error"
+        ));
+        for error in [
+            "err_code=20",
+            "err_code=200",
+            "other_err_code=2",
+            "err_code=2abc",
+            "",
+        ] {
+            assert!(
+                !requires_logout_retry(error),
+                "would trigger unnecessary logout: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_authentication_releases_busy_state() {
+        let state = state();
+        let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.users.push(StoredUser {
+                username: "test-user".into(),
+                encrypted_password: String::new(),
+                ip: None,
+                if_name: None,
+            });
+            s.ensure_statuses();
+            s.user_statuses[0].state = LoginState::LoggingIn;
+        }
+        drop(operation);
+        assert!(!state.lock().unwrap().authentication_busy());
+        assert_eq!(
+            state.lock().unwrap().user_statuses[0].state,
+            LoginState::Error
+        );
+        assert!(AuthOperation::begin(&state, AuthMode::Login, None).is_some());
+    }
+
+    #[test]
+    fn auth_operations_are_exclusive_and_invalidate_old_queries() {
+        let state = state();
+        let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        assert!(AuthOperation::begin(&state, AuthMode::Logout, None).is_none());
+        assert_eq!(state.lock().unwrap().auth_generation, 1);
+        drop(operation);
+        assert!(!state.lock().unwrap().auth_busy);
+        assert_eq!(state.lock().unwrap().auth_generation, 2);
+    }
+
+    #[test]
+    fn manual_logout_suppresses_reconnect_before_network_work() {
+        let state = state();
+        let operation = AuthOperation::begin(&state, AuthMode::Logout, None).unwrap();
+        assert!(state.lock().unwrap().suppress_auto_reconnect);
+        drop(operation);
+        assert!(AuthOperation::begin(&state, AuthMode::Auto, None).is_none());
+        assert!(state.lock().unwrap().suppress_auto_reconnect);
+    }
+
+    #[test]
+    fn automatic_login_rejects_shifted_account_indices() {
+        let state = state();
+        let user = StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        };
+        state.lock().unwrap().config.users.push(user.clone());
+        let other = StoredUser {
+            username: "other-test-user".into(),
+            ..user
+        };
+        assert!(AuthOperation::begin(&state, AuthMode::Auto, Some((0, &other, 0))).is_none());
+        assert!(!state.lock().unwrap().auth_busy);
+    }
+
+    #[test]
+    fn manual_authentication_invalidates_an_older_reconnect_batch() {
+        let state = state();
+        let user = StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        };
+        state.lock().unwrap().config.users.push(user.clone());
+        let initial_generation = state.lock().unwrap().auth_generation;
+        let first_auto =
+            AuthOperation::begin(&state, AuthMode::Auto, Some((0, &user, initial_generation)))
+                .unwrap();
+        drop(first_auto);
+        let next_generation = initial_generation.wrapping_add(2);
+        let manual = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        drop(manual);
+        assert!(
+            AuthOperation::begin(&state, AuthMode::Auto, Some((0, &user, next_generation)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconnect_batch_can_continue_after_its_own_failed_attempt() {
+        let state = state();
+        let user = StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        };
+        state.lock().unwrap().config.users.push(user.clone());
+        let generation = state.lock().unwrap().auth_generation;
+        let first =
+            AuthOperation::begin(&state, AuthMode::Auto, Some((0, &user, generation))).unwrap();
+        drop(first);
+        assert!(AuthOperation::begin(
+            &state,
+            AuthMode::Auto,
+            Some((0, &user, generation.wrapping_add(2)))
+        )
+        .is_some());
+    }
 }

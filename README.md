@@ -45,6 +45,8 @@
 
 登录接口返回成功后，程序会进入等待确认状态。只有 `rad_user_info` 确认在线后，界面才会显示为已登录。
 
+登录、登出及自动重连共享同一个操作锁。操作期间，账号编辑、删除和认证设置暂时禁用，避免请求完成后写到其他账号。手动登出从操作开始就抑制自动重连；再次手动登录可解除抑制。旧的状态查询结果不会覆盖后续认证操作。
+
 ## 运营商后缀
 
 部分 Srun / 深澜部署通过用户名后缀区分运营商线路：
@@ -76,6 +78,8 @@ C:\ProgramData\CampusNetClient\
 
 从 `v1.1.9` 开始，配置保存会先写入临时文件，再替换正式配置，并维护 `config.json.bak`。如果启动时发现 `config.json` 已损坏，程序会先把坏文件备份为 `config.json.bad-<timestamp>`，再尝试从 `config.json.bak` 恢复。只有主配置和备份都不可用时，才会使用默认配置，并在启动日志和界面日志中提示。
 
+从 `v1.1.11` 开始，主配置丢失但备份存在时也会恢复备份，并优先于旧目录迁移。界面修改在后台合并保存，正常退出和自动更新前会再保存最新配置。配置中缺少默认字段时，补写失败不会丢弃已成功读取的账号和设置。
+
 旧版本曾经放在 exe 同目录的 `config.json` 会在启动时迁移到 `C:\ProgramData\CampusNetClient\`。
 
 配置示例：
@@ -87,12 +91,13 @@ C:\ProgramData\CampusNetClient\
   "strict_bind": false,
   "double_stack": false,
   "n": 200,
-  "type": 1,
+  "utype": 1,
   "acid": 8,
   "retry_delay": 1000,
   "auto_reconnect": true,
-  "check_update_on_startup": true,
-  "language": "zh-CN",
+  "enable_ipv4_internet_probe": false,
+  "monitor_interval_secs": 30,
+  "language": "zh",
   "users": []
 }
 ```
@@ -104,12 +109,14 @@ C:\ProgramData\CampusNetClient\
 | `server` | 校园网认证服务器地址 |
 | `acid` | Srun 区域或接入点参数 |
 | `n` | Srun 登录参数，常见值为 `200` |
-| `type` | Srun 登录类型参数 |
+| `utype` | Srun 登录类型参数；读取旧配置时兼容 `type` |
 | `double_stack` | 是否启用双栈参数 |
-| `detect_ip` | 是否执行 IPv4 外网连通性探测，默认关闭 |
+| `detect_ip` | 是否通过认证服务器辅助识别客户端 IP，默认关闭 |
+| `enable_ipv4_internet_probe` | 是否执行 IPv4 外网连通性探测，默认关闭 |
 | `strict_bind` | 是否严格要求绑定网卡可用 |
 | `auto_reconnect` | 是否启用自动重连 |
-| `check_update_on_startup` | 是否启动时检查更新 |
+| `monitor_interval_secs` | 状态检查间隔，默认 30 秒 |
+| `language` | `zh` 或 `en` |
 
 密码只按本地配置数据保存，不要把真实 `config.json`、日志、截图或账号信息提交到仓库或发给他人。
 
@@ -133,6 +140,10 @@ C:\ProgramData\CampusNetClient\
 
 更新时，程序会下载新的 exe，保存配置，生成 PowerShell 替换脚本，退出当前进程，替换旧 exe，然后启动新版本。
 
+`v1.1.11` 会在退出前检查下载文件大小和 PE 文件头，并确认配置保存成功。替换脚本使用实际运行的 exe 路径，支持文件改名，只等待发起更新的进程退出。旧程序备份会保留至新程序通过短暂启动检查；替换或启动失败时尝试恢复旧程序。`updater.log` 会留在 exe 目录供排错，普通启动不再删除 `.exe.bak`。
+
+GitHub 检查先直连，失败后尝试环境变量代理；下载先尝试环境变量代理，再回退直连。当前依赖配置不读取 Windows 系统代理设置。若仍无法访问，可以从 Release 页面手动下载。启动检查失败后按 1、5、15 分钟及后续每 30 分钟重试；正常检查间隔为 24 小时。
+
 ## 排错
 
 日志文件位置：
@@ -155,6 +166,7 @@ Get-Content C:\ProgramData\CampusNetClient\app.log -Encoding UTF8
 | 登录后一直等待确认 | 查看 `app.log` 中的 `rad_user_info` 和 `[OnlineInfo]` 日志 |
 | 自动重连没有触发 | 确认 `auto_reconnect` 已开启，并且不是手动登出后的抑制状态 |
 | 自动更新失败 | 确认 exe 目录可写，并且能访问 GitHub Releases |
+| 更新替换或重启失败 | 查看 exe 目录的 `updater.log`，保留 `.exe.bak` 以便恢复 |
 | 配置被恢复或重置 | 检查 `config.json.bad-<timestamp>` 和 `config.json.bak` |
 | 中文日志乱码 | 使用 `Get-Content -Encoding UTF8` |
 
@@ -182,6 +194,20 @@ cargo build --release
 ```text
 target\release\campus-net-client.exe
 ```
+
+发布前验证（依赖已经缓存时可附加 `--offline`）：
+
+```powershell
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked -- -D warnings
+cargo build --release --locked
+```
+
+默认测试不发起真实校园网或外网探测；三个需要实际网络的测试标记为 `ignored`。需要联调时，仅在允许进行探测的环境中单独运行相应测试。
+
+发布新版本时，先同步 `Cargo.toml` 与 `Cargo.lock` 中的应用版本，提交并推送源码，再为该提交创建对应的 `vX.Y.Z` tag。按照历史 Release 的约定，将上述 Windows 构建产物以 `campus-net-client.exe` 为资产名上传，并在发布说明中记录修复内容和验证结果。Release、tag 和应用内版本号必须一致。
 
 ## 已知限制
 

@@ -58,21 +58,25 @@ impl CampusNetApp {
                             self.edit_if_name.clone_from(name);
                         }
                     }
+                } else if self.edit_network_rx.is_some() {
+                    ui.spinner();
                 } else {
                     ui.colored_label(Color32::YELLOW, "No network interfaces detected");
                 }
 
                 ui.add_space(8.0);
 
-                let can_save = if is_new_user {
-                    !self.edit_username.is_empty() && !self.edit_password.is_empty()
-                } else {
-                    !self.edit_username.is_empty()
-                        && (self.edit_username != self.edit_original_username
-                            || !self.edit_password.is_empty()
-                            || self.edit_ip != self.edit_original_ip
-                            || self.edit_if_name != self.edit_original_if_name)
-                };
+                let auth_busy = self.state.lock().unwrap().authentication_busy();
+                let can_save = !auth_busy
+                    && if is_new_user {
+                        !self.edit_username.is_empty() && !self.edit_password.is_empty()
+                    } else {
+                        !self.edit_username.is_empty()
+                            && (self.edit_username != self.edit_original_username
+                                || !self.edit_password.is_empty()
+                                || self.edit_ip != self.edit_original_ip
+                                || self.edit_if_name != self.edit_original_if_name)
+                    };
 
                 ui.horizontal(|ui| {
                     if ui.button(t.btn_cancel).clicked() {
@@ -115,15 +119,19 @@ impl CampusNetApp {
 
                         {
                             let mut s = self.state.lock().unwrap();
+                            if s.authentication_busy() {
+                                return;
+                            }
                             if let Some(idx) = self.editing_user_idx {
                                 if idx < s.config.users.len() {
-                                    s.config.users[idx] = new_user;
+                                    s.replace_user(idx, new_user);
                                     let uname = s.config.users[idx].username.clone();
                                     s.add_log(format!("[INFO] Updated user {}", uname));
                                 }
                             } else {
                                 s.config.users.push(new_user);
                                 s.user_statuses.push(crate::service::UserStatus::new());
+                                s.invalidate_auth_context();
                                 let uname = s.config.users.last().unwrap().username.clone();
                                 s.add_log(format!("[INFO] Added user {}", uname));
                             }

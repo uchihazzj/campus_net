@@ -5,11 +5,37 @@ use crate::core::utils::get_network_interfaces;
 use crate::service::{auth, LoginState};
 
 impl CampusNetApp {
-    pub(super) fn refresh_edit_network_cache(&mut self) -> Vec<(String, String)> {
-        let candidates = crate::service::detection::detect_campus_ip_candidates();
-        self.edit_detected_ip = candidates.first().map(|(_, ip)| ip.clone());
-        self.edit_interfaces = get_network_interfaces();
-        candidates
+    pub(super) fn refresh_edit_network_cache(&mut self) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.edit_network_rx = Some(rx);
+        self.edit_interfaces.clear();
+        self.edit_detected_ip = None;
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(get_network_interfaces());
+            crate::service::request_ui_repaint();
+        });
+    }
+
+    pub(super) fn poll_edit_network_cache(&mut self) {
+        let Some(rx) = &self.edit_network_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(interfaces) => {
+                let candidates =
+                    crate::service::detection::campus_ip_candidates_from_interfaces(&interfaces);
+                self.edit_detected_ip = candidates.first().map(|(_, ip)| ip.clone());
+                if self.show_add_dialog && self.edit_if_name.is_empty() {
+                    if let Some((name, _)) = candidates.first() {
+                        self.edit_if_name = name.clone();
+                    }
+                }
+                self.edit_interfaces = interfaces;
+                self.edit_network_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.edit_network_rx = None,
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
     }
 
     pub(super) fn open_add_dialog(&mut self) {
@@ -21,16 +47,13 @@ impl CampusNetApp {
         self.edit_original_username.clear();
         self.edit_original_ip.clear();
         self.edit_original_if_name.clear();
-        let candidates = self.refresh_edit_network_cache();
-        if let Some((name, _ip)) = candidates.first() {
-            self.edit_if_name = name.clone();
-        }
+        self.refresh_edit_network_cache();
         self.show_add_dialog = true;
     }
 
     fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) {
         let t = self.t();
-        let (username, state, current_ip, last_error) = {
+        let (username, state, current_ip, last_error, auth_busy) = {
             let s = self.state.lock().unwrap();
             let Some(user) = s.config.users.get(user_idx) else {
                 return;
@@ -43,6 +66,7 @@ impl CampusNetApp {
                 us.state.clone(),
                 us.current_ip.clone(),
                 us.last_error.clone(),
+                s.authentication_busy(),
             )
         };
 
@@ -111,19 +135,14 @@ impl CampusNetApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button(t.btn_delete)
+                        .add_enabled(!auth_busy, egui::Button::new(t.btn_delete))
                         .on_hover_text(t.hint_delete)
                         .clicked()
                     {
                         {
                             let mut s = self.state.lock().unwrap();
-                            s.config.users.remove(user_idx);
-                            s.user_statuses.remove(user_idx);
-                            s.reconnect_targets.retain(|&i| i != user_idx);
-                            for t in &mut s.reconnect_targets {
-                                if *t > user_idx {
-                                    *t -= 1;
-                                }
+                            if !s.remove_user(user_idx) {
+                                return;
                             }
                             s.add_log("[INFO] Removed user".to_string());
                         }
@@ -139,7 +158,11 @@ impl CampusNetApp {
                         return;
                     }
 
-                    if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
+                    if ui
+                        .add_enabled(!auth_busy, egui::Button::new(t.btn_edit))
+                        .on_hover_text(t.hint_edit)
+                        .clicked()
+                    {
                         let user = {
                             let s = self.state.lock().unwrap();
                             s.config.users.get(user_idx).cloned()
@@ -158,26 +181,20 @@ impl CampusNetApp {
                         }
                     }
 
-                    let is_busy = state == LoginState::LoggingIn || state == LoginState::LoggingOut;
+                    let is_busy = auth_busy;
 
                     if should_show_logout_button(&state) {
                         if ui
                             .add_enabled(!is_busy, egui::Button::new(t.btn_logout))
                             .clicked()
                         {
-                            let state = self.state.clone();
-                            tokio::spawn(async move {
-                                auth::do_logout(state, user_idx).await;
-                            });
+                            auth::spawn_logout(self.state.clone(), user_idx);
                         }
                     } else if ui
                         .add_enabled(!is_busy, egui::Button::new(t.btn_login))
                         .clicked()
                     {
-                        let state = self.state.clone();
-                        tokio::spawn(async move {
-                            auth::do_login(state, user_idx).await;
-                        });
+                        auth::spawn_login(self.state.clone(), user_idx);
                     }
                 });
             });
@@ -288,9 +305,7 @@ impl CampusNetApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let any_busy = {
                     let s = self.state.lock().unwrap();
-                    s.user_statuses.iter().any(|us| {
-                        us.state == LoginState::LoggingIn || us.state == LoginState::LoggingOut
-                    })
+                    s.authentication_busy()
                 };
 
                 if ui

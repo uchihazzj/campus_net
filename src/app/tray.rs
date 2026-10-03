@@ -8,8 +8,8 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 use super::icon::create_tray_icon_rgba;
 use crate::path::config_path;
 use crate::service::auth;
-use crate::service::config::write_config;
-use crate::service::{LoginState, SharedState};
+use crate::service::config::save_shared_config;
+use crate::service::SharedState;
 use crate::ui::l10n::UiText;
 
 static MAIN_HWND: OnceLock<isize> = OnceLock::new();
@@ -23,12 +23,32 @@ pub(super) fn capture_main_hwnd() {
     if MAIN_HWND.get().is_some() {
         return;
     }
-    let title: Vec<u16> = "Campus Net Client\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(std::ptr::null_mut(), title.as_ptr()) };
+    let mut hwnd = 0isize;
+    unsafe {
+        EnumWindows(Some(find_own_main_window), &mut hwnd as *mut isize as isize);
+    }
     if hwnd != 0 {
         let _ = MAIN_HWND.set(hwnd);
         tracing::info!("[Native] Captured main window HWND={}", hwnd);
     }
+}
+
+unsafe extern "system" fn find_own_main_window(hwnd: isize, result: isize) -> i32 {
+    let mut process_id = 0;
+    GetWindowThreadProcessId(hwnd, &mut process_id);
+    if process_id == std::process::id() {
+        let mut title = [0u16; 64];
+        let len = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        if len > 0
+            && "Campus Net Client"
+                .encode_utf16()
+                .eq(title[..len as usize].iter().copied())
+        {
+            *(result as *mut isize) = hwnd;
+            return 0;
+        }
+    }
+    1
 }
 
 fn native_show_window() {
@@ -47,16 +67,11 @@ fn native_show_window() {
 
 fn native_force_quit(state: &SharedState) {
     tracing::info!("[Native] Force quit from tray");
-    let config = if let Ok(mut s) = state.lock() {
+    if let Ok(mut s) = state.lock() {
         s.add_log("[INFO] Quit from tray menu".to_string());
-        Some(s.config.clone())
-    } else {
-        None
-    };
-    if let Some(config) = config {
-        if let Err(e) = write_config(config_path(), &config) {
-            tracing::error!("Failed to save config on quit: {}", e);
-        }
+    }
+    if let Err(e) = save_shared_config(config_path(), state) {
+        tracing::error!("Failed to save config on quit: {}", e);
     }
     tracing::info!("[Native] Config saved, initiating quit");
     FORCE_QUIT.store(true, Ordering::SeqCst);
@@ -188,15 +203,6 @@ fn spawn_tray_listener(
                                 {
                                     let mut s = state.lock().unwrap();
                                     s.add_log("[INFO] One-click login requested from tray".to_string());
-                                    let count = s.config.users.len().min(s.user_statuses.len());
-                                    if count > 0 {
-                                        for i in 0..count {
-                                            if s.user_statuses[i].state != LoginState::Online {
-                                                s.user_statuses[i].state = LoginState::LoggedOut;
-                                                s.user_statuses[i].last_error.clear();
-                                            }
-                                        }
-                                    }
                                 }
                                 crate::service::request_ui_repaint();
                                 let st = state.clone();
@@ -273,7 +279,12 @@ fn spawn_tray_listener(
 
 #[cfg(target_os = "windows")]
 extern "system" {
-    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn EnumWindows(
+        callback: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+        param: isize,
+    ) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
+    fn GetWindowTextW(hwnd: isize, text: *mut u16, max_count: i32) -> i32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;

@@ -96,7 +96,7 @@ mod windows_impl {
                 anyhow::bail!("Failed to open registry key for autostart");
             }
 
-            let _ = RegSetValueExW(
+            let ret = RegSetValueExW(
                 hkey,
                 value_name.as_ptr(),
                 0,
@@ -105,6 +105,12 @@ mod windows_impl {
                 (exe_wide.len() * 2) as u32,
             );
             RegCloseKey(hkey);
+            if ret != 0 {
+                anyhow::bail!(
+                    "Failed to write autostart registry value: {}",
+                    std::io::Error::from_raw_os_error(ret)
+                );
+            }
         }
         tracing::info!("Autostart enabled");
         Ok(())
@@ -124,10 +130,22 @@ mod windows_impl {
                 &mut hkey,
             );
             if ret != 0 {
-                return Ok(());
+                if ret == 2 {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "Failed to open autostart registry key: {}",
+                    std::io::Error::from_raw_os_error(ret)
+                );
             }
-            RegDeleteValueW(hkey, value_name.as_ptr());
+            let ret = RegDeleteValueW(hkey, value_name.as_ptr());
             RegCloseKey(hkey);
+            if ret != 0 && ret != 2 {
+                anyhow::bail!(
+                    "Failed to delete autostart registry value: {}",
+                    std::io::Error::from_raw_os_error(ret)
+                );
+            }
         }
         tracing::info!("Autostart disabled");
         Ok(())

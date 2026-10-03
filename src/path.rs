@@ -36,7 +36,7 @@ pub fn ensure_data_dir() -> std::io::Result<()> {
 pub fn migrate_config() -> std::io::Result<(bool, String)> {
     let new_path = config_path();
 
-    if new_path.exists() {
+    if new_path.exists() || new_path.with_file_name("config.json.bak").exists() {
         return Ok((false, String::new()));
     }
 
@@ -70,7 +70,7 @@ fn try_migrate_config(
     new_path: &Path,
     candidates: &[(PathBuf, &str)],
 ) -> std::io::Result<(bool, String)> {
-    if new_path.exists() {
+    if new_path.exists() || new_path.with_file_name("config.json.bak").exists() {
         return Ok((false, String::new()));
     }
 
@@ -95,6 +95,21 @@ fn try_migrate_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_preserves_recoverable_backup_when_main_is_missing() {
+        let tmp = std::env::temp_dir().join("cnet_test_migrate_backup");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let new_path = tmp.join("config.json");
+        let backup = tmp.join("config.json.bak");
+        let old = tmp.join("legacy.json");
+        std::fs::write(&backup, "safe-backup").unwrap();
+        std::fs::write(&old, "stale-legacy").unwrap();
+        assert!(!try_migrate_config(&new_path, &[(old, "legacy")]).unwrap().0);
+        assert!(!new_path.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "safe-backup");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn config_path_ends_with_programdata() {

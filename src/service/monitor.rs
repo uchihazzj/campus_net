@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::service::auth::do_login;
+use crate::service::auth::do_auto_login;
 use crate::service::config::StoredUser;
 use crate::service::detection::{check_ipv4_reachability, detect_campus_ip};
 use crate::service::online_info::sync_online_state;
@@ -27,6 +27,7 @@ enum ReconnectDecision {
 
 /// Check whether any user has a usable login IP (current_ip, user.ip, or
 /// if_name that resolves). Returns true if at least one source is available.
+#[cfg(test)]
 fn any_usable_ip(s: &crate::service::AppState) -> bool {
     if s.campus_ip.is_some() {
         return true;
@@ -52,14 +53,17 @@ fn any_usable_user_ip(users: &[StoredUser], statuses: &[UserStatus]) -> bool {
 /// - When degraded (≥3 failures), fall back to captive portal / IPv4 probe.
 /// - Respects `auto_reconnect` config flag and `suppress_auto_reconnect`
 ///   (set on manual logout, cleared on manual login).
-fn evaluate_reconnect(s: &crate::service::AppState) -> ReconnectDecision {
+fn evaluate_reconnect(s: &crate::service::AppState, has_usable_ip: bool) -> ReconnectDecision {
     if !s.config.auto_reconnect {
         return ReconnectDecision::Wait;
     }
     if s.suppress_auto_reconnect {
         return ReconnectDecision::Wait;
     }
-    if !any_usable_ip(s) {
+    if s.authentication_busy() {
+        return ReconnectDecision::Wait;
+    }
+    if s.campus_ip.is_none() && !has_usable_ip {
         return ReconnectDecision::Wait;
     }
 
@@ -151,6 +155,11 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             let ipv4_status = check_ipv4_reachability(Some(bind_ip)).await;
             {
                 let mut s = state.lock().unwrap();
+                if !s.config.enable_ipv4_internet_probe {
+                    s.ipv4_internet = Ipv4InternetStatus::Disabled;
+                    crate::service::request_ui_repaint();
+                    return interval;
+                }
                 match &ipv4_status {
                     Ipv4InternetStatus::Reachable => {
                         s.internet_fail_count = 0;
@@ -194,9 +203,9 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
     }
 
     // ── Auto-reconnect ──────────────────────────
-    let decision = {
+    let (decision, mut reconnect_generation) = {
         let s = state.lock().unwrap();
-        evaluate_reconnect(&s)
+        (evaluate_reconnect(&s, has_usable_ip), s.auth_generation)
     };
 
     match decision {
@@ -234,6 +243,14 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         ReconnectDecision::Reconnect => {
             let (targets, created_targets) = {
                 let mut s = state.lock().unwrap();
+                if s.auth_generation != reconnect_generation
+                    || !matches!(
+                        evaluate_reconnect(&s, has_usable_ip),
+                        ReconnectDecision::Reconnect
+                    )
+                {
+                    return interval;
+                }
                 let mut created_targets = false;
                 if s.reconnect_targets.is_empty() {
                     let online: Vec<usize> = s
@@ -259,7 +276,12 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                 }
                 let user_len = s.config.users.len();
                 s.reconnect_targets.retain(|&i| i < user_len);
-                (s.reconnect_targets.clone(), created_targets)
+                let targets: Vec<_> = s
+                    .reconnect_targets
+                    .iter()
+                    .filter_map(|&idx| s.config.users.get(idx).cloned().map(|user| (idx, user)))
+                    .collect();
+                (targets, created_targets)
             };
             if created_targets {
                 crate::service::request_ui_repaint();
@@ -270,10 +292,18 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
             }
 
             let mut any_portal_ok = false;
-            for idx in &targets {
-                do_login(state.clone(), *idx).await;
+            for (idx, user) in &targets {
+                if !do_auto_login(state.clone(), *idx, user, reconnect_generation).await {
+                    return interval;
+                }
+                // Only our own claim/release may advance this batch. Never
+                // adopt a newer generation produced by a manual operation.
+                reconnect_generation = reconnect_generation.wrapping_add(2);
                 let post_state = {
                     let s = state.lock().unwrap();
+                    if s.auth_generation != reconnect_generation {
+                        return interval;
+                    }
                     s.user_statuses
                         .get(*idx)
                         .map(|us| us.state.clone())
@@ -287,6 +317,9 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
 
             if any_portal_ok {
                 let mut s = state.lock().unwrap();
+                if s.auth_generation != reconnect_generation {
+                    return interval;
+                }
                 s.reconnect_targets.clear();
                 s.online_info_fail_count = 0;
                 s.add_log(
@@ -297,6 +330,9 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                 interval
             } else {
                 let mut s = state.lock().unwrap();
+                if s.auth_generation != reconnect_generation {
+                    return interval;
+                }
                 let next = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 s.add_log(format!(
                     "[WARN] Auto-reconnect failed, will retry in {}s",
@@ -379,6 +415,27 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_waits_during_authentication() {
+        for login_state in [LoginState::LoggingIn, LoginState::LoggingOut] {
+            let mut s = make_state();
+            s.campus_ip = Some("10.0.0.1".to_string());
+            s.campus_auth = CampusAuthStatus::NotLoggedIn;
+            s.config.users.push(StoredUser {
+                username: "test-user".to_string(),
+                encrypted_password: String::new(),
+                ip: None,
+                if_name: None,
+            });
+            s.ensure_statuses();
+            s.user_statuses[0].state = login_state;
+            assert!(matches!(
+                evaluate_reconnect(&s, any_usable_ip(&s)),
+                ReconnectDecision::Wait
+            ));
+        }
+    }
+
+    #[test]
     fn any_ip_with_campus_ip() {
         let mut s = make_state();
         s.campus_ip = Some("10.0.0.1".to_string());
@@ -454,7 +511,7 @@ mod tests {
         });
         s.ensure_statuses();
         assert!(matches!(
-            evaluate_reconnect(&s),
+            evaluate_reconnect(&s, any_usable_ip(&s)),
             ReconnectDecision::Reconnect
         ));
     }
@@ -473,7 +530,7 @@ mod tests {
         s.ensure_statuses();
         s.user_statuses[0].current_ip = "10.0.0.3".to_string();
         assert!(matches!(
-            evaluate_reconnect(&s),
+            evaluate_reconnect(&s, any_usable_ip(&s)),
             ReconnectDecision::Reconnect
         ));
     }
@@ -483,6 +540,9 @@ mod tests {
         let mut s = make_state();
         s.config.auto_reconnect = true;
         s.campus_auth = CampusAuthStatus::NotLoggedIn;
-        assert!(matches!(evaluate_reconnect(&s), ReconnectDecision::Wait));
+        assert!(matches!(
+            evaluate_reconnect(&s, any_usable_ip(&s)),
+            ReconnectDecision::Wait
+        ));
     }
 }

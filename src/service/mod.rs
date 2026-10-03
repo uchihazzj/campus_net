@@ -123,6 +123,12 @@ pub struct AppState {
     /// True after user manually logs out. Suppresses auto-reconnect until user
     /// manually logs in. Not persisted to config — runtime-only.
     pub suppress_auto_reconnect: bool,
+    /// One authentication operation owns all accounts until it completes.
+    pub auth_busy: bool,
+    pub auth_generation: u64,
+    pub online_query_generation: u64,
+    pub config_save_pending: bool,
+    pub autostart_busy: bool,
     pub update_status: UpdateStatus,
 }
 
@@ -148,6 +154,11 @@ impl AppState {
             online_info_fail_count: 0,
             online_info_stale: false,
             suppress_auto_reconnect: false,
+            auth_busy: false,
+            auth_generation: 0,
+            online_query_generation: 0,
+            config_save_pending: false,
+            autostart_busy: false,
             update_status: UpdateStatus::Idle,
         }
     }
@@ -165,6 +176,46 @@ impl AppState {
             self.user_statuses.push(UserStatus::new());
         }
     }
+
+    pub fn authentication_busy(&self) -> bool {
+        self.auth_busy
+            || self
+                .user_statuses
+                .iter()
+                .any(|us| matches!(us.state, LoginState::LoggingIn | LoginState::LoggingOut))
+    }
+
+    pub fn invalidate_auth_context(&mut self) {
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+    }
+
+    pub fn replace_user(&mut self, idx: usize, user: crate::service::config::StoredUser) {
+        if self.authentication_busy() || idx >= self.config.users.len() {
+            return;
+        }
+        self.config.users[idx] = user;
+        self.ensure_statuses();
+        self.user_statuses[idx] = UserStatus::new();
+        self.reconnect_targets.retain(|&i| i != idx);
+        self.invalidate_auth_context();
+    }
+
+    pub fn remove_user(&mut self, idx: usize) -> bool {
+        if self.authentication_busy() || idx >= self.config.users.len() {
+            return false;
+        }
+        self.ensure_statuses();
+        self.config.users.remove(idx);
+        self.user_statuses.remove(idx);
+        self.reconnect_targets.retain(|&i| i != idx);
+        for target in &mut self.reconnect_targets {
+            if *target > idx {
+                *target -= 1;
+            }
+        }
+        self.invalidate_auth_context();
+        true
+    }
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -180,6 +231,50 @@ mod tests {
 
     fn format_ui_log_message(now: chrono::DateTime<chrono::Local>, msg: &str) -> String {
         format!("[{}] {}", now.format("%m/%d %H:%M"), msg)
+    }
+
+    #[test]
+    fn replacing_an_account_clears_its_session_and_reconnect_target() {
+        let mut s = AppState::new(AppConfig::default());
+        let user = crate::service::config::StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        };
+        s.config.users.push(user.clone());
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.1".into();
+        s.reconnect_targets.push(0);
+        s.replace_user(0, user);
+        assert_eq!(s.user_statuses[0].state, LoginState::LoggedOut);
+        assert!(s.user_statuses[0].current_ip.is_empty());
+        assert!(s.reconnect_targets.is_empty());
+        assert_eq!(s.auth_generation, 1);
+    }
+
+    #[test]
+    fn account_mutation_is_blocked_during_authentication() {
+        let mut s = AppState::new(AppConfig::default());
+        let user = crate::service::config::StoredUser {
+            username: "test-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: None,
+        };
+        s.config.users.push(user.clone());
+        s.ensure_statuses();
+        s.auth_busy = true;
+        assert!(!s.remove_user(0));
+        s.replace_user(
+            0,
+            crate::service::config::StoredUser {
+                username: "other-test-user".into(),
+                ..user.clone()
+            },
+        );
+        assert_eq!(s.config.users[0], user);
     }
 
     #[test]
