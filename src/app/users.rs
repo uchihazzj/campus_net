@@ -97,31 +97,56 @@ impl CampusNetApp {
                 s.definitely_offline() || s.current_online_info().is_some(),
             )
         };
-        card_frame(ui).show(ui, |ui| {
+        let card = if confirmed_info.is_some() {
+            card_frame(ui).stroke(egui::Stroke::new(
+                1.0,
+                tone_color(ui, Tone::Positive).gamma_multiply(0.45),
+            ))
+        } else {
+            card_frame(ui)
+        };
+        card.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let title_width = (ui.available_width() - 76.0).max(40.0);
-                ui.add_sized(
-                    [title_width, 24.0],
-                    egui::Label::new(RichText::new(&user.username).strong())
-                        .truncate()
-                        .halign(egui::Align::Min),
-                )
-                .on_hover_text(&user.username);
-                ui.add_enabled_ui(!auth_busy, |ui| {
-                    ui.menu_button(t.btn_more, |ui| {
-                        if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
-                            self.open_edit_dialog(user_idx);
-                            ui.close_menu();
-                        }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(!auth_busy, |ui| {
+                        ui.menu_button(t.btn_more, |ui| {
+                            if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
+                                self.open_edit_dialog(user_idx);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .button(
+                                    RichText::new(t.btn_delete).color(tone_color(ui, Tone::Error)),
+                                )
+                                .on_hover_text(t.hint_delete)
+                                .clicked()
+                            {
+                                self.pending_delete = Some((user_idx, user.clone()));
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                    if should_show_logout_button(&status.state) {
                         if ui
-                            .button(RichText::new(t.btn_delete).color(tone_color(ui, Tone::Error)))
-                            .on_hover_text(t.hint_delete)
+                            .add_enabled(!auth_busy, egui::Button::new(t.btn_logout))
                             .clicked()
                         {
-                            self.pending_delete = Some((user_idx, user.clone()));
-                            ui.close_menu();
+                            auth::spawn_logout(self.state.clone(), user_idx);
                         }
+                    } else if ui
+                        .add_enabled(!auth_busy, egui::Button::new(t.btn_login))
+                        .on_hover_text(t.login_recovery_hint)
+                        .clicked()
+                    {
+                        auth::spawn_login(self.state.clone(), user_idx);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&user.username).size(16.0).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(&user.username);
                     });
                 });
             });
@@ -148,20 +173,7 @@ impl CampusNetApp {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(tone_color(ui, tone), format!("●  {}", status_text))
                     .on_hover_text(hint);
-                if should_show_logout_button(&status.state) {
-                    if ui
-                        .add_enabled(!auth_busy, egui::Button::new(t.btn_logout))
-                        .clicked()
-                    {
-                        auth::spawn_logout(self.state.clone(), user_idx);
-                    }
-                } else if ui
-                    .add_enabled(!auth_busy, egui::Button::new(t.btn_login))
-                    .on_hover_text(t.login_recovery_hint)
-                    .clicked()
-                {
-                    auth::spawn_login(self.state.clone(), user_idx);
-                }
+                ui.small(binding_hint(&user, &t));
             });
             if let Some(info) = confirmed_info {
                 ui.horizontal_wrapped(|ui| {
@@ -186,7 +198,6 @@ impl CampusNetApp {
             } else if !status.current_ip.is_empty() {
                 ui.label(format!("{} {}", t.last_ip_label, status.current_ip));
             }
-            ui.small(binding_hint(&user, &t));
             if user.if_name.as_deref().is_some_and(|name| !name.is_empty()) {
                 if let Some(ip) = user.ip.as_deref().filter(|ip| !ip.is_empty()) {
                     ui.weak(format!("{} {}", t.fallback_ip_label, ip));
@@ -223,7 +234,11 @@ impl CampusNetApp {
             )
         };
         ui.horizontal_wrapped(|ui| {
-            ui.strong(format!("{} · {}", t.section_accounts, user_count));
+            ui.label(
+                RichText::new(format!("{} · {}", t.section_accounts, user_count))
+                    .size(16.0)
+                    .strong(),
+            );
             if ui
                 .add_enabled(!busy, egui::Button::new(t.btn_add_user))
                 .clicked()
@@ -238,7 +253,7 @@ impl CampusNetApp {
                 if ui
                     .add_enabled(
                         !busy && !preserve_session,
-                        egui::Button::new(t.btn_login_all),
+                        egui::Button::new(t.btn_login_all).fill(ui.visuals().selection.bg_fill),
                     )
                     .on_hover_text(format!(
                         "{}\n{}",

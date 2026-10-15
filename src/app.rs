@@ -5,9 +5,7 @@ use egui::{RichText, ScrollArea};
 use tray_icon::TrayIcon;
 
 use crate::platform::autostart;
-use crate::service::{
-    config::StoredUser, AuthServerStatus, Ipv4InternetStatus, SharedState, UpdateStatus,
-};
+use crate::service::{config::StoredUser, AuthServerStatus, Ipv4InternetStatus, SharedState};
 use crate::ui::l10n::{self, UiText};
 
 mod edit_dialog;
@@ -137,23 +135,27 @@ impl CampusNetApp {
                 s.definitely_offline() && s.online_info_fail_count > 0,
             )
         };
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(RichText::new(t.window_title).size(20.0));
-            if query_busy {
-                ui.spinner();
-            }
-            if ui
-                .add_enabled(
-                    !query_busy && !auth_busy,
-                    egui::Button::new(t.btn_refresh_status),
-                )
-                .clicked()
-            {
-                let state = self.state.clone();
-                tokio::spawn(async move {
-                    crate::service::online_info::sync_online_state(&state).await;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !query_busy && !auth_busy,
+                        egui::Button::new(t.btn_refresh_status),
+                    )
+                    .clicked()
+                {
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        crate::service::online_info::sync_online_state(&state).await;
+                    });
+                }
+                if query_busy {
+                    ui.spinner();
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.heading(RichText::new(t.window_title).size(22.0).strong());
                 });
-            }
+            });
         });
         card_frame(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -187,13 +189,16 @@ impl CampusNetApp {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
                     tone_color(ui, tone),
-                    RichText::new(format!("●  {}", text)).strong(),
+                    RichText::new(format!("●  {}", text)).size(18.0).strong(),
                 )
                 .on_hover_text(hint);
-                if let Some(account) = account {
-                    ui.label(format!("{} {}", t.campus_account_label, account));
-                }
             });
+            if let Some(account) = account {
+                ui.add(
+                    egui::Label::new(format!("{} {}", t.campus_account_label, account)).truncate(),
+                )
+                .on_hover_text(account);
+            }
             ui.small(reconnect);
             if matches!(
                 status,
@@ -258,51 +263,31 @@ impl CampusNetApp {
         let dialog_open = self.show_add_dialog
             || self.editing_user_idx.is_some()
             || self.pending_delete.is_some();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.add_enabled_ui(!dialog_open, |ui| {
-                        self.render_top_bar(ui);
-                        ui.add_space(4.0);
-                        self.render_user_list(ui);
-                        ui.add_space(4.0);
-                        self.render_settings(ui);
-                        self.render_log(ui);
-                        let t = self.t();
-                        let update = self.state.lock().unwrap().update_status.clone();
-                        let (notice, tone) = match &update {
-                            UpdateStatus::Available { latest, .. } => {
-                                (t.update_available.replace("{}", latest), Tone::Warning)
-                            }
-                            UpdateStatus::Failed(_) => (t.update_failed.into(), Tone::Error),
-                            UpdateStatus::Checking => (t.update_checking.into(), Tone::Muted),
-                            UpdateStatus::Downloading => {
-                                (t.update_downloading.into(), Tone::Warning)
-                            }
-                            UpdateStatus::PreparingUpdate => {
-                                (t.update_preparing.into(), Tone::Warning)
-                            }
-                            UpdateStatus::Restarting => {
-                                (t.update_restarting.into(), Tone::Positive)
-                            }
-                            _ => (format!("v{}", env!("CARGO_PKG_VERSION")), Tone::Muted),
-                        };
-                        egui::CollapsingHeader::new(
-                            RichText::new(format!("{} · {}", t.section_about, notice))
-                                .color(tone_color(ui, tone)),
-                        )
-                        .id_salt("about")
-                        .show(ui, |ui| {
-                            self.render_version_section(ui);
-                            ui.hyperlink_to(
-                                "github.com/uchihazzj/campus_net",
-                                "https://github.com/uchihazzj/campus_net",
-                            );
+        egui::TopBottomPanel::bottom("version_footer")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .fill(ctx.style().visuals.window_fill()),
+            )
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!dialog_open, |ui| self.render_version_section(ui));
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(16.0))
+            .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!dialog_open, |ui| {
+                            self.render_top_bar(ui);
+                            ui.add_space(8.0);
+                            self.render_user_list(ui);
+                            ui.add_space(8.0);
+                            self.render_settings(ui);
+                            self.render_log(ui);
                         });
                     });
-                });
-        });
+            });
         self.render_edit_dialog(ctx);
         self.render_delete_dialog(ctx);
     }

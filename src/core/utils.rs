@@ -18,9 +18,14 @@ pub fn get_network_interfaces() -> Vec<(String, IpAddr)> {
     }
 }
 
-pub fn get_ip_by_if_name(if_name: &str) -> Option<String> {
-    let ifaces = get_network_interfaces();
-    ipv4_by_if_name(if_name, &ifaces)
+/// Keep synchronous OS table reads off the async worker threads.
+pub async fn get_network_interfaces_async() -> Vec<(String, IpAddr)> {
+    tokio::task::spawn_blocking(get_network_interfaces)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!("Network interface query task failed: {}", error);
+            Vec::new()
+        })
 }
 
 pub fn ipv4_by_if_name(if_name: &str, ifaces: &[(String, IpAddr)]) -> Option<String> {

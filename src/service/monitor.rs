@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::service::auth::do_auto_login;
 use crate::service::config::StoredUser;
-use crate::service::detection::{check_ipv4_reachability, detect_campus_ip};
-use crate::service::online_info::sync_online_state;
+use crate::service::detection::{check_ipv4_reachability, detect_campus_ip_from_interfaces};
+use crate::service::online_info::sync_online_state_from_interfaces;
 use crate::service::user_ip;
 use crate::service::{
     AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus, LoginState, SharedState, UserStatus,
@@ -14,6 +14,17 @@ const MAX_INTERVAL_SECS: u64 = 300;
 const MAX_BACKOFF_SECS: u64 = 300;
 const FAILURE_THRESHOLD: u32 = 2;
 const MONITOR_CRASH_RESTART_SECS: u64 = 30;
+
+fn cached_online_interfaces(
+    s: &crate::service::AppState,
+) -> Option<Vec<(String, std::net::IpAddr)>> {
+    s.current_online_info()?;
+    let interfaces = s.network_interfaces.as_ref()?;
+    interfaces
+        .iter()
+        .any(|(_, ip)| ip.is_ipv4())
+        .then(|| interfaces.clone())
+}
 
 /// Decision from the unified auto-reconnect evaluation.
 enum ReconnectDecision {
@@ -41,14 +52,18 @@ fn any_usable_ip(s: &crate::service::AppState) -> bool {
     }
     let users = s.config.users.clone();
     let statuses = s.user_statuses.clone();
-    any_usable_user_ip(&users, &statuses)
+    any_usable_user_ip(&users, &statuses, &[])
 }
 
-fn any_usable_user_ip(users: &[StoredUser], statuses: &[UserStatus]) -> bool {
+fn any_usable_user_ip(
+    users: &[StoredUser],
+    statuses: &[UserStatus],
+    interfaces: &[(String, std::net::IpAddr)],
+) -> bool {
     statuses
         .iter()
         .enumerate()
-        .any(|(i, us)| user_ip::has_usable_user_ip(users.get(i), Some(us)))
+        .any(|(i, us)| user_ip::has_usable_user_ip(users.get(i), Some(us), interfaces))
 }
 
 /// Evaluate whether auto-reconnect should fire based on current state.
@@ -143,11 +158,31 @@ fn apply_ipv4_probe(
 /// This is run as a separate tokio task so panics are caught by the outer loop.
 async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs: u64) -> u64 {
     // ── Layer 1: Campus IPv4 ────────────────────
-    let auth_generation = state.lock().unwrap().auth_generation;
-    let campus_ipv4 = detect_campus_ip();
+    let (auth_generation, initial_query_generation, cached_interfaces) = {
+        let s = state.lock().unwrap();
+        if s.authentication_busy() || s.online_query_busy {
+            return interval;
+        }
+        (
+            s.auth_generation,
+            s.online_query_generation,
+            cached_online_interfaces(&s),
+        )
+    };
+    let from_cache = cached_interfaces.is_some();
+    let interfaces = if let Some(interfaces) = cached_interfaces {
+        interfaces
+    } else {
+        crate::core::utils::get_network_interfaces_async().await
+    };
+    let campus_ipv4 = detect_campus_ip_from_interfaces(&interfaces);
     {
         let mut s = state.lock().unwrap();
-        if s.authentication_busy() || s.auth_generation != auth_generation {
+        if s.authentication_busy()
+            || s.online_query_busy
+            || s.auth_generation != auth_generation
+            || s.online_query_generation != initial_query_generation
+        {
             return interval;
         }
         s.campus_ip = campus_ipv4.clone();
@@ -159,12 +194,16 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         let users = s.config.users.clone();
         let statuses = s.user_statuses.clone();
         drop(s);
-        any_usable_user_ip(&users, &statuses)
+        any_usable_user_ip(&users, &statuses, &interfaces)
     };
 
     if campus_ipv4.is_none() && !has_usable_ip {
         let mut s = state.lock().unwrap();
-        if s.authentication_busy() || s.auth_generation != auth_generation {
+        if s.authentication_busy()
+            || s.online_query_busy
+            || s.auth_generation != auth_generation
+            || s.online_query_generation != initial_query_generation
+        {
             return interval;
         }
         s.auth_server = AuthServerStatus::Unknown;
@@ -185,6 +224,13 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
 
     if campus_ipv4.is_none() {
         let mut s = state.lock().unwrap();
+        if s.authentication_busy()
+            || s.online_query_busy
+            || s.auth_generation != auth_generation
+            || s.online_query_generation != initial_query_generation
+        {
+            return interval;
+        }
         s.auth_server = AuthServerStatus::Unknown;
         s.add_log(
             "[WARN] No global campus IPv4 detected, but user-bound IP exists; preserving current auth status and continuing auto-reconnect evaluation"
@@ -194,7 +240,29 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         crate::service::request_ui_repaint();
     }
     // ── Layer 2+3: Auth Server + Auth Status ─────
-    sync_online_state(state).await;
+    if !sync_online_state_from_interfaces(
+        state,
+        &interfaces,
+        auth_generation,
+        initial_query_generation,
+        from_cache,
+    )
+    .await
+    {
+        return interval;
+    }
+    let completed_query_generation = initial_query_generation.wrapping_add(1);
+    // A cached query may have detected trouble and refreshed its address/IP
+    // before applying a result. Diagnose and reconnect using that fresh data.
+    let (interfaces, users, statuses) = {
+        let s = state.lock().unwrap();
+        (
+            s.network_interfaces.clone().unwrap_or(interfaces),
+            s.config.users.clone(),
+            s.user_statuses.clone(),
+        )
+    };
+    let has_usable_ip = any_usable_user_ip(&users, &statuses, &interfaces);
 
     // ── Layer 4: IPv4 Internet (conditional) ─────
     let (
@@ -205,6 +273,13 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         probe_campus_ip,
     ) = {
         let s = state.lock().unwrap();
+        if s.authentication_busy()
+            || s.online_query_busy
+            || s.auth_generation != auth_generation
+            || s.online_query_generation != completed_query_generation
+        {
+            return interval;
+        }
         (
             s.config.enable_ipv4_internet_probe,
             s.auth_generation,
@@ -215,7 +290,6 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
     };
 
     if probe_enabled {
-        let interfaces = crate::core::utils::get_network_interfaces();
         let probe_ip = {
             let s = state.lock().unwrap();
             ipv4_probe_ip(&s, &interfaces)
@@ -261,6 +335,13 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
     // ── Auto-reconnect ──────────────────────────
     let (decision, mut reconnect_generation) = {
         let s = state.lock().unwrap();
+        if s.authentication_busy()
+            || s.online_query_busy
+            || s.auth_generation != auth_generation
+            || s.online_query_generation != completed_query_generation
+        {
+            return interval;
+        }
         (evaluate_reconnect(&s, has_usable_ip), s.auth_generation)
     };
 
@@ -474,6 +555,26 @@ mod tests {
     }
 
     #[test]
+    fn only_confirmed_online_sessions_reuse_a_nonempty_ipv4_snapshot() {
+        let mut s = make_state();
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        s.online_info = Some(crate::service::OnlineUserInfo::default());
+        assert!(cached_online_interfaces(&s).is_none());
+        s.network_interfaces = Some(vec![("test-campus".into(), "10.0.0.2".parse().unwrap())]);
+        assert!(cached_online_interfaces(&s).is_some());
+        s.online_info_stale = true;
+        assert!(cached_online_interfaces(&s).is_none());
+        s.online_info_stale = false;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        assert!(cached_online_interfaces(&s).is_none());
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        s.network_interfaces = Some(Vec::new());
+        assert!(cached_online_interfaces(&s).is_none());
+        s.network_interfaces = Some(vec![("test-ipv6".into(), "::1".parse().unwrap())]);
+        assert!(cached_online_interfaces(&s).is_none());
+    }
+
+    #[test]
     fn tun_internet_success_does_not_erase_the_offline_accounts_reconnect_target() {
         let mut s = make_state();
         s.config.enable_ipv4_internet_probe = true;
@@ -674,23 +775,22 @@ mod tests {
 
     #[test]
     fn any_ip_with_if_name() {
-        let ifaces = crate::core::utils::get_network_interfaces();
-        let real_if_name = ifaces
-            .iter()
-            .find(|(_, ip)| ip.is_ipv4())
-            .map(|(name, _)| name.clone());
+        let interfaces = vec![("test-campus".into(), "10.0.0.2".parse().unwrap())];
 
         let mut s = make_state();
         s.config.users.push(StoredUser {
             username: "test".to_string(),
             encrypted_password: String::new(),
             ip: None,
-            if_name: real_if_name,
+            if_name: Some("test-campus".into()),
         });
         s.ensure_statuses();
-        if s.config.users[0].if_name.is_some() {
-            assert!(any_usable_ip(&s));
-        }
+        assert!(any_usable_user_ip(
+            &s.config.users,
+            &s.user_statuses,
+            &interfaces
+        ));
+        assert!(!any_usable_user_ip(&s.config.users, &s.user_statuses, &[]));
     }
 
     #[test]

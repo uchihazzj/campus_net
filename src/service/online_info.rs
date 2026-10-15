@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::service::detection::{check_auth_server, check_auth_status, detect_campus_ip};
+use crate::service::detection::{
+    check_auth_server, check_auth_status, detect_campus_ip_from_interfaces,
+};
 use crate::service::user_ip;
 use crate::service::{AuthServerStatus, CampusAuthStatus, LoginState, SharedState};
 
@@ -489,6 +491,56 @@ struct StatusQueryGuard {
     query: StatusQuery,
 }
 
+impl StatusQueryGuard {
+    fn begin(state: &SharedState, expected_generations: Option<(u64, u64)>) -> Option<Self> {
+        let query = {
+            let mut s = state.lock().unwrap();
+            if expected_generations.is_some_and(|(auth, query)| {
+                s.auth_generation != auth || s.online_query_generation != query
+            }) {
+                return None;
+            }
+            StatusQuery::begin(&mut s)?
+        };
+        let guard = Self {
+            state: state.clone(),
+            query,
+        };
+        crate::service::request_ui_repaint();
+        Some(guard)
+    }
+
+    fn use_interfaces(&mut self, interfaces: &[(String, std::net::IpAddr)], fresh: bool) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if !self.query.is_current(&s) {
+            return false;
+        }
+        if fresh {
+            s.network_interfaces = Some(interfaces.to_vec());
+            s.campus_ip = detect_campus_ip_from_interfaces(interfaces);
+            self.query.campus_ip = s.campus_ip.clone();
+            self.query.context_ip = best_status_query_ip(&s);
+        }
+        if !interfaces.iter().any(|(_, ip)| ip.is_ipv4()) {
+            // An empty/IPv6-only snapshot cannot validate the old IPv4's
+            // offline response. Preserve the account and wait for an address.
+            s.campus_auth = CampusAuthStatus::Unknown;
+            s.online_info_stale = true;
+            s.ipv4_internet = if s.config.enable_ipv4_internet_probe {
+                crate::service::Ipv4InternetStatus::ProbeFailed
+            } else {
+                crate::service::Ipv4InternetStatus::Disabled
+            };
+            s.add_log(
+                "[WARN] No local IPv4 available; waiting before status checks or reconnect".into(),
+            );
+            return false;
+        }
+        self.query.ip = status_query_ip_from_interfaces(&s, interfaces);
+        true
+    }
+}
+
 impl Drop for StatusQueryGuard {
     fn drop(&mut self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -499,31 +551,109 @@ impl Drop for StatusQueryGuard {
 }
 
 pub async fn sync_online_state(state: &SharedState) {
-    {
-        let s = state.lock().unwrap();
-        if s.authentication_busy() || s.online_query_busy {
+    sync_online_state_collecting(state, crate::core::utils::get_network_interfaces_async()).await;
+}
+
+async fn sync_online_state_collecting(
+    state: &SharedState,
+    collect: impl std::future::Future<Output = Vec<(String, std::net::IpAddr)>>,
+) {
+    let Some(guard) = StatusQueryGuard::begin(state, None) else {
+        return;
+    };
+    // Enumerate outside AppState locks; DHCP can invalidate a last-seen session IP.
+    let interfaces = collect.await;
+    sync_online_state_claimed(guard, &interfaces, false).await;
+}
+
+/// The monitor/startup already read the OS address table; reuse that same
+/// snapshot while preserving the usual authentication/query ownership checks.
+/// Returns false if the snapshot's original context can no longer be claimed.
+pub(crate) async fn sync_online_state_from_interfaces(
+    state: &SharedState,
+    interfaces: &[(String, std::net::IpAddr)],
+    expected_auth_generation: u64,
+    expected_query_generation: u64,
+    from_cache: bool,
+) -> bool {
+    let Some(guard) = StatusQueryGuard::begin(
+        state,
+        Some((expected_auth_generation, expected_query_generation)),
+    ) else {
+        return false;
+    };
+    sync_online_state_claimed(guard, interfaces, from_cache).await;
+    true
+}
+
+async fn sync_online_state_claimed(
+    guard: StatusQueryGuard,
+    interfaces: &[(String, std::net::IpAddr)],
+    from_cache: bool,
+) {
+    sync_online_state_claimed_with_io(
+        guard,
+        interfaces,
+        from_cache,
+        crate::core::utils::get_network_interfaces_async,
+        |server, ip| async move { fetch_online_user_info(&server, ip.as_deref()).await },
+    )
+    .await;
+}
+
+async fn sync_online_state_claimed_with_io<Read, ReadFuture, Fetch, FetchFuture>(
+    mut guard: StatusQueryGuard,
+    interfaces: &[(String, std::net::IpAddr)],
+    from_cache: bool,
+    read: Read,
+    fetch: Fetch,
+) where
+    Read: FnOnce() -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Vec<(String, std::net::IpAddr)>>,
+    Fetch: Fn(String, Option<String>) -> FetchFuture,
+    FetchFuture: std::future::Future<Output = Result<Option<OnlineUserInfo>, String>>,
+{
+    if !guard.use_interfaces(interfaces, !from_cache) {
+        return;
+    }
+    let first_ip = guard.query.ip.clone();
+    let mut result = fetch(guard.query.server.clone(), first_ip.clone()).await;
+    let refresh_cached = if from_cache {
+        let s = guard.state.lock().unwrap();
+        if !guard.query.is_current(&s) {
             return;
         }
-    }
-    // Enumerate outside AppState locks; DHCP can invalidate a last-seen session IP.
-    let interfaces = crate::core::utils::get_network_interfaces();
-    let query = {
-        let mut s = state.lock().unwrap();
-        let Some(mut query) = StatusQuery::begin(&mut s) else {
+        match (&result, s.current_online_info()) {
+            (Ok(Some(next)), Some(previous)) => {
+                // A different session can mean the old address moved to another
+                // adapter. Preserve compatible base/suffix account matching.
+                let same_account = previous.user_name.trim() == next.user_name.trim()
+                    || confirmed_online_user_idx(Some(previous), &s.config.users).is_some_and(
+                        |idx| confirmed_online_user_idx(Some(next), &s.config.users) == Some(idx),
+                    );
+                !same_account || previous.online_ip != next.online_ip
+            }
+            _ => true,
+        }
+    } else {
+        false
+    };
+    if refresh_cached {
+        let fresh_interfaces = read().await;
+        if !guard.use_interfaces(&fresh_interfaces, true) {
             return;
-        };
-        query.ip = status_query_ip_from_interfaces(&s, &interfaces);
-        query
-    };
-    let guard = StatusQueryGuard {
-        state: state.clone(),
-        query,
-    };
+        }
+        if guard.query.ip != first_ip {
+            // The old address may now belong to another adapter. Confirm
+            // through the refreshed binding before demoting or reconnecting.
+            result = fetch(guard.query.server.clone(), guard.query.ip.clone()).await;
+        }
+    }
+    let state = &guard.state;
     let query = &guard.query;
-    crate::service::request_ui_repaint();
     let (server, query_ip) = (&query.server, &query.ip);
 
-    match fetch_online_user_info(server, query_ip.as_deref()).await {
+    match result {
         Ok(Some(info)) => {
             let mut s = state.lock().unwrap();
             if !query.is_current(&s) {
@@ -680,18 +810,44 @@ pub fn spawn_startup_tasks(state: SharedState) {
     tokio::spawn(async move {
         // Phase 1 (version check) is now handled by update_scheduler.
         // ── Phase 2: Detect campus IP ──────────────────
+        let (startup_auth_generation, startup_query_generation) = {
+            let s = state.lock().unwrap();
+            (s.auth_generation, s.online_query_generation)
+        };
+        let interfaces = crate::core::utils::get_network_interfaces_async().await;
         {
-            let ip = detect_campus_ip();
+            let ip = detect_campus_ip_from_interfaces(&interfaces);
             let mut s = state.lock().unwrap();
-            s.campus_ip = ip;
+            if s.auth_generation == startup_auth_generation
+                && s.online_query_generation == startup_query_generation
+                && !s.authentication_busy()
+                && !s.online_query_busy
+            {
+                s.campus_ip = ip;
+            }
         }
         crate::service::request_ui_repaint();
 
         // ── Phase 3: Sync online state from server ─────
-        sync_online_state(&state).await;
+        let startup_synced = sync_online_state_from_interfaces(
+            &state,
+            &interfaces,
+            startup_auth_generation,
+            startup_query_generation,
+            false,
+        )
+        .await;
 
         // ── Phase 4: Conditional auto-login ────────────
-        let (auto_reconnect, should_login, has_online, campus_auth, generation, first_user) = {
+        let (
+            auto_reconnect,
+            should_login,
+            has_online,
+            campus_auth,
+            generation,
+            first_user,
+            startup_current,
+        ) = {
             let s = state.lock().unwrap();
             let has_online = s
                 .user_statuses
@@ -704,9 +860,16 @@ pub fn spawn_startup_tasks(state: SharedState) {
                 s.campus_auth.clone(),
                 s.auth_generation,
                 s.config.users.first().cloned(),
+                startup_synced
+                    && s.auth_generation == startup_auth_generation
+                    && s.online_query_generation == startup_query_generation.wrapping_add(1)
+                    && !s.authentication_busy()
+                    && !s.online_query_busy,
             )
         };
-        if should_auto_login(auto_reconnect, has_online, should_login, &campus_auth) {
+        if startup_current
+            && should_auto_login(auto_reconnect, has_online, should_login, &campus_auth)
+        {
             tracing::info!(
                 "[Startup] Auto-reconnect enabled, not logged in — starting one-click login"
             );
@@ -720,7 +883,8 @@ pub fn spawn_startup_tasks(state: SharedState) {
             }
             // Re-sync after login attempt
             sync_online_state(&state).await;
-        } else if auto_reconnect
+        } else if startup_current
+            && auto_reconnect
             && !has_online
             && should_login > 0
             && campus_auth == CampusAuthStatus::Unknown
@@ -740,6 +904,9 @@ pub fn spawn_startup_tasks(state: SharedState) {
         crate::service::monitor::spawn_monitor(state);
     });
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1031,6 +1198,86 @@ mod tests {
             state: state.clone(),
             query,
         };
+        assert!(state.lock().unwrap().online_query_busy);
+        drop(guard);
+        assert!(!state.lock().unwrap().online_query_busy);
+    }
+
+    #[tokio::test]
+    async fn slow_interface_collection_is_exclusive_and_cancellation_releases_it() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        let state = Arc::new(Mutex::new(make_app_state()));
+        let collections = AtomicUsize::new(0);
+        let mut refresh = Box::pin(sync_online_state_collecting(&state, async {
+            collections.fetch_add(1, Ordering::SeqCst);
+            // No OS/network calls: pause inside the synthetic interface query.
+            std::future::pending().await
+        }));
+        tokio::select! {
+            biased;
+            _ = &mut refresh => panic!("synthetic collection should still be pending"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(
+            state.lock().unwrap().online_query_busy,
+            "refresh must be claimed before local interface collection starts"
+        );
+        sync_online_state_collecting(&state, async {
+            collections.fetch_add(1, Ordering::SeqCst);
+            panic!("a duplicate refresh must not poll its interface collector");
+        })
+        .await;
+        assert_eq!(collections.load(Ordering::SeqCst), 1);
+        drop(refresh);
+        let s = state.lock().unwrap();
+        assert!(!s.online_query_busy);
+        assert_eq!(s.auth_generation, 0);
+        assert_eq!(s.campus_auth, CampusAuthStatus::Unknown);
+    }
+
+    #[test]
+    fn an_old_interface_snapshot_cannot_claim_a_newer_authentication_or_query_context() {
+        use std::sync::{Arc, Mutex};
+        for auth_changed in [true, false] {
+            let state = Arc::new(Mutex::new(make_app_state()));
+            let origin = {
+                let mut s = state.lock().unwrap();
+                s.config.users.push(make_user("test-snapshot"));
+                s.ensure_statuses();
+                (s.auth_generation, s.online_query_generation)
+            };
+            // Simulate a slow A-address snapshot returning after a newer
+            // login or completed refresh has already established address B.
+            {
+                let mut s = state.lock().unwrap();
+                if auth_changed {
+                    s.invalidate_auth_context();
+                } else {
+                    s.online_query_generation = s.online_query_generation.wrapping_add(1);
+                }
+                s.campus_ip = Some("10.0.0.4".into());
+                s.user_statuses[0].current_ip = "10.0.0.4".into();
+                s.user_statuses[0].state = LoginState::PendingConfirm;
+            }
+            let before_query = state.lock().unwrap().online_query_generation;
+            assert!(StatusQueryGuard::begin(&state, Some(origin)).is_none());
+            let s = state.lock().unwrap();
+            assert_eq!(s.online_query_generation, before_query);
+            assert!(!s.online_query_busy);
+            assert_eq!(s.user_statuses[0].state, LoginState::PendingConfirm);
+            assert_eq!(s.user_statuses[0].current_ip, "10.0.0.4");
+        }
+
+        let state = Arc::new(Mutex::new(make_app_state()));
+        let origin = {
+            let s = state.lock().unwrap();
+            (s.auth_generation, s.online_query_generation)
+        };
+        let guard = StatusQueryGuard::begin(&state, Some(origin)).unwrap();
         assert!(state.lock().unwrap().online_query_busy);
         drop(guard);
         assert!(!state.lock().unwrap().online_query_busy);

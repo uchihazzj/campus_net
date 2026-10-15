@@ -67,11 +67,13 @@ fn fixture(lang: Lang, state: LoginState) -> CampusNetApp {
 
 fn context(light: bool) -> Context {
     let ctx = Context::default();
+    ctx.set_theme(if light {
+        egui::Theme::Light
+    } else {
+        egui::Theme::Dark
+    });
     super::configure_style(&ctx);
     ctx.style_mut(|style| style.animation_time = 0.0);
-    if light {
-        ctx.set_visuals(egui::Visuals::light());
-    }
     if let Some(font) = crate::load_cjk_font() {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert("cjk_font".into(), font);
@@ -128,7 +130,9 @@ fn text_rect(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<Rect> 
             _ => None,
         }
     }
-    shapes.iter().find_map(|shape| find(&shape.shape, text))
+    shapes.iter().find_map(|shape| {
+        find(&shape.shape, text).filter(|rect| shape.clip_rect.contains_rect(*rect))
+    })
 }
 
 #[test]
@@ -234,15 +238,125 @@ fn account_dialog_actions_remain_inside_the_minimum_window() {
 }
 
 #[test]
-fn collapsed_about_still_shows_available_updates() {
-    let mut app = fixture(Lang::English, LoginState::LoggedOut);
-    app.state.lock().unwrap().update_status = UpdateStatus::Available {
-        latest: "v9.9.9".into(),
-        release_url: "https://example.test/release".into(),
-        download_url: "https://example.test/preview.exe".into(),
-    };
-    let (_, out) = render(&mut app, [520.0, 700.0], false, "en_update_available");
-    assert!(text_rect(&out.shapes, "v9.9.9").is_some());
+fn version_and_update_actions_stay_visible_in_the_minimum_window() {
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        for (name, status) in [
+            ("idle", UpdateStatus::Idle),
+            ("checking", UpdateStatus::Checking),
+            ("current", UpdateStatus::UpToDate),
+            (
+                "available",
+                UpdateStatus::Available {
+                    latest: "v9.9.9".into(),
+                    release_url: "https://example.test/release".into(),
+                    download_url: "https://example.test/preview.exe".into(),
+                },
+            ),
+            ("downloading", UpdateStatus::Downloading),
+            ("preparing", UpdateStatus::PreparingUpdate),
+            ("restarting", UpdateStatus::Restarting),
+            (
+                "failed",
+                UpdateStatus::Failed("Preview update error: ".repeat(40)),
+            ),
+        ] {
+            let mut app = fixture(lang, LoginState::Online);
+            // A long list must scroll without displacing the version/update controls.
+            {
+                let mut s = app.state.lock().unwrap();
+                for index in 1..20 {
+                    let mut user = s.config.users[0].clone();
+                    user.username = format!("preview-extra-account-{index}");
+                    s.config.users.push(user);
+                }
+                s.ensure_statuses();
+                s.update_status = status;
+            }
+            let t = app.t();
+            let (ctx, out) = render(
+                &mut app,
+                [420.0, 280.0],
+                false,
+                &format!("{prefix}_update_{name}_small"),
+            );
+            for label in [
+                t.section_about,
+                env!("CARGO_PKG_VERSION"),
+                t.btn_check_update,
+                "GitHub",
+            ] {
+                let rect = text_rect(&out.shapes, label).expect("version control must be visible");
+                assert!(
+                    ctx.screen_rect().contains_rect(rect),
+                    "{prefix} {name} {label}: {rect:?}"
+                );
+            }
+            if name == "available" {
+                for label in ["v9.9.9", t.btn_auto_update, t.btn_open_release] {
+                    assert!(ctx
+                        .screen_rect()
+                        .contains_rect(text_rect(&out.shapes, label).unwrap()));
+                }
+            }
+            if name == "failed" {
+                assert!(
+                    text_rect(&out.shapes, t.update_failed).is_some(),
+                    "error must fit the footer clip"
+                );
+                assert!(
+                    text_rect(&out.shapes, t.update_failed).unwrap().top()
+                        < text_rect(&out.shapes, "GitHub").unwrap().bottom(),
+                    "long errors must not force another footer row"
+                );
+            }
+            let main_status = text_rect(&out.shapes, t.campus_auth_logged_in).unwrap();
+            assert!(ctx.screen_rect().contains_rect(main_status));
+            assert!(main_status.bottom() < text_rect(&out.shapes, t.section_about).unwrap().top());
+        }
+    }
+}
+
+#[test]
+fn multiple_accounts_keep_titles_left_aligned_and_session_details_visible() {
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        for light in [false, true] {
+            let mut app = fixture(lang, LoginState::Online);
+            {
+                let mut s = app.state.lock().unwrap();
+                s.config.users[0].username = "preview-account-01".into();
+                s.config.users[0].ip = None;
+                let mut online_user = s.config.users[0].clone();
+                online_user.username = "preview-account-02".into();
+                s.config.users.push(online_user);
+                s.ensure_statuses();
+                s.user_statuses[0].state = LoginState::LoggedOut;
+                s.user_statuses[1].state = LoginState::Online;
+                let info = s.online_info.as_mut().unwrap();
+                info.user_name = "preview-account-02".into();
+                info.sum_seconds = 3 * 3600 + 16 * 60 + 6;
+                info.remain_bytes = 256 * 1024 * 1024 * 1024;
+                s.update_status = UpdateStatus::UpToDate;
+            }
+            let (_, out) = render(
+                &mut app,
+                [706.0, 830.0],
+                light,
+                &format!(
+                    "{prefix}_two_accounts_{}",
+                    if light { "light" } else { "dark" }
+                ),
+            );
+            let title = text_rect(&out.shapes, "preview-account-01").unwrap();
+            assert!(
+                title.left() < 40.0,
+                "account title must start at the card's left inset: {title:?}"
+            );
+            assert!(text_rect(&out.shapes, "preview-account-02").is_some());
+            assert!(text_rect(&out.shapes, "03:16:06").is_some());
+            assert!(text_rect(&out.shapes, "256.0 GB").is_some());
+            assert!(text_rect(&out.shapes, app.t().update_up_to_date).is_some());
+        }
+    }
 }
 
 #[test]

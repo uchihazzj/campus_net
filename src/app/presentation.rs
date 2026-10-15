@@ -70,28 +70,62 @@ pub(super) fn tone_color(ui: &egui::Ui, tone: Tone) -> Color32 {
 
 pub(super) fn card_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style())
-        .inner_margin(10.0)
-        .rounding(8.0)
-        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(14.0)
+        .rounding(10.0)
+        .fill(ui.visuals().window_fill())
 }
 
 pub(crate) fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.interact_size.y = 28.0;
-    style
-        .text_styles
-        .insert(TextStyle::Body, FontId::proportional(14.0));
-    style
-        .text_styles
-        .insert(TextStyle::Button, FontId::proportional(14.0));
-    style
-        .text_styles
-        .insert(TextStyle::Small, FontId::proportional(12.0));
-    style.visuals.window_rounding = 8.0.into();
-    style.visuals.menu_rounding = 6.0.into();
-    ctx.set_style(style);
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.interact_size.y = 30.0;
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::proportional(12.0));
+
+        let (panel, surface, border, button, hover, text, accent) = if style.visuals.dark_mode {
+            (
+                0x161a20, 0x20262e, 0x343e4b, 0x303a47, 0x3d4e62, 0xcdd5e0, 0x8bc1ff,
+            )
+        } else {
+            (
+                0xf2f5f9, 0xffffff, 0xd8e0e9, 0xe7edf5, 0xd8e5f4, 0x354254, 0x245fa6,
+            )
+        };
+        let rgb = |hex| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+        let visuals = &mut style.visuals;
+        visuals.panel_fill = rgb(panel);
+        visuals.window_fill = rgb(surface);
+        visuals.window_stroke = egui::Stroke::new(1.0, rgb(border));
+        visuals.hyperlink_color = rgb(accent);
+        visuals.widgets.noninteractive.bg_fill = rgb(surface);
+        visuals.widgets.noninteractive.weak_bg_fill = rgb(surface);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, rgb(border));
+        visuals.widgets.noninteractive.fg_stroke.color = rgb(text);
+        visuals.widgets.inactive.bg_fill = rgb(button);
+        visuals.widgets.inactive.weak_bg_fill = rgb(button);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        visuals.widgets.inactive.fg_stroke.color = rgb(text);
+        visuals.widgets.hovered.bg_fill = rgb(hover);
+        visuals.widgets.hovered.weak_bg_fill = rgb(hover);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, rgb(accent));
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            widget.rounding = 6.0.into();
+        }
+        visuals.window_rounding = 10.0.into();
+        visuals.menu_rounding = 8.0.into();
+    });
 }
 
 pub(super) fn binding_hint(user: &StoredUser, t: &UiText) -> String {

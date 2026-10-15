@@ -106,6 +106,8 @@ pub struct AppState {
     pub log_messages: Vec<String>,
     // Four-layer detection state
     pub campus_ip: Option<String>,
+    /// Last accepted local address snapshot. Runtime-only; never saved to config.
+    pub network_interfaces: Option<Vec<(String, std::net::IpAddr)>>,
     pub auth_server: AuthServerStatus,
     pub campus_auth: CampusAuthStatus,
     pub ipv4_internet: Ipv4InternetStatus,
@@ -144,6 +146,7 @@ impl AppState {
             user_statuses: vec![UserStatus::new(); user_count],
             log_messages: Vec::new(),
             campus_ip: None,
+            network_interfaces: None,
             auth_server: AuthServerStatus::Unknown,
             campus_auth: CampusAuthStatus::Unknown,
             ipv4_internet: if probe_enabled {

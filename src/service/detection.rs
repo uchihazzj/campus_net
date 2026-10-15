@@ -1,7 +1,6 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use crate::core::utils::get_network_interfaces;
 use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 
 // ── Campus IPv4 ────────────────────────────────────────────────────
@@ -9,10 +8,6 @@ use crate::service::{AuthServerStatus, CampusAuthStatus, Ipv4InternetStatus};
 /// Return all candidate campus IPv4 interfaces (name, ip), filtered to
 /// exclude loopback, link-local, and common virtual adapters (VPN, Docker,
 /// WSL, Hyper‑V, VMware, etc.). Use this for both IP selection and UI.
-pub fn detect_campus_ip_candidates() -> Vec<(String, String)> {
-    campus_ip_candidates_from_interfaces(&get_network_interfaces())
-}
-
 pub fn campus_ip_candidates_from_interfaces(
     interfaces: &[(String, std::net::IpAddr)],
 ) -> Vec<(String, String)> {
@@ -62,8 +57,10 @@ pub fn campus_ip_candidates_from_interfaces(
         .collect()
 }
 
-pub fn detect_campus_ip() -> Option<String> {
-    let candidates = detect_campus_ip_candidates();
+pub fn detect_campus_ip_from_interfaces(
+    interfaces: &[(String, std::net::IpAddr)],
+) -> Option<String> {
+    let candidates = campus_ip_candidates_from_interfaces(interfaces);
     if candidates.len() > 1 {
         tracing::debug!(
             "[IP] Multiple campus IPv4 candidates: {:?}, selecting first",
@@ -565,15 +562,25 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_campus_ip() {
-        let ip = detect_campus_ip();
-        println!("Campus IPv4: {:?}", ip);
+    fn campus_ip_detection_uses_only_the_supplied_local_addresses() {
+        let mut interfaces = vec![
+            ("test-tun".into(), "10.0.0.1".parse().unwrap()),
+            ("test-local".into(), "192.168.137.1".parse().unwrap()),
+            ("test-ipv6".into(), "::1".parse().unwrap()),
+        ];
+        assert!(detect_campus_ip_from_interfaces(&interfaces).is_none());
+        interfaces.push(("test-campus".into(), "10.0.0.2".parse().unwrap()));
+        assert_eq!(
+            detect_campus_ip_from_interfaces(&interfaces).as_deref(),
+            Some("10.0.0.2")
+        );
+        assert!(detect_campus_ip_from_interfaces(&[]).is_none());
     }
 
     #[tokio::test]
     #[ignore = "manual network test; contacts the campus authentication server"]
     async fn test_check_auth_server() {
-        let ip = detect_campus_ip();
+        let ip = detect_campus_ip_from_interfaces(&crate::core::utils::get_network_interfaces());
         let status = check_auth_server("http://10.0.0.55", ip.as_deref()).await;
         println!("Auth server: {:?}", status);
     }
@@ -581,7 +588,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_auth_status() {
-        let ip = detect_campus_ip();
+        let ip = detect_campus_ip_from_interfaces(&crate::core::utils::get_network_interfaces());
         let status = check_auth_status("http://10.0.0.55", ip.as_deref()).await;
         println!("Auth status: {:?}", status);
     }
@@ -589,7 +596,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_ipv4_reachability() {
-        let ip = detect_campus_ip();
+        let ip = detect_campus_ip_from_interfaces(&crate::core::utils::get_network_interfaces());
         let result = check_ipv4_reachability("http://10.0.0.55", ip.as_deref()).await;
         println!("IPv4 reachability: {:?}", result);
     }
