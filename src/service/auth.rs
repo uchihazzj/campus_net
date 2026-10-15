@@ -573,7 +573,29 @@ pub async fn do_startup_login(state: SharedState, expected: StoredUser, expected
 
 async fn do_one_click_login_inner(state: SharedState) {
     let user_count = {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
+        if s.current_online_info().is_some() {
+            s.add_log(
+                "[INFO] One-click login: an account is already online; keeping the current session"
+                    .into(),
+            );
+            drop(s);
+            crate::service::request_ui_repaint();
+            return;
+        }
+        if !s.definitely_offline()
+            && s.user_statuses
+                .iter()
+                .any(|status| status.state == LoginState::PendingConfirm)
+        {
+            s.add_log(
+                "[INFO] One-click login: waiting for server confirmation; not repeating the login"
+                    .into(),
+            );
+            drop(s);
+            crate::service::request_ui_repaint();
+            return;
+        }
         s.config.users.len()
     };
 
@@ -784,6 +806,60 @@ mod tests {
 
     fn state() -> SharedState {
         Arc::new(Mutex::new(AppState::new(AppConfig::default())))
+    }
+
+    #[tokio::test]
+    async fn one_click_login_preserves_an_existing_online_session() {
+        let state = state();
+        {
+            let mut s = state.lock().unwrap();
+            for name in ["test-first", "test-online"] {
+                s.config.users.push(StoredUser {
+                    username: name.into(),
+                    // Invalid synthetic data guarantees this test cannot send a login.
+                    encrypted_password: "***".into(),
+                    ip: None,
+                    if_name: None,
+                });
+            }
+            s.ensure_statuses();
+            s.user_statuses[1].state = LoginState::Online;
+            s.user_statuses[1].current_ip = "10.0.0.2".into();
+            s.campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+            s.online_info = Some(crate::service::OnlineUserInfo {
+                error: "ok".into(),
+                user_name: "test-online".into(),
+                online_ip: "10.0.0.2".into(),
+                ..Default::default()
+            });
+        }
+        do_one_click_login(state.clone()).await;
+        let s = state.lock().unwrap();
+        assert_eq!(s.user_statuses[0].state, LoginState::LoggedOut);
+        assert_eq!(s.user_statuses[1].state, LoginState::Online);
+        assert!(s.user_statuses[1].last_error.is_empty());
+        assert!(!s.authentication_busy());
+    }
+
+    #[tokio::test]
+    async fn one_click_login_does_not_repeat_a_pending_login() {
+        let state = state();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.users.push(StoredUser {
+                username: "test-pending".into(),
+                encrypted_password: "***".into(),
+                ip: None,
+                if_name: None,
+            });
+            s.ensure_statuses();
+            mark_pending_login(&mut s, 0, "10.0.0.2".into());
+        }
+        do_one_click_login(state.clone()).await;
+        let s = state.lock().unwrap();
+        assert_eq!(s.user_statuses[0].state, LoginState::PendingConfirm);
+        assert!(s.user_statuses[0].last_error.is_empty());
+        assert!(!s.authentication_busy());
     }
 
     #[test]

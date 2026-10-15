@@ -158,7 +158,8 @@ pub async fn check_auth_server(server: &str, campus_ipv4: Option<&str>) -> AuthS
 /// external URL. If the campus gateway redirects to the portal → NotLoggedIn.
 /// If the request succeeds without redirect → LoggedIn.
 /// If the probe fails entirely (DNS, timeout, etc.) → Unknown.
-pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
+/// Without a valid campus IPv4 source, skip the request and return Unknown.
+pub async fn check_auth_status(server: &str, campus_ipv4: Option<&str>) -> CampusAuthStatus {
     let (client, bound) = match crate::service::http_client::build_probe_client(
         Duration::from_secs(2),
         Duration::from_secs(5),
@@ -171,6 +172,11 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
         }
     };
 
+    if !bound {
+        tracing::debug!("[CaptiveProbe] No campus IPv4 binding; skipping auth probe");
+        return CampusAuthStatus::Unknown;
+    }
+
     // Use a well-known HTTP URL. The campus gateway will redirect to the
     // portal if not logged in.
     tracing::debug!(
@@ -181,37 +187,22 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
 
     match client.get("http://www.baidu.com").send().await {
         Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                tracing::debug!("[CaptiveProbe] LoggedIn: status={}", status.as_u16());
-                return CampusAuthStatus::LoggedIn;
-            }
-            if status.is_redirection() {
-                let location = resp
-                    .headers()
+            let auth_status = auth_status_from_probe_response(
+                bound,
+                resp.status(),
+                resp.headers()
                     .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("(missing)");
-                if is_portal_url(location) {
-                    tracing::debug!(
-                        "[CaptiveProbe] NotLoggedIn: portal redirect location={}",
-                        location
-                    );
-                    return CampusAuthStatus::NotLoggedIn;
-                }
-                // Non-portal redirect (e.g., http→https upgrade) → logged in
-                tracing::debug!(
-                    "[CaptiveProbe] LoggedIn (non-portal redirect): status={} location={}",
-                    status.as_u16(),
-                    location
-                );
-                return CampusAuthStatus::LoggedIn;
-            }
-            tracing::info!(
-                "[CaptiveProbe] Unknown: unexpected status={}",
-                status.as_u16()
+                    .and_then(|value| value.to_str().ok()),
+                resp.url(),
+                server,
             );
-            CampusAuthStatus::Unknown
+            tracing::debug!(
+                "[CaptiveProbe] Response status={} auth_status={:?} bound={}",
+                resp.status().as_u16(),
+                auth_status,
+                bound
+            );
+            auth_status
         }
         Err(e) => {
             // Probe failed — NOT "server unreachable"
@@ -226,15 +217,55 @@ pub async fn check_auth_status(campus_ipv4: Option<&str>) -> CampusAuthStatus {
     }
 }
 
-fn is_portal_url(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.contains("srun_portal")
-        || lower.contains("ac_id=")
-        || lower.contains("userip=")
-        || lower.contains("wlanuserip")
-        || lower.contains("redirect")
-        || lower.contains("portal")
-        || lower.contains("login")
+fn auth_status_from_probe_response(
+    bound: bool,
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+    request_url: &reqwest::Url,
+    server: &str,
+) -> CampusAuthStatus {
+    if !bound {
+        return CampusAuthStatus::Unknown;
+    }
+    if status.is_success() {
+        return CampusAuthStatus::LoggedIn;
+    }
+    if status.is_redirection() {
+        if location.is_some_and(|url| is_portal_url(url, request_url, server)) {
+            return CampusAuthStatus::NotLoggedIn;
+        }
+        return CampusAuthStatus::LoggedIn;
+    }
+    CampusAuthStatus::Unknown
+}
+
+fn is_portal_url(location: &str, request_url: &reqwest::Url, server: &str) -> bool {
+    let Ok(target) = request_url.join(location) else {
+        return false;
+    };
+    if !matches!(target.scheme(), "http" | "https") {
+        return false;
+    }
+    let server = crate::core::srun::SrunClient::normalize_server_url(server);
+    if reqwest::Url::parse(&server)
+        .ok()
+        .is_some_and(|auth| auth.host_str().is_some() && auth.host_str() == target.host_str())
+    {
+        return true;
+    }
+
+    // Ordinary websites also use login/redirect/portal. Only Srun-specific
+    // paths or the paired portal parameters establish a campus redirect.
+    target
+        .path()
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case("srun_portal"))
+        || (target
+            .query_pairs()
+            .any(|(key, _)| key.eq_ignore_ascii_case("ac_id"))
+            && target.query_pairs().any(|(key, _)| {
+                key.eq_ignore_ascii_case("userip") || key.eq_ignore_ascii_case("wlanuserip")
+            }))
 }
 
 // ── IPv4 Internet Reachability ─────────────────────────────────────
@@ -272,16 +303,19 @@ static REACHABILITY_CHECKS: &[ReachabilityCheck] = &[
 ///
 /// Strategy:
 /// 1. Bound probe: bind client to campus_ipv4 via local_address.
-/// 2. If bound probe fails, unbound fallback only trusts CaptivePortal
-///    (portal redirect is genuine on any IP version); Reachable is treated
-///    as ProbeFailed to avoid false positives from IPv6.
+/// 2. If bound probe fails, an unbound response cannot establish the campus
+///    IPv4 state: it may travel through TUN, IPv6, or another adapter.
+///    Both success and portal redirects are treated as ProbeFailed.
 ///
 /// Returns `ProbeFailed` if the client can't be built at all.
-pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetStatus {
+pub async fn check_ipv4_reachability(
+    server: &str,
+    campus_ipv4: Option<&str>,
+) -> Ipv4InternetStatus {
     // ── Bound probe ────────────────────────────────────
     if let Some(ip) = campus_ipv4 {
         if let Ok(addr) = ip.parse::<Ipv4Addr>() {
-            let bound_result = run_reachability_probes(Some(addr)).await;
+            let bound_result = run_reachability_probes(server, Some(addr)).await;
             match bound_result {
                 Ipv4InternetStatus::Reachable | Ipv4InternetStatus::CaptivePortal => {
                     return bound_result;
@@ -297,20 +331,18 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
     }
 
     // ── Unbound fallback ───────────────────────────────
-    // Bound probe failed. Try without local_address to see if the network
-    // is completely down or just IPv4-isolated. Only trust CaptivePortal
-    // (portal redirect is genuine on any IP version). Treat Reachable as
-    // ProbeFailed because it may have succeeded via IPv6 — false positive.
+    // Keep the diagnostic fallback, but do not authenticate the campus session
+    // from another route after its source-address binding failed.
     tracing::debug!("[IPv4] Running unbound fallback probe...");
-    let unbound_result = run_reachability_probes(None).await;
+    let unbound_result = run_reachability_probes(server, None).await;
+    unbound_probe_status(unbound_result)
+}
+
+fn unbound_probe_status(unbound_result: Ipv4InternetStatus) -> Ipv4InternetStatus {
     match unbound_result {
-        Ipv4InternetStatus::CaptivePortal => {
-            tracing::debug!("[IPv4] Unbound probe confirms captive portal");
-            Ipv4InternetStatus::CaptivePortal
-        }
-        Ipv4InternetStatus::Reachable => {
+        Ipv4InternetStatus::Reachable | Ipv4InternetStatus::CaptivePortal => {
             tracing::warn!(
-                "[IPv4] Unbound probe succeeded but cannot confirm IPv4 — treating as ProbeFailed"
+                "[IPv4] Unbound response cannot confirm the campus IPv4 state — treating as ProbeFailed"
             );
             Ipv4InternetStatus::ProbeFailed
         }
@@ -319,7 +351,7 @@ pub async fn check_ipv4_reachability(campus_ipv4: Option<&str>) -> Ipv4InternetS
 }
 
 /// Run the full set of reachability checks with an optional local_address binding.
-async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStatus {
+async fn run_reachability_probes(server: &str, local_v4: Option<Ipv4Addr>) -> Ipv4InternetStatus {
     let ip_str = local_v4.map(|a| a.to_string());
     let (client, bound) = match crate::service::http_client::build_probe_client(
         Duration::from_secs(2),
@@ -340,7 +372,7 @@ async fn run_reachability_probes(local_v4: Option<Ipv4Addr>) -> Ipv4InternetStat
     let mut last_error = String::new();
 
     for check in REACHABILITY_CHECKS {
-        match try_single_check(&client, check).await {
+        match try_single_check(&client, check, server).await {
             Ok(()) => {
                 tracing::debug!("[IPv4] Reachable via: {} bound={}", check.url, bound);
                 return Ipv4InternetStatus::Reachable;
@@ -377,6 +409,7 @@ enum CheckError {
 async fn try_single_check(
     client: &reqwest::Client,
     check: &ReachabilityCheck,
+    server: &str,
 ) -> Result<(), CheckError> {
     let resp = client
         .get(check.url)
@@ -396,7 +429,7 @@ async fn try_single_check(
             .get(reqwest::header::LOCATION)
             .and_then(|v| v.to_str().ok())
         {
-            if is_portal_url(location) {
+            if is_portal_url(location, resp.url(), server) {
                 return Err(CheckError::CaptivePortal {
                     url: check.url,
                     location: location.to_string(),
@@ -449,6 +482,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_site_redirects_are_not_campus_portals() {
+        let request = reqwest::Url::parse("http://www.baidu.com").unwrap();
+        for location in [
+            "https://example.com/account/login",
+            "https://example.com/?redirect=/news",
+            "https://portal.example.com/",
+            "https://example.com/?next=http%3A%2F%2F10.0.0.55%2Flogin",
+        ] {
+            assert!(
+                !is_portal_url(location, &request, "http://10.0.0.55"),
+                "ordinary redirect: {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn srun_portal_redirects_are_recognized() {
+        let request = reqwest::Url::parse("http://www.baidu.com").unwrap();
+        for location in [
+            "http://10.0.0.55/index_1.html",
+            "http://10.0.0.56/cgi-bin/srun_portal",
+            "http://10.0.0.56/index_1.html?ac_id=8&userip=10.0.0.2",
+            "/cgi-bin/srun_portal",
+        ] {
+            assert!(
+                is_portal_url(location, &request, "http://10.0.0.55"),
+                "campus redirect: {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbound_routes_cannot_establish_the_campus_ipv4_authentication_state() {
+        for status in [
+            Ipv4InternetStatus::Reachable,
+            Ipv4InternetStatus::CaptivePortal,
+        ] {
+            assert_eq!(
+                unbound_probe_status(status),
+                Ipv4InternetStatus::ProbeFailed
+            );
+        }
+        assert_eq!(
+            unbound_probe_status(Ipv4InternetStatus::Unreachable),
+            Ipv4InternetStatus::Unreachable
+        );
+    }
+
+    #[test]
+    fn probe_results_require_a_bound_campus_source() {
+        let request = reqwest::Url::parse("http://www.baidu.com").unwrap();
+        for (status, location, expected_bound) in [
+            (reqwest::StatusCode::OK, None, CampusAuthStatus::LoggedIn),
+            (
+                reqwest::StatusCode::FOUND,
+                Some("http://10.0.0.55/index_1.html"),
+                CampusAuthStatus::NotLoggedIn,
+            ),
+        ] {
+            assert_eq!(
+                auth_status_from_probe_response(
+                    false,
+                    status,
+                    location,
+                    &request,
+                    "http://10.0.0.55"
+                ),
+                CampusAuthStatus::Unknown
+            );
+            assert_eq!(
+                auth_status_from_probe_response(
+                    true,
+                    status,
+                    location,
+                    &request,
+                    "http://10.0.0.55"
+                ),
+                expected_bound
+            );
+        }
+    }
+
+    #[test]
     fn test_detect_campus_ip() {
         let ip = detect_campus_ip();
         println!("Campus IPv4: {:?}", ip);
@@ -466,7 +582,7 @@ mod tests {
     #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_auth_status() {
         let ip = detect_campus_ip();
-        let status = check_auth_status(ip.as_deref()).await;
+        let status = check_auth_status("http://10.0.0.55", ip.as_deref()).await;
         println!("Auth status: {:?}", status);
     }
 
@@ -474,7 +590,7 @@ mod tests {
     #[ignore = "manual network test; contacts the public internet"]
     async fn test_check_ipv4_reachability() {
         let ip = detect_campus_ip();
-        let result = check_ipv4_reachability(ip.as_deref()).await;
+        let result = check_ipv4_reachability("http://10.0.0.55", ip.as_deref()).await;
         println!("IPv4 reachability: {:?}", result);
     }
 }

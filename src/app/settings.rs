@@ -3,6 +3,13 @@ use crate::platform::autostart;
 use crate::service::Ipv4InternetStatus;
 use crate::ui::l10n::Lang;
 
+fn apply_autostart_edit(s: &mut crate::service::AppState, enabled: bool, edited: bool) {
+    if edited {
+        s.config.auto_start = enabled;
+        s.autostart_busy = true;
+    }
+}
+
 impl CampusNetApp {
     pub(super) fn render_settings(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
@@ -167,10 +174,7 @@ impl CampusNetApp {
                         s.config.language = lang;
                         s.config.auto_reconnect = auto_reconnect;
                         s.config.minimize_to_tray = minimize_to_tray;
-                        s.config.auto_start = auto_start;
-                        if as_changed {
-                            s.autostart_busy = true;
-                        }
+                        apply_autostart_edit(&mut s, auto_start, as_changed);
                         s.config.enable_ipv4_internet_probe = enable_ipv4_internet_probe;
                         if !enable_ipv4_internet_probe {
                             s.ipv4_internet = Ipv4InternetStatus::Disabled;
@@ -222,5 +226,24 @@ impl CampusNetApp {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_settings_do_not_undo_failed_autostart_rollback() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        let old_ui_snapshot = true;
+        s.config.auto_start = false;
+        s.autostart_busy = false;
+        apply_autostart_edit(&mut s, old_ui_snapshot, false);
+        assert!(!s.config.auto_start);
+        assert!(!s.autostart_busy);
+        apply_autostart_edit(&mut s, true, true);
+        assert!(s.config.auto_start);
+        assert!(s.autostart_busy);
     }
 }

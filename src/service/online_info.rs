@@ -51,7 +51,7 @@ pub enum MatchResult {
 /// Match a server-reported `user_name` against locally configured users.
 ///
 /// Rules (in priority order):
-/// 1. Exact string match → `Exact(idx)`.
+/// 1. A unique exact string match → `Exact(idx)`; duplicates → `Ambiguous`.
 /// 2. Server name is a base (no `@`), and exactly one local user has
 ///    `base@something` → `UniqueBase(idx)`.
 /// 3. Server name is a base, multiple locals share it → `Ambiguous(indices)`.
@@ -61,12 +61,21 @@ pub fn match_account(
     local_users: &[crate::service::config::StoredUser],
 ) -> MatchResult {
     let server = server_user.trim();
+    if server.is_empty() {
+        return MatchResult::NoMatch;
+    }
 
     // ── Rule 1: exact match ────────────────────────────
-    for (idx, u) in local_users.iter().enumerate() {
-        if u.username.trim() == server {
-            return MatchResult::Exact(idx);
-        }
+    let exact: Vec<usize> = local_users
+        .iter()
+        .enumerate()
+        .filter(|(_, user)| user.username.trim() == server)
+        .map(|(idx, _)| idx)
+        .collect();
+    match exact.len() {
+        0 => {}
+        1 => return MatchResult::Exact(exact[0]),
+        _ => return MatchResult::Ambiguous(exact),
     }
 
     // ── Rule 2+3: base-name matching ──────────────────
@@ -164,7 +173,8 @@ pub async fn fetch_online_user_info(
 
 fn parse_online_user_info(bytes: &[u8]) -> Result<Option<OnlineUserInfo>, String> {
     let body = crate::core::srun::decode_body(bytes);
-    let json_str = crate::core::jsonp::strip_jsonp(&body)?;
+    let json_str = crate::core::jsonp::strip_jsonp(&body)
+        .map_err(|_| "Invalid rad_user_info JSONP".to_string())?;
 
     let info: OnlineUserInfo =
         serde_json::from_str(json_str).map_err(|_| "Invalid rad_user_info JSON".to_string())?;
@@ -296,10 +306,138 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     None
 }
 
-/// Called at startup and periodically by the monitor.
+pub(crate) fn status_query_ip_from_interfaces(
+    s: &crate::service::AppState,
+    interfaces: &[(String, std::net::IpAddr)],
+) -> Option<String> {
+    let previous = best_status_query_ip(s);
+    let is_local = |ip: &str| {
+        ip.parse::<std::net::Ipv4Addr>().is_ok_and(|addr| {
+            interfaces
+                .iter()
+                .any(|(_, local)| *local == std::net::IpAddr::V4(addr))
+        })
+    };
+    if interfaces.is_empty() {
+        return previous;
+    }
+
+    // Respect an active account's interface binding even if its former IP has
+    // moved to another adapter. Do not change the displayed IP before confirmation.
+    for state in [LoginState::Online, LoginState::PendingConfirm] {
+        for (idx, status) in s.user_statuses.iter().enumerate() {
+            if status.state == state {
+                if let Some(name) = s
+                    .config
+                    .users
+                    .get(idx)
+                    .and_then(|user| user.if_name.as_deref())
+                {
+                    if let Some(ip) = crate::core::utils::ipv4_by_if_name_preferring(
+                        name,
+                        interfaces,
+                        Some(&status.current_ip),
+                    ) {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+    }
+    // A previously active account keeps its binding after offline confirmation.
+    for &idx in &s.reconnect_targets {
+        if let Some(name) = s
+            .config
+            .users
+            .get(idx)
+            .and_then(|user| user.if_name.as_deref())
+        {
+            let preferred = s
+                .user_statuses
+                .get(idx)
+                .map(|status| status.current_ip.as_str())
+                .filter(|ip| !ip.is_empty())
+                .or(previous.as_deref());
+            if let Some(ip) =
+                crate::core::utils::ipv4_by_if_name_preferring(name, interfaces, preferred)
+            {
+                return Some(ip);
+            }
+        }
+    }
+    // Before the first login, query through the same account binding that the
+    // startup one-click login will try, rather than an unrelated global adapter.
+    if s.reconnect_targets.is_empty()
+        && !s.user_statuses.iter().any(|status| {
+            matches!(
+                status.state,
+                LoginState::Online | LoginState::PendingConfirm
+            )
+        })
+    {
+        if let Some(user) = s.config.users.first() {
+            if let Some(ip) = user
+                .if_name
+                .as_deref()
+                .and_then(|name| crate::core::utils::ipv4_by_if_name(name, interfaces))
+            {
+                return Some(ip);
+            }
+            if let Some(ip) = user_ip::configured_static_ip(user).filter(|ip| is_local(ip)) {
+                return Some(ip);
+            }
+        }
+    }
+    if previous.as_deref().is_some_and(is_local) {
+        return previous;
+    }
+    if let Some(ip) = s.campus_ip.as_deref().filter(|ip| is_local(ip)) {
+        return Some(ip.into());
+    }
+    crate::service::detection::campus_ip_candidates_from_interfaces(interfaces)
+        .first()
+        .map(|(_, ip)| ip.clone())
+        .or(previous)
+}
+
+/// Preserve the active account before the authoritative offline result demotes it.
+fn apply_server_offline(s: &mut crate::service::AppState) {
+    let active: Vec<usize> = s
+        .user_statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, status)| {
+            matches!(
+                status.state,
+                LoginState::Online | LoginState::PendingConfirm
+            )
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if !active.is_empty() {
+        s.reconnect_targets = active;
+    }
+    s.auth_server = AuthServerStatus::Reachable;
+    s.campus_auth = CampusAuthStatus::NotLoggedIn;
+    s.online_info = None;
+    s.online_info_fail_count = 0;
+    s.online_info_stale = false;
+    for status in &mut s.user_statuses {
+        if matches!(
+            status.state,
+            LoginState::Online | LoginState::PendingConfirm
+        ) {
+            status.state = LoginState::Error;
+            status.last_error = "Server reports no user logged in".into();
+        }
+    }
+}
+
 struct StatusQuery {
     server: String,
     ip: Option<String>,
+    context_ip: Option<String>,
+    campus_ip: Option<String>,
     auth_generation: u64,
     query_generation: u64,
 }
@@ -314,6 +452,8 @@ impl StatusQuery {
         Some(Self {
             server: s.config.server.clone(),
             ip: best_status_query_ip(s),
+            context_ip: best_status_query_ip(s),
+            campus_ip: s.campus_ip.clone(),
             auth_generation: s.auth_generation,
             query_generation: s.online_query_generation,
         })
@@ -324,7 +464,8 @@ impl StatusQuery {
             && self.auth_generation == s.auth_generation
             && self.query_generation == s.online_query_generation
             && self.server == s.config.server
-            && self.ip == best_status_query_ip(s)
+            && self.campus_ip == s.campus_ip
+            && self.context_ip == best_status_query_ip(s)
     }
 
     fn finish(&self, s: &mut crate::service::AppState) {
@@ -349,11 +490,20 @@ impl Drop for StatusQueryGuard {
 }
 
 pub async fn sync_online_state(state: &SharedState) {
+    {
+        let s = state.lock().unwrap();
+        if s.authentication_busy() || s.online_query_busy {
+            return;
+        }
+    }
+    // Enumerate outside AppState locks; DHCP can invalidate a last-seen session IP.
+    let interfaces = crate::core::utils::get_network_interfaces();
     let query = {
         let mut s = state.lock().unwrap();
-        let Some(query) = StatusQuery::begin(&mut s) else {
+        let Some(mut query) = StatusQuery::begin(&mut s) else {
             return;
         };
+        query.ip = status_query_ip_from_interfaces(&s, &interfaces);
         query
     };
     let guard = StatusQueryGuard {
@@ -428,19 +578,7 @@ pub async fn sync_online_state(state: &SharedState) {
             if !query.is_current(&s) {
                 return;
             }
-            s.auth_server = AuthServerStatus::Reachable;
-            s.campus_auth = CampusAuthStatus::NotLoggedIn;
-            s.online_info = None;
-            s.online_info_fail_count = 0;
-            s.online_info_stale = false;
-
-            // Invalidate users that were marked Online or PendingConfirm
-            for us in &mut s.user_statuses {
-                if us.state == LoginState::Online || us.state == LoginState::PendingConfirm {
-                    us.state = LoginState::Error;
-                    us.last_error = "Server reports no user logged in".to_string();
-                }
-            }
+            apply_server_offline(&mut s);
             s.add_log("[INFO] Auth server reachable, no user logged in".to_string());
             drop(s);
             crate::service::request_ui_repaint();
@@ -489,7 +627,7 @@ pub async fn sync_online_state(state: &SharedState) {
                 }
                 if reachable {
                     if probe_enabled {
-                        let auth_status = check_auth_status(query_ip.as_deref()).await;
+                        let auth_status = check_auth_status(server, query_ip.as_deref()).await;
                         let mut s = state.lock().unwrap();
                         if !query.is_current(&s) || !s.config.enable_ipv4_internet_probe {
                             return;
@@ -609,6 +747,175 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_disconnect_keeps_the_previous_account_first_for_reconnect() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        s.config.users = vec![make_user("test-first"), make_user("test-active")];
+        s.ensure_statuses();
+        s.user_statuses[1].state = LoginState::Online;
+        apply_server_offline(&mut s);
+        assert_eq!(s.reconnect_targets, vec![1]);
+        assert_eq!(s.user_statuses[1].state, LoginState::Error);
+        assert!(crate::service::monitor::reconnect_needed(&s, true));
+        apply_server_offline(&mut s);
+        assert_eq!(s.reconnect_targets, vec![1]);
+        s.suppress_auto_reconnect = true;
+        assert!(!crate::service::monitor::reconnect_needed(&s, true));
+    }
+
+    #[test]
+    fn cold_start_queries_follow_the_account_binding_before_the_global_ip() {
+        let interfaces = vec![
+            ("test-other".into(), "10.0.0.99".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.3".parse().unwrap()),
+            ("test-tun".into(), "198.18.0.1".parse().unwrap()),
+        ];
+        for bound in [true, false] {
+            let mut s = make_app_state();
+            let mut user = make_user("test-startup-user");
+            user.if_name = bound.then(|| "test-campus".into());
+            user.ip = Some(if bound { "10.0.0.99" } else { "10.0.0.3" }.into());
+            s.config.users.push(user);
+            s.ensure_statuses();
+            s.campus_ip = Some("10.0.0.99".into());
+            assert_eq!(s.user_statuses[0].state, LoginState::LoggedOut);
+            assert!(s.reconnect_targets.is_empty());
+            assert_eq!(
+                status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+                Some("10.0.0.3")
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_dhcp_address_does_not_leave_status_queries_bound_to_the_old_ip() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        let mut user = make_user("test-dhcp-user");
+        user.if_name = Some("test-campus".into());
+        s.config.users.push(user);
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.2".into();
+        s.campus_ip = Some("10.0.0.99".into());
+        let interfaces = vec![
+            ("test-other".into(), "10.0.0.99".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.3".parse().unwrap()),
+        ];
+        assert_eq!(
+            status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+            Some("10.0.0.3")
+        );
+        let mut query = StatusQuery::begin(&mut s).unwrap();
+        query.ip = status_query_ip_from_interfaces(&s, &interfaces);
+        assert!(query.is_current(&s));
+        assert_eq!(s.user_statuses[0].current_ip, "10.0.0.2");
+        s.invalidate_auth_context();
+        assert!(!query.is_current(&s));
+    }
+
+    #[test]
+    fn status_queries_keep_a_valid_session_ip_and_do_not_guess_without_interfaces() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        s.config.users.push(make_user("test-user"));
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.2".into();
+        s.campus_ip = Some("10.0.0.3".into());
+        let interfaces = vec![("test-campus".into(), "10.0.0.2".parse().unwrap())];
+        assert_eq!(
+            status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+            Some("10.0.0.2")
+        );
+        assert_eq!(
+            status_query_ip_from_interfaces(&s, &[]).as_deref(),
+            Some("10.0.0.2")
+        );
+    }
+
+    #[test]
+    fn a_bound_account_follows_its_interface_when_the_old_ip_moves_to_another_adapter() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        let mut user = make_user("test-bound-user");
+        user.if_name = Some("test-campus".into());
+        s.config.users.push(user);
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.2".into();
+        let interfaces = vec![
+            ("test-other".into(), "10.0.0.2".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.3".parse().unwrap()),
+        ];
+        assert_eq!(
+            status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+            Some("10.0.0.3")
+        );
+    }
+
+    #[test]
+    fn a_reconnect_target_follows_its_interface_after_the_old_ip_moves() {
+        let mut s = crate::service::AppState::new(crate::service::config::AppConfig::default());
+        let mut user = make_user("test-bound-user");
+        user.if_name = Some("test-campus".into());
+        user.ip = Some("10.0.0.2".into());
+        s.config.users.push(user);
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.2".into();
+        apply_server_offline(&mut s);
+        assert_eq!(s.user_statuses[0].state, LoginState::Error);
+        let interfaces = vec![
+            ("test-other".into(), "10.0.0.2".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.3".parse().unwrap()),
+        ];
+        assert_eq!(
+            status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+            Some("10.0.0.3")
+        );
+    }
+
+    #[test]
+    fn bound_queries_preserve_the_session_ip_on_a_multi_address_interface() {
+        let interfaces = vec![
+            ("test-campus".into(), "10.0.0.3".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.2".parse().unwrap()),
+        ];
+        for binding in ["test-campus", "campus"] {
+            for state in [LoginState::Online, LoginState::PendingConfirm] {
+                let mut s =
+                    crate::service::AppState::new(crate::service::config::AppConfig::default());
+                let mut user = make_user("test-bound-user");
+                user.if_name = Some(binding.into());
+                user.ip = Some("10.0.0.99".into());
+                s.config.users.push(user);
+                s.ensure_statuses();
+                s.user_statuses[0].state = state;
+                s.user_statuses[0].current_ip = "10.0.0.2".into();
+                assert_eq!(
+                    status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+                    Some("10.0.0.2")
+                );
+                apply_server_offline(&mut s);
+                assert_eq!(
+                    status_query_ip_from_interfaces(&s, &interfaces).as_deref(),
+                    Some("10.0.0.2")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_exact_names_are_ambiguous_instead_of_confirming_the_first_user() {
+        let users = vec![make_user("test-user"), make_user(" test-user ")];
+        let result = match_account("test-user", &users);
+        assert_eq!(result, MatchResult::Ambiguous(vec![0, 1]));
+        let info = OnlineUserInfo {
+            error: "ok".into(),
+            user_name: "test-user".into(),
+            ..Default::default()
+        };
+        assert_eq!(confirmed_online_user_idx(Some(&info), &users), None);
+    }
+
+    #[test]
     fn malformed_status_is_unknown_instead_of_offline() {
         for body in [r#"{}"#, r#"{"error":"ip_error"}"#, r#"{"error":"ok"}"#] {
             let response = format!("sdu({body})");
@@ -616,6 +923,17 @@ mod tests {
                 parse_online_user_info(response.as_bytes()).is_err(),
                 "misclassified response: {body}"
             );
+        }
+    }
+
+    #[test]
+    fn malformed_status_diagnostics_do_not_include_response_payloads() {
+        for body in [
+            "test-sensitive-sentinel",
+            "sdu({\"private\":\"test-sensitive-sentinel\"}",
+        ] {
+            let error = parse_online_user_info(body.as_bytes()).unwrap_err();
+            assert!(!error.contains("test-sensitive-sentinel"));
         }
     }
 

@@ -9,6 +9,28 @@ const STEADY_RETRY_SECS: u64 = 1800; // 30 min
 const DAILY_INTERVAL_SECS: u64 = 86400; // 24 h
 const SCHEDULER_CRASH_RESTART_SECS: u64 = 60;
 
+fn next_fail_count(fail_count: usize, checked: bool, status: &UpdateStatus) -> usize {
+    if !checked && update_busy(status) {
+        // An overlapping manual check/download has not produced a new result.
+        fail_count
+    } else if matches!(status, UpdateStatus::Failed(_)) {
+        fail_count.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn check_delay_secs(fail_count: usize) -> u64 {
+    if fail_count == 0 {
+        DAILY_INTERVAL_SECS
+    } else {
+        RETRY_DELAYS_SECS
+            .get(fail_count - 1)
+            .copied()
+            .unwrap_or(STEADY_RETRY_SECS)
+    }
+}
+
 /// Returns true when the update system is busy (checking/downloading/etc.).
 pub fn update_busy(status: &UpdateStatus) -> bool {
     matches!(
@@ -46,7 +68,7 @@ pub async fn check_update_claimed(state: &SharedState) -> Result<(), String> {
     if s.update_status != UpdateStatus::Checking {
         return Err("Update check no longer owns its state".to_string());
     }
-    match result {
+    let outcome = match result {
         Ok(Some((latest, release_url, download_url))) => {
             s.add_log(format!("[INFO] New version available: {}", latest));
             s.update_status = UpdateStatus::Available {
@@ -54,54 +76,39 @@ pub async fn check_update_claimed(state: &SharedState) -> Result<(), String> {
                 release_url,
                 download_url,
             };
-            crate::service::request_ui_repaint();
             Ok(())
         }
         Ok(None) => {
             s.update_status = UpdateStatus::UpToDate;
-            crate::service::request_ui_repaint();
             Ok(())
         }
         Err(e) => {
             s.add_log(format!("[WARN] Update check failed: {}", e));
             s.update_status = UpdateStatus::Failed(e.clone());
-            crate::service::request_ui_repaint();
             Err(e)
         }
-    }
+    };
+    drop(s);
+    crate::service::request_ui_repaint();
+    outcome
 }
 
 /// Run the scheduler loop body. Each call performs one check cycle.
-/// Returns Ok when a check was performed, Err if skipped or failed.
+/// Returns true after a claimed check, including failure, and false if skipped.
 async fn run_scheduler_cycle(state: &SharedState) -> bool {
-    // Determine if we should check now
-    let should_check = {
-        let s = state.lock().unwrap();
+    {
+        // Decide and claim together: a manual check cannot take ownership
+        // between the busy check and starting the scheduled request.
+        let mut s = state.lock().unwrap();
         if update_busy(&s.update_status)
             || matches!(s.update_status, UpdateStatus::Available { .. })
         {
-            false
-        } else if matches!(s.update_status, UpdateStatus::Failed(_)) {
-            true
-        } else {
-            // No state tracking for daily check time — just always check
-            // if not busy and not failed. The sleep between cycles provides
-            // the throttling.
-            true
+            return false;
         }
-    };
-
-    if !should_check {
-        return false;
+        s.update_status = UpdateStatus::Checking;
     }
-
-    match check_update_once(state).await {
-        Ok(()) => true,
-        Err(_e) => {
-            // On failure, increase the delay before next attempt
-            true
-        }
-    }
+    let _ = check_update_claimed(state).await;
+    true
 }
 
 pub fn spawn_update_scheduler(state: SharedState) {
@@ -117,15 +124,7 @@ pub fn spawn_update_scheduler(state: SharedState) {
         // ── Background loop ──────────────────────────────
         loop {
             // Compute sleep duration based on last result
-            let sleep_secs = if fail_count > 0 {
-                if fail_count <= RETRY_DELAYS_SECS.len() {
-                    RETRY_DELAYS_SECS[fail_count - 1]
-                } else {
-                    STEADY_RETRY_SECS
-                }
-            } else {
-                DAILY_INTERVAL_SECS
-            };
+            let sleep_secs = check_delay_secs(fail_count);
 
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
 
@@ -133,11 +132,8 @@ pub fn spawn_update_scheduler(state: SharedState) {
             let cycle_state = state.clone();
             let handle = tokio::spawn(async move { run_scheduler_cycle(&cycle_state).await });
 
-            match handle.await {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Skipped (busy), keep current fail_count
-                }
+            let checked = match handle.await {
+                Ok(checked) => checked,
                 Err(e) if e.is_panic() => {
                     tracing::error!(
                         "[UpdateScheduler] cycle panicked: {}, restarting in {}s",
@@ -165,20 +161,12 @@ pub fn spawn_update_scheduler(state: SharedState) {
                     tracing::info!("[UpdateScheduler] task cancelled, exiting");
                     break;
                 }
-            }
+            };
 
             // Update fail_count after the result
             {
                 let s = state.lock().unwrap();
-                if matches!(s.update_status, UpdateStatus::Failed(_)) {
-                    if fail_count == 0 {
-                        fail_count = 1;
-                    } else {
-                        fail_count += 1;
-                    }
-                } else {
-                    fail_count = 0;
-                }
+                fail_count = next_fail_count(fail_count, checked, &s.update_status);
             }
         }
     });
@@ -187,6 +175,45 @@ pub fn spawn_update_scheduler(state: SharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_manual_claim_keeps_the_scheduled_check_skipped_and_the_retry_short() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::service::AppState::new(
+            crate::service::config::AppConfig::default(),
+        )));
+        assert!(try_begin_update_check(&state));
+        // The claimed check is deliberately not run: this test cannot make an HTTP request.
+        let checked = run_scheduler_cycle(&state).await;
+        assert!(!checked);
+        assert_eq!(
+            check_delay_secs(next_fail_count(
+                1,
+                checked,
+                &state.lock().unwrap().update_status
+            )),
+            60
+        );
+    }
+
+    #[test]
+    fn a_busy_manual_check_does_not_delay_failed_startup_retries_for_a_day() {
+        let failed = UpdateStatus::Failed("synthetic failure".into());
+        let after_startup = next_fail_count(0, true, &failed);
+        assert_eq!(check_delay_secs(after_startup), 60);
+        let after_busy = next_fail_count(after_startup, false, &UpdateStatus::Checking);
+        assert_eq!(check_delay_secs(after_busy), 60);
+        let after_retry_failure = next_fail_count(after_busy, true, &failed);
+        assert_eq!(check_delay_secs(after_retry_failure), 300);
+        let available = UpdateStatus::Available {
+            latest: "v99.0.0".into(),
+            release_url: String::new(),
+            download_url: String::new(),
+        };
+        assert_eq!(
+            check_delay_secs(next_fail_count(after_retry_failure, false, &available)),
+            86400
+        );
+    }
 
     #[test]
     fn check_claim_is_exclusive_and_preserves_downloads() {

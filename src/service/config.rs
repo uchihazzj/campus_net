@@ -1,7 +1,10 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +13,7 @@ use crate::platform::secure_store;
 use crate::ui::l10n::Lang;
 
 static CONFIG_IO_LOCK: Mutex<()> = Mutex::new(());
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredUser {
@@ -142,16 +146,32 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{}.{}", name, suffix))
 }
 
-fn config_tmp_path(path: &Path) -> PathBuf {
-    sibling_path(path, "tmp")
-}
-
 fn config_backup_path(path: &Path) -> PathBuf {
     sibling_path(path, "bak")
 }
 
-fn config_backup_tmp_path(path: &Path) -> PathBuf {
-    sibling_path(path, "bak.tmp")
+/// Each save owns its files even when another client process is saving too.
+struct ConfigTempFile(PathBuf);
+
+impl Drop for ConfigTempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn create_config_temp(path: &Path, suffix: &str) -> std::io::Result<(ConfigTempFile, File)> {
+    loop {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = sibling_path(
+            path,
+            &format!("{}-{}-{}", suffix, std::process::id(), sequence),
+        );
+        match OpenOptions::new().create_new(true).write(true).open(&tmp) {
+            Ok(file) => return Ok((ConfigTempFile(tmp), file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -167,10 +187,14 @@ fn damaged_config_backup_path(path: &Path) -> PathBuf {
 
 fn parse_config_file(path: &Path) -> Result<AppConfig, ConfigReadFailure> {
     match std::fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).map_err(ConfigReadFailure::Parse),
+        Ok(content) => parse_config_text(&content).map_err(ConfigReadFailure::Parse),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ConfigReadFailure::NotFound),
         Err(e) => Err(ConfigReadFailure::Io(e)),
     }
+}
+
+fn parse_config_text(content: &str) -> Result<AppConfig, serde_json::Error> {
+    serde_json::from_str(content.strip_prefix('\u{feff}').unwrap_or(content))
 }
 
 fn fill_required_defaults(config: &mut AppConfig) -> bool {
@@ -215,34 +239,26 @@ fn atomic_write_config_unlocked(
         std::fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = config_tmp_path(path);
     let backup_path = config_backup_path(path);
-    let backup_tmp_path = config_backup_tmp_path(path);
+    let (tmp, mut file) = create_config_temp(path, "tmp")?;
+    file.write_all(content.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
 
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        file.write_all(content.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+    if keep_backup {
+        if let Ok(previous) = std::fs::read_to_string(path) {
+            if parse_config_text(&previous).is_ok() {
+                let (backup_tmp, mut backup_file) = create_config_temp(path, "bak.tmp")?;
+                backup_file.write_all(previous.as_bytes())?;
+                backup_file.sync_all()?;
+                drop(backup_file);
+                std::fs::rename(&backup_tmp.0, &backup_path)?;
+            }
+        }
     }
 
-    if keep_backup && path.exists() && parse_config_file(path).is_ok() {
-        if backup_tmp_path.exists() {
-            let _ = std::fs::remove_file(&backup_tmp_path);
-        }
-        std::fs::copy(path, &backup_tmp_path)?;
-        {
-            let backup_file = OpenOptions::new().write(true).open(&backup_tmp_path)?;
-            backup_file.sync_all()?;
-        }
-        std::fs::rename(&backup_tmp_path, &backup_path)?;
-    }
-
-    std::fs::rename(&tmp_path, path)?;
+    std::fs::rename(&tmp.0, path)?;
     Ok(())
 }
 
@@ -376,6 +392,7 @@ pub fn schedule_config_save(state: crate::service::SharedState) {
         tracing::error!("Failed to save config: {}", error);
         let mut s = state.lock().unwrap();
         s.add_log(format!("[ERROR] Failed to save config: {}", error));
+        drop(s);
         crate::service::request_ui_repaint();
     });
 }
@@ -389,6 +406,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn saving_config_does_not_overwrite_another_writers_temporary_files() {
+        let dir = temp_dir("foreign_temporary_files");
+        let path = dir.join("config.json");
+        let original = AppConfig::default();
+        std::fs::write(&path, serde_json::to_string(&original).unwrap()).unwrap();
+        let foreign_tmp = dir.join("config.json.tmp");
+        let foreign_backup_tmp = dir.join("config.json.bak.tmp");
+        std::fs::write(&foreign_tmp, "another writer's incomplete config").unwrap();
+        std::fs::write(&foreign_backup_tmp, "another writer's incomplete backup").unwrap();
+
+        let replacement = AppConfig {
+            acid: 42,
+            ..original.clone()
+        };
+        write_config(&path, &replacement).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&foreign_tmp).unwrap(),
+            "another writer's incomplete config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&foreign_backup_tmp).unwrap(),
+            "another writer's incomplete backup"
+        );
+        assert_eq!(parse_config_file(&path).ok().unwrap().acid, 42);
+        assert_eq!(
+            parse_config_file(&config_backup_path(&path))
+                .ok()
+                .unwrap()
+                .acid,
+            original.acid
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf8_bom_config_keeps_its_accounts_and_settings() {
+        let dir = temp_dir("utf8_bom");
+        let path = dir.join("config.json");
+        let config = AppConfig {
+            acid: 42,
+            users: vec![StoredUser {
+                username: "test-bom-user".into(),
+                encrypted_password: String::new(),
+                ip: None,
+                if_name: None,
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            &path,
+            format!("\u{feff}{}", serde_json::to_string(&config).unwrap()),
+        )
+        .unwrap();
+        let report = read_config_with_report(&path).unwrap();
+        assert_eq!(report.source, ConfigLoadSource::Main);
+        assert_eq!(report.config.acid, 42);
+        assert_eq!(report.config.users, config.users);
+        assert!(report.messages.is_empty());
+        let replacement = AppConfig {
+            acid: 43,
+            ..config.clone()
+        };
+        write_config(&path, &replacement).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let recovered = read_config_with_report(&path).unwrap();
+        assert_eq!(recovered.source, ConfigLoadSource::Backup);
+        assert_eq!(recovered.config.acid, 42);
+        assert_eq!(recovered.config.users, config.users);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_config_replacement_cleans_only_its_owned_temporary_files() {
+        let dir = temp_dir("failed_replace_cleanup");
+        let path = dir.join("config.json");
+        std::fs::create_dir(&path).unwrap();
+        let foreign = dir.join("other-process.tmp");
+        std::fs::write(&foreign, "untouched").unwrap();
+        assert!(write_config(&path, &AppConfig::default()).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read_to_string(foreign).unwrap(), "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn isolated_config_writer_process() {
+        // Only the parent test supplies this path; the test harness never runs main().
+        let Some(path) = std::env::var_os("CNET_TEST_MULTIWRITER_CONFIG_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let dir = path.parent().unwrap();
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("cnet_config_multiprocess_"));
+        assert!(dir
+            .canonicalize()
+            .unwrap()
+            .starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        let id: i32 = std::env::var("CNET_TEST_MULTIWRITER_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        std::fs::write(dir.join(format!("ready-{}", id)), "ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dir.join("start").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not start the isolated writers"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let config = AppConfig {
+            acid: id,
+            name: format!("test-writer-{}", id).repeat(4096),
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            write_config(&path, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn simultaneous_processes_save_complete_configs_and_backups() {
+        let dir = temp_dir("multiprocess");
+        let path = dir.join("config.json");
+        write_config(&path, &AppConfig::default()).unwrap();
+        let test_exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for id in [41, 42] {
+            let child = std::process::Command::new(&test_exe)
+                .args([
+                    "--exact",
+                    "service::config::tests::isolated_config_writer_process",
+                    "--test-threads=1",
+                ])
+                .env("CNET_TEST_MULTIWRITER_CONFIG_PATH", &path)
+                .env("CNET_TEST_MULTIWRITER_ID", id.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            children.push(child);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(dir.join("ready-41").exists() && dir.join("ready-42").exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated writers did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::write(dir.join("start"), "start").unwrap();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated writer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for saved in [&path, &config_backup_path(&path)] {
+            let config = parse_config_file(saved)
+                .ok()
+                .expect("saved JSON must be complete");
+            assert!([41, 42].contains(&config.acid));
+            assert_eq!(
+                config.name,
+                format!("test-writer-{}", config.acid).repeat(4096)
+            );
+        }
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -412,7 +613,7 @@ mod tests {
         let dir = temp_dir("defaults_save_failure");
         let path = dir.join("config.json");
         std::fs::write(&path, r#"{"server":"","acid":42,"users":[]}"#).unwrap();
-        std::fs::create_dir(dir.join("config.json.tmp")).unwrap();
+        std::fs::create_dir(dir.join("config.json.bak")).unwrap();
         let report = read_config_with_report(&path).unwrap();
         assert_eq!(report.config.acid, 42);
         assert_eq!(report.source, ConfigLoadSource::Main);

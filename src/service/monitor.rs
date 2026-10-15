@@ -96,6 +96,16 @@ fn evaluate_reconnect(s: &crate::service::AppState, has_usable_ip: bool) -> Reco
     ReconnectDecision::Wait
 }
 
+fn ipv4_probe_ip(
+    s: &crate::service::AppState,
+    interfaces: &[(String, std::net::IpAddr)],
+) -> Option<String> {
+    // Preserve the existing skip when no global campus IPv4 was detected.
+    // Otherwise diagnose the account's actual adapter, as rad_user_info does.
+    s.campus_ip.as_ref()?;
+    crate::service::online_info::status_query_ip_from_interfaces(s, interfaces)
+}
+
 fn apply_ipv4_probe(
     s: &mut crate::service::AppState,
     status: Ipv4InternetStatus,
@@ -116,10 +126,8 @@ fn apply_ipv4_probe(
         Ipv4InternetStatus::Reachable => {
             s.internet_fail_count = 0;
             s.ipv4_internet = Ipv4InternetStatus::Reachable;
-            if !s.reconnect_targets.is_empty() {
-                s.add_log("[INFO] IPv4 internet restored, clearing reconnect targets".to_string());
-                s.reconnect_targets.clear();
-            }
+            // TUN/proxy connectivity does not confirm campus authentication.
+            // Only the authoritative Healthy branch may clear reconnect targets.
         }
         _ => {
             s.internet_fail_count = s.internet_fail_count.saturating_add(1);
@@ -185,24 +193,35 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
         drop(s);
         crate::service::request_ui_repaint();
     }
-    let ip = campus_ipv4.as_deref();
-
     // ── Layer 2+3: Auth Server + Auth Status ─────
     sync_online_state(state).await;
 
     // ── Layer 4: IPv4 Internet (conditional) ─────
-    let (probe_enabled, probe_auth_generation, probe_query_generation) = {
+    let (
+        probe_enabled,
+        probe_auth_generation,
+        probe_query_generation,
+        probe_server,
+        probe_campus_ip,
+    ) = {
         let s = state.lock().unwrap();
         (
             s.config.enable_ipv4_internet_probe,
             s.auth_generation,
             s.online_query_generation,
+            s.config.server.clone(),
+            s.campus_ip.clone(),
         )
     };
 
     if probe_enabled {
-        if let Some(bind_ip) = ip {
-            let ipv4_status = check_ipv4_reachability(Some(bind_ip)).await;
+        let interfaces = crate::core::utils::get_network_interfaces();
+        let probe_ip = {
+            let s = state.lock().unwrap();
+            ipv4_probe_ip(&s, &interfaces)
+        };
+        if let Some(bind_ip) = probe_ip.as_deref() {
+            let ipv4_status = check_ipv4_reachability(&probe_server, Some(bind_ip)).await;
             {
                 let mut s = state.lock().unwrap();
                 if !s.config.enable_ipv4_internet_probe {
@@ -216,7 +235,7 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
                     ipv4_status,
                     probe_auth_generation,
                     probe_query_generation,
-                    &campus_ipv4,
+                    &probe_campus_ip,
                 ) {
                     return interval;
                 }
@@ -452,6 +471,135 @@ mod tests {
 
     fn make_state() -> AppState {
         AppState::new(AppConfig::default())
+    }
+
+    #[test]
+    fn tun_internet_success_does_not_erase_the_offline_accounts_reconnect_target() {
+        let mut s = make_state();
+        s.config.enable_ipv4_internet_probe = true;
+        s.campus_ip = Some("10.0.0.2".into());
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        s.config.users = ["test-first", "test-previous-online"]
+            .into_iter()
+            .map(|name| StoredUser {
+                username: name.into(),
+                encrypted_password: String::new(),
+                ip: None,
+                if_name: None,
+            })
+            .collect();
+        s.ensure_statuses();
+        s.user_statuses[1].state = LoginState::Error;
+        s.reconnect_targets = vec![1];
+        let auth_generation = s.auth_generation;
+        let query_generation = s.online_query_generation;
+        let campus_ip = s.campus_ip.clone();
+        assert!(apply_ipv4_probe(
+            &mut s,
+            Ipv4InternetStatus::Reachable,
+            auth_generation,
+            query_generation,
+            &campus_ip,
+        ));
+        assert_eq!(s.campus_auth, CampusAuthStatus::NotLoggedIn);
+        assert_eq!(s.reconnect_targets, vec![1]);
+        assert!(reconnect_needed(&s, true));
+        s.suppress_auto_reconnect = true;
+        assert!(!reconnect_needed(&s, true));
+    }
+
+    #[test]
+    fn optional_probe_follows_the_account_interface_instead_of_the_global_ip() {
+        let mut s = make_state();
+        s.campus_ip = Some("10.0.0.99".into());
+        s.config.users.push(StoredUser {
+            username: "test-bound-user".into(),
+            encrypted_password: String::new(),
+            ip: None,
+            if_name: Some("test-campus".into()),
+        });
+        s.ensure_statuses();
+        s.user_statuses[0].state = LoginState::Online;
+        s.user_statuses[0].current_ip = "10.0.0.2".into();
+        let interfaces = vec![
+            ("test-other".into(), "10.0.0.99".parse().unwrap()),
+            ("test-campus".into(), "10.0.0.2".parse().unwrap()),
+        ];
+        assert_eq!(ipv4_probe_ip(&s, &interfaces).as_deref(), Some("10.0.0.2"));
+        s.user_statuses[0].state = LoginState::Error;
+        s.reconnect_targets = vec![0];
+        assert_eq!(ipv4_probe_ip(&s, &interfaces).as_deref(), Some("10.0.0.2"));
+        s.campus_ip = None;
+        assert!(ipv4_probe_ip(&s, &interfaces).is_none());
+    }
+
+    #[test]
+    fn uncertain_or_tun_affected_diagnostics_do_not_override_authoritative_state() {
+        for (auth, failures, enabled, internet) in [
+            (
+                CampusAuthStatus::LoggedIn,
+                0,
+                true,
+                Ipv4InternetStatus::Unreachable,
+            ),
+            (
+                CampusAuthStatus::LoggedIn,
+                0,
+                true,
+                Ipv4InternetStatus::CaptivePortal,
+            ),
+            (
+                CampusAuthStatus::Unknown,
+                2,
+                true,
+                Ipv4InternetStatus::CaptivePortal,
+            ),
+            (
+                CampusAuthStatus::Unknown,
+                3,
+                false,
+                Ipv4InternetStatus::CaptivePortal,
+            ),
+            (
+                CampusAuthStatus::Unknown,
+                3,
+                true,
+                Ipv4InternetStatus::ProbeFailed,
+            ),
+        ] {
+            let mut s = make_state();
+            s.campus_ip = Some("10.0.0.2".into());
+            s.campus_auth = auth;
+            s.online_info_fail_count = failures;
+            s.config.enable_ipv4_internet_probe = enabled;
+            s.ipv4_internet = internet;
+            assert!(!reconnect_needed(&s, true));
+        }
+    }
+
+    #[test]
+    fn turning_off_probes_rejects_cached_fallback_authentication_state() {
+        let mut s = make_state();
+        s.campus_ip = Some("10.0.0.2".into());
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        s.online_info_fail_count = 3;
+        s.config.enable_ipv4_internet_probe = true;
+        s.ipv4_internet = Ipv4InternetStatus::CaptivePortal;
+        assert!(reconnect_needed(&s, true));
+        s.config.enable_ipv4_internet_probe = false;
+        assert!(!s.definitely_offline());
+        assert!(!reconnect_needed(&s, true));
+        for failures in [1, 2] {
+            s.online_info_fail_count = failures;
+            assert!(!s.definitely_offline());
+            assert!(!reconnect_needed(&s, true));
+        }
+        // A fresh server offline response remains authoritative with probes off.
+        s.online_info_fail_count = 0;
+        assert!(s.definitely_offline());
+        assert!(reconnect_needed(&s, true));
+        s.suppress_auto_reconnect = true;
+        assert!(!reconnect_needed(&s, true));
     }
 
     #[test]

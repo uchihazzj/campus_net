@@ -56,8 +56,9 @@ pub enum AuthServerStatus {
     Unknown,
 }
 
-/// Campus auth login state. Determined by captive-portal probe (HTTP redirect
-/// detection), not by whether the auth server or public internet is reachable.
+/// Campus auth login state. rad_user_info is authoritative; a bound captive
+/// portal probe is only used when status queries repeatedly fail and probing
+/// is enabled. Public internet success alone does not confirm a campus session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CampusAuthStatus {
     LoggedIn,
@@ -73,9 +74,10 @@ pub enum Ipv4InternetStatus {
     Reachable,
     CaptivePortal,
     Unreachable,
-    /// All probes failed — could not determine reachability (e.g., DNS failure
-    /// on all endpoints, or client build error). Different from Unreachable,
-    /// which means we confirmed IPv4 is down.
+    /// The response cannot establish campus IPv4 reachability, e.g. client
+    /// creation failed or an unbound fallback used another route. Unreachable
+    /// means all endpoints failed; neither result proves campus authentication
+    /// is offline.
     ProbeFailed,
     /// IPv4 internet probe is disabled by user config.
     Disabled,
@@ -247,10 +249,15 @@ impl AppState {
     }
 
     pub fn definitely_offline(&self) -> bool {
-        self.campus_auth == CampusAuthStatus::NotLoggedIn
-            || (self.online_info_fail_count >= 3
-                && self.config.enable_ipv4_internet_probe
-                && self.ipv4_internet == Ipv4InternetStatus::CaptivePortal)
+        if self.online_info_fail_count == 0 {
+            return self.campus_auth == CampusAuthStatus::NotLoggedIn;
+        }
+        // Failed status queries need an enabled fallback. Disabling probes
+        // must also disable a cached fallback NotLoggedIn classification.
+        self.online_info_fail_count >= 3
+            && self.config.enable_ipv4_internet_probe
+            && (self.campus_auth == CampusAuthStatus::NotLoggedIn
+                || self.ipv4_internet == Ipv4InternetStatus::CaptivePortal)
     }
 
     pub fn confirmed_user_info(&self, idx: usize) -> Option<&OnlineUserInfo> {
