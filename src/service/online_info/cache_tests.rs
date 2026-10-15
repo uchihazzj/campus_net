@@ -255,3 +255,57 @@ async fn forced_refresh_updates_the_cache_and_uses_the_current_binding() {
     assert_eq!(s.campus_ip.as_deref(), Some("10.0.0.4"));
     assert_eq!(s.user_statuses[0].current_ip, "10.0.0.4");
 }
+
+#[tokio::test]
+async fn switch_confirmation_uses_the_selected_account_after_an_old_logout_failed() {
+    for (address, server_online) in [("10.0.0.4", true), ("10.0.0.6", true), ("10.0.0.4", false)] {
+        let (state, mut interfaces) = fixture();
+        interfaces.push(("test-switched".into(), address.parse().unwrap()));
+        {
+            let mut s = state.lock().unwrap();
+            s.config.users.push(StoredUser {
+                username: "test-selected-account".into(),
+                encrypted_password: String::new(),
+                if_name: Some("test-switched".into()),
+                ip: None,
+            });
+            s.ensure_statuses();
+            s.user_statuses[0].last_error = "synthetic logout timeout".into();
+            s.user_statuses[1].state = LoginState::PendingConfirm;
+            s.user_statuses[1].current_ip = "10.0.0.4".into();
+            s.reconnect_targets = vec![1];
+            s.online_info = None;
+            s.online_info_stale = true;
+            s.campus_auth = CampusAuthStatus::Unknown;
+            assert_eq!(best_status_query_ip(&s).as_deref(), Some("10.0.0.4"));
+        }
+        let guard = StatusQueryGuard::begin(&state, None).unwrap();
+        sync_online_state_claimed_with_io(
+            guard,
+            &interfaces,
+            false,
+            || async { panic!("fresh synthetic interfaces need no OS query") },
+            |_, ip| {
+                assert_eq!(ip.as_deref(), Some(address));
+                std::future::ready(Ok(server_online.then(|| OnlineUserInfo {
+                    user_name: "test-selected-account".into(),
+                    ..online(address)
+                })))
+            },
+        )
+        .await;
+        let s = state.lock().unwrap();
+        assert_eq!(s.user_statuses[0].state, LoginState::Error);
+        if server_online {
+            assert_eq!(s.user_statuses[1].state, LoginState::Online);
+            assert_eq!(s.user_statuses[1].current_ip, address);
+            assert_eq!(
+                confirmed_online_user_idx(s.current_online_info(), &s.config.users),
+                Some(1)
+            );
+        } else {
+            assert_eq!(s.reconnect_targets, vec![1]);
+            assert!(s.definitely_offline());
+        }
+    }
+}

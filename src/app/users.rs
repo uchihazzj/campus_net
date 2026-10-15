@@ -82,7 +82,7 @@ impl CampusNetApp {
 
     fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) {
         let t = self.t();
-        let (user, status, auth_busy, confirmed_info, session_known) = {
+        let (user, status, auth_busy, confirmed_info, session_known, switching) = {
             let s = self.state.lock().unwrap();
             let (Some(user), Some(status)) =
                 (s.config.users.get(user_idx), s.user_statuses.get(user_idx))
@@ -95,7 +95,13 @@ impl CampusNetApp {
                 s.authentication_busy(),
                 s.confirmed_user_info(user_idx).cloned(),
                 s.definitely_offline() || s.current_online_info().is_some(),
+                auth::login_will_switch_account(&s, user_idx),
             )
+        };
+        let login_hint = if switching {
+            format!("{}\n{}", t.login_switch_hint, t.login_recovery_hint)
+        } else {
+            t.login_recovery_hint.to_string()
         };
         let card = if confirmed_info.is_some() {
             card_frame(ui).stroke(egui::Stroke::new(
@@ -135,8 +141,15 @@ impl CampusNetApp {
                             auth::spawn_logout(self.state.clone(), user_idx);
                         }
                     } else if ui
-                        .add_enabled(!auth_busy, egui::Button::new(t.btn_login))
-                        .on_hover_text(t.login_recovery_hint)
+                        .add_enabled(
+                            !auth_busy,
+                            egui::Button::new(if switching {
+                                t.btn_switch_login
+                            } else {
+                                t.btn_login
+                            }),
+                        )
+                        .on_hover_text(&login_hint)
                         .clicked()
                     {
                         auth::spawn_login(self.state.clone(), user_idx);

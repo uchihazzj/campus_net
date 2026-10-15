@@ -268,12 +268,23 @@ pub fn apply_match_result(
 /// Pick the best IP to bind rad_user_info queries to.
 ///
 /// Priority:
+/// 0. Explicit reconnect target waiting for confirmation (e.g. an account switch)
 /// 1. `Online` user's `current_ip`
 /// 2. `PendingConfirm` user's `current_ip`
 /// 3. `reconnect_targets`中第一个有 `user.ip` 的用户 IP
 /// 4. 全局 `campus_ip`（real-time detected, more reliable than stored IP）
 /// 5. 任一配置用户的 `user.ip`（last resort when auto-detection fails）
 pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
+    if let Some(idx) = pending_reconnect_target(s) {
+        if let Some(ip) = s
+            .user_statuses
+            .get(idx)
+            .map(|status| &status.current_ip)
+            .filter(|ip| !ip.is_empty())
+        {
+            return Some(ip.clone());
+        }
+    }
     // 1. Online.current_ip
     if let Some(us) = s
         .user_statuses
@@ -317,6 +328,15 @@ pub fn best_status_query_ip(s: &crate::service::AppState) -> Option<String> {
     None
 }
 
+fn pending_reconnect_target(s: &crate::service::AppState) -> Option<usize> {
+    s.reconnect_targets.iter().copied().find(|&idx| {
+        s.config.users.get(idx).is_some()
+            && s.user_statuses
+                .get(idx)
+                .is_some_and(|status| status.state == LoginState::PendingConfirm)
+    })
+}
+
 pub(crate) fn status_query_ip_from_interfaces(
     s: &crate::service::AppState,
     interfaces: &[(String, std::net::IpAddr)],
@@ -331,6 +351,25 @@ pub(crate) fn status_query_ip_from_interfaces(
     };
     if interfaces.is_empty() {
         return previous;
+    }
+
+    // A failed logout may retain an old Online account as a retry entry.
+    // Confirm the explicitly selected pending login through its own binding.
+    if let Some(idx) = pending_reconnect_target(s) {
+        let status = &s.user_statuses[idx];
+        let user = &s.config.users[idx];
+        return user
+            .if_name
+            .as_deref()
+            .and_then(|name| {
+                crate::core::utils::ipv4_by_if_name_preferring(
+                    name,
+                    interfaces,
+                    Some(&status.current_ip),
+                )
+            })
+            .or_else(|| (!status.current_ip.is_empty()).then(|| status.current_ip.clone()))
+            .or_else(|| user_ip::configured_static_ip(user));
     }
 
     // Respect an active account's interface binding even if its former IP has
@@ -425,7 +464,9 @@ fn apply_server_offline(s: &mut crate::service::AppState) {
         })
         .map(|(idx, _)| idx)
         .collect();
-    if !active.is_empty() {
+    if let Some(idx) = pending_reconnect_target(s) {
+        s.reconnect_targets = vec![idx];
+    } else if !active.is_empty() {
         s.reconnect_targets = active;
     }
     s.auth_server = AuthServerStatus::Reachable;

@@ -93,7 +93,7 @@ impl Drop for AuthOperation {
 pub fn spawn_login(state: SharedState, user_idx: usize) {
     if let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) {
         tokio::spawn(async move {
-            do_login_inner(state, user_idx).await;
+            do_login_inner(state, user_idx, true).await;
             drop(operation);
         });
     }
@@ -119,7 +119,7 @@ pub async fn do_auto_login(
         AuthMode::Auto,
         Some((user_idx, expected, expected_generation)),
     ) {
-        do_login_inner(state, user_idx).await;
+        do_login_inner(state, user_idx, false).await;
         drop(operation);
         true
     } else {
@@ -180,6 +180,27 @@ fn login_blocking_account(s: &crate::service::AppState) -> Option<usize> {
     crate::service::online_info::confirmed_online_user_idx(s.online_info.as_ref(), &s.config.users)
 }
 
+pub(crate) fn login_will_switch_account(s: &crate::service::AppState, user_idx: usize) -> bool {
+    user_idx < s.config.users.len()
+        && login_blocking_account(s).is_some_and(|online_idx| online_idx != user_idx)
+}
+
+async fn logout_for_login_cleanup(
+    server: String,
+    account: StoredUser,
+    status_ip: String,
+    acid: i32,
+    detect_ip: bool,
+    strict_bind: bool,
+) -> anyhow::Result<()> {
+    let ip = user_ip::resolve_logout_ip(&account, &status_ip);
+    SrunClient::new_for_logout(&server, &account.username, &ip, acid)
+        .set_detect_ip(detect_ip)
+        .set_strict_bind(strict_bind)
+        .logout()
+        .await
+}
+
 fn mark_pending_login(s: &mut crate::service::AppState, idx: usize, ip: String) {
     s.user_statuses[idx].state = LoginState::PendingConfirm;
     s.user_statuses[idx].current_ip = ip;
@@ -190,8 +211,8 @@ fn mark_pending_login(s: &mut crate::service::AppState, idx: usize, ip: String) 
     s.campus_auth = crate::service::CampusAuthStatus::Unknown;
 }
 
-async fn do_login_inner(state: SharedState, user_idx: usize) {
-    let (server, username, user, detect_ip, strict_bind, double_stack, generation) = {
+async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switch: bool) {
+    let (server, username, user, detect_ip, strict_bind, double_stack, acid, generation) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -205,20 +226,19 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.double_stack,
+            cfg.acid,
             s.auth_generation,
         )
     };
 
-    let ip = user_ip::resolve_login_ip(&user);
-
-    // Guard: block login if a different local account is already confirmed online
-    {
+    // Only a direct account-button click may replace an existing session.
+    let switching = {
         let mut s = state.lock().unwrap();
         if !login_context_matches(&s, generation, &server, user_idx, &user) {
             return;
         }
         if let Some(online_idx) = login_blocking_account(&s) {
-            if online_idx != user_idx && user_idx < s.config.users.len() {
+            if online_idx != user_idx && !allow_account_switch {
                 let target_uname = s.config.users[user_idx].username.clone();
                 let online_uname = s.config.users[online_idx].username.clone();
                 s.user_statuses[user_idx].state = LoginState::Error;
@@ -235,7 +255,8 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                 return;
             }
         }
-    }
+        allow_account_switch && login_will_switch_account(&s, user_idx)
+    };
 
     let password = match secure_store::decrypt_password(&user.encrypted_password) {
         Ok(p) => p,
@@ -252,6 +273,54 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
             return;
         }
     };
+
+    if switching {
+        // Validate local credentials before disturbing a working session.
+        if username.trim().is_empty() || password.is_empty() {
+            let mut s = state.lock().unwrap();
+            if login_context_matches(&s, generation, &server, user_idx, &user) {
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error =
+                    "Account switch cancelled: target username or password is empty".into();
+            }
+            drop(s);
+            crate::service::request_ui_repaint();
+            return;
+        }
+        let result = recovery::logout_all_before_login(
+            &state,
+            user_idx,
+            &user,
+            &server,
+            "",
+            recovery::CleanupReason::AccountSwitch,
+            |account, status_ip| {
+                logout_for_login_cleanup(
+                    server.clone(),
+                    account,
+                    status_ip,
+                    acid,
+                    detect_ip,
+                    strict_bind,
+                )
+            },
+        )
+        .await;
+        if let Err(error) = result {
+            let mut s = state.lock().unwrap();
+            if login_context_matches(&s, generation, &server, user_idx, &user) {
+                s.user_statuses[user_idx].state = LoginState::Error;
+                s.user_statuses[user_idx].last_error = error.to_string();
+                s.add_log(format!("[ERROR] {}: {}", username, error));
+            }
+            drop(s);
+            crate::service::request_ui_repaint();
+            return;
+        }
+    }
+
+    // Cleanup can take time; resolve the target's current binding afterwards.
+    let ip = user_ip::resolve_login_ip(&user);
 
     {
         let mut s = state.lock().unwrap();
@@ -339,19 +408,14 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                 &server,
                 &client.client_ip,
                 |account, status_ip| {
-                    let server = server.clone();
-                    async move {
-                        let logout_ip = user_ip::resolve_logout_ip(&account, &status_ip);
-                        let mut logout_client = SrunClient::new_for_logout(
-                            &server,
-                            &account.username,
-                            &logout_ip,
-                            acid,
-                        )
-                        .set_detect_ip(detect_ip)
-                        .set_strict_bind(strict_bind);
-                        logout_client.logout().await
-                    }
+                    logout_for_login_cleanup(
+                        server.clone(),
+                        account,
+                        status_ip,
+                        acid,
+                        detect_ip,
+                        strict_bind,
+                    )
                 },
                 || async {
                     let retry_ip = user_ip::resolve_login_ip(&user);
@@ -592,7 +656,7 @@ async fn do_one_click_login_inner(state: SharedState) {
         }
         crate::service::request_ui_repaint();
 
-        do_login_inner(state.clone(), idx).await;
+        do_login_inner(state.clone(), idx, false).await;
 
         let post_state = {
             let s = state.lock().unwrap();
@@ -768,6 +832,98 @@ mod tests {
 
     fn state() -> SharedState {
         Arc::new(Mutex::new(AppState::new(AppConfig::default())))
+    }
+
+    fn switch_state() -> SharedState {
+        let state = state();
+        {
+            let mut s = state.lock().unwrap();
+            for index in 0..2 {
+                s.config.users.push(StoredUser {
+                    username: format!("test-switch-{index}"),
+                    encrypted_password: "***".into(),
+                    ip: Some(format!("10.0.0.{}", index + 1)),
+                    if_name: None,
+                });
+            }
+            s.ensure_statuses();
+            s.user_statuses[0].state = LoginState::Online;
+            s.campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+            s.online_info = Some(crate::service::OnlineUserInfo {
+                user_name: "test-switch-0".into(),
+                online_ip: "10.0.0.1".into(),
+                ..Default::default()
+            });
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn invalid_switch_target_keeps_the_online_account_and_reports_its_password_error() {
+        let state = switch_state();
+        let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        do_login_inner(state.clone(), 1, true).await;
+        drop(operation);
+        let s = state.lock().unwrap();
+        assert!(s.user_statuses[1]
+            .last_error
+            .contains("Password decrypt failed"));
+        assert_eq!(s.user_statuses[0].state, LoginState::Online);
+        assert!(s.current_online_info().is_some());
+        assert!(s.reconnect_targets.is_empty());
+        assert!(!s.authentication_busy());
+    }
+
+    #[tokio::test]
+    async fn empty_switch_credentials_do_not_log_out_the_working_session() {
+        for empty_password in [false, true] {
+            let state = switch_state();
+            {
+                let mut s = state.lock().unwrap();
+                let target = &mut s.config.users[1];
+                if empty_password {
+                    target.encrypted_password.clear();
+                } else {
+                    target.username.clear();
+                    target.encrypted_password =
+                        secure_store::encrypt_password("synthetic-switch-password").unwrap();
+                }
+            }
+            let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+            do_login_inner(state.clone(), 1, true).await;
+            drop(operation);
+            let s = state.lock().unwrap();
+            assert!(s.user_statuses[1].last_error.contains("is empty"));
+            assert_eq!(s.user_statuses[0].state, LoginState::Online);
+            assert!(s.current_online_info().is_some());
+            assert!(s.reconnect_targets.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unattended_login_keeps_the_existing_account_protection() {
+        let state = switch_state();
+        let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        do_login_inner(state.clone(), 1, false).await;
+        drop(operation);
+        let s = state.lock().unwrap();
+        assert!(s.user_statuses[1]
+            .last_error
+            .contains("Another account is already online"));
+        assert_eq!(s.user_statuses[0].state, LoginState::Online);
+        assert!(s.current_online_info().is_some());
+        assert!(s.reconnect_targets.is_empty());
+    }
+
+    #[test]
+    fn switching_requires_a_different_account_and_no_confirmed_offline_state() {
+        let state = switch_state();
+        let mut s = state.lock().unwrap();
+        assert!(!login_will_switch_account(&s, 0));
+        assert!(login_will_switch_account(&s, 1));
+        assert!(!login_will_switch_account(&s, 2));
+        s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+        assert!(!login_will_switch_account(&s, 1));
     }
 
     #[tokio::test]

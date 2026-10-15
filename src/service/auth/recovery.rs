@@ -10,6 +10,25 @@ fn context_matches(s: &AppState, generation: u64, users: &[StoredUser], server: 
         && s.config.users == users
 }
 
+pub(super) enum CleanupReason {
+    LoginFailure,
+    AccountSwitch,
+}
+
+impl CleanupReason {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::LoginFailure => "Login recovery",
+            Self::AccountSwitch => "Account switch",
+        }
+    }
+}
+
+pub(super) struct CleanupContext {
+    users: Vec<StoredUser>,
+    generation: u64,
+}
+
 /// Executes one recovery round inside the caller's authentication operation.
 /// Callbacks keep the ordering/state policy testable without network requests.
 pub(super) async fn recover_login_after_failure<L, LF, R, RF>(
@@ -18,7 +37,7 @@ pub(super) async fn recover_login_after_failure<L, LF, R, RF>(
     expected: &StoredUser,
     server: &str,
     failed_ip: &str,
-    mut logout: L,
+    logout: L,
     retry: R,
 ) -> anyhow::Result<String>
 where
@@ -27,13 +46,50 @@ where
     R: FnOnce() -> RF,
     RF: Future<Output = anyhow::Result<String>>,
 {
+    let context = logout_all_before_login(
+        state,
+        target_idx,
+        expected,
+        server,
+        failed_ip,
+        CleanupReason::LoginFailure,
+        logout,
+    )
+    .await?;
+    let result = retry().await;
+    if !context_matches(
+        &state.lock().unwrap(),
+        context.generation,
+        &context.users,
+        server,
+    ) {
+        anyhow::bail!("Login recovery cancelled: authentication context changed");
+    }
+    result
+}
+
+/// Reuses the caller's authentication lock; never starts a separate logout operation.
+pub(super) async fn logout_all_before_login<L, LF>(
+    state: &SharedState,
+    target_idx: usize,
+    expected: &StoredUser,
+    server: &str,
+    failed_ip: &str,
+    reason: CleanupReason,
+    mut logout: L,
+) -> anyhow::Result<CleanupContext>
+where
+    L: FnMut(StoredUser, String) -> LF,
+    LF: Future<Output = anyhow::Result<()>>,
+{
+    let label = reason.label();
     let (users, status_ips, generation) = {
         let mut s = state.lock().unwrap();
         if !s.auth_busy
             || s.config.server != server
             || s.config.users.get(target_idx) != Some(expected)
         {
-            anyhow::bail!("Login recovery cancelled: authentication context changed");
+            anyhow::bail!("{} cancelled: authentication context changed", label);
         }
         s.ensure_statuses();
         let users = s.config.users.clone();
@@ -52,8 +108,12 @@ where
         if s.campus_auth == CampusAuthStatus::LoggedIn {
             s.campus_auth = CampusAuthStatus::Unknown;
         }
+        if matches!(reason, CleanupReason::AccountSwitch) {
+            s.reconnect_targets = vec![target_idx];
+        }
         s.add_log(format!(
-            "[INFO] Login recovery: logging out all {} configured account(s) once",
+            "[INFO] {}: logging out all {} configured account(s) once",
+            label,
             users.len()
         ));
         (users, status_ips, s.auth_generation)
@@ -65,14 +125,15 @@ where
         let previous = {
             let mut s = state.lock().unwrap();
             if !context_matches(&s, generation, &users, server) {
-                anyhow::bail!("Login recovery cancelled: authentication context changed");
+                anyhow::bail!("{} cancelled: authentication context changed", label);
             }
             s.ensure_statuses();
             let previous = s.user_statuses[idx].state.clone();
             s.user_statuses[idx].state = LoginState::LoggingOut;
             s.user_statuses[idx].last_error.clear();
             s.add_log(format!(
-                "[INFO] Login recovery: logout {}/{} — {}",
+                "[INFO] {}: logout {}/{} — {}",
+                label,
                 idx + 1,
                 users.len(),
                 user.username
@@ -84,7 +145,7 @@ where
         {
             let mut s = state.lock().unwrap();
             if !context_matches(&s, generation, &users, server) {
-                anyhow::bail!("Login recovery cancelled: authentication context changed");
+                anyhow::bail!("{} cancelled: authentication context changed", label);
             }
             match result {
                 Ok(()) => {
@@ -92,8 +153,8 @@ where
                     s.user_statuses[idx].current_ip.clear();
                     s.user_statuses[idx].last_error.clear();
                     s.add_log(format!(
-                        "[OK] Login recovery: {} logout completed",
-                        user.username
+                        "[OK] {}: {} logout completed",
+                        label, user.username
                     ));
                 }
                 Err(error) => {
@@ -104,8 +165,8 @@ where
                         &error.to_string(),
                     );
                     s.add_log(format!(
-                        "[WARN] Login recovery: {} logout failed — {}; continuing",
-                        user.username, error
+                        "[WARN] {}: {} logout failed — {}; continuing",
+                        label, user.username, error
                     ));
                 }
             }
@@ -116,23 +177,23 @@ where
     {
         let mut s = state.lock().unwrap();
         if !context_matches(&s, generation, &users, server) {
-            anyhow::bail!("Login recovery cancelled: authentication context changed");
+            anyhow::bail!("{} cancelled: authentication context changed", label);
         }
         // Internal recovery never enters AuthMode::Logout: that would pause
         // auto-reconnect and conflict with the caller's authentication lock.
         s.user_statuses[target_idx].state = LoginState::LoggingIn;
         s.user_statuses[target_idx].last_error.clear();
+        let next = match reason {
+            CleanupReason::LoginFailure => "retrying",
+            CleanupReason::AccountSwitch => "logging in to",
+        };
         s.add_log(format!(
-            "[INFO] Login recovery: cleanup complete ({} failed), retrying {} once",
-            failures, expected.username
+            "[INFO] {}: cleanup complete ({} failed), {} {}",
+            label, failures, next, expected.username
         ));
     }
     crate::service::request_ui_repaint();
-    let result = retry().await;
-    if !context_matches(&state.lock().unwrap(), generation, &users, server) {
-        anyhow::bail!("Login recovery cancelled: authentication context changed");
-    }
-    result
+    Ok(CleanupContext { users, generation })
 }
 
 #[cfg(test)]
@@ -171,6 +232,117 @@ mod tests {
         let operation = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
         state.lock().unwrap().user_statuses[2].state = LoginState::LoggingIn;
         (state, operation, expected)
+    }
+
+    #[tokio::test]
+    async fn switch_cleanup_uses_each_old_ip_and_prepares_only_the_selected_account() {
+        for fail_one_logout in [false, true] {
+            let (state, operation, expected) = fixture();
+            let generation = {
+                let mut s = state.lock().unwrap();
+                s.user_statuses[2].current_ip = "10.0.0.77".into();
+                s.campus_auth = CampusAuthStatus::LoggedIn;
+                s.reconnect_targets = vec![1];
+                s.auth_generation
+            };
+            let actions = Arc::new(Mutex::new(Vec::new()));
+            logout_all_before_login(
+                &state,
+                2,
+                &expected,
+                "http://auth.example.test",
+                "",
+                CleanupReason::AccountSwitch,
+                |user, status_ip| {
+                    let state = state.clone();
+                    let actions = actions.clone();
+                    async move {
+                        {
+                            let s = state.try_lock().expect("lock held during synthetic logout");
+                            assert!(s.auth_busy);
+                            assert!(!s.suppress_auto_reconnect);
+                            assert_eq!(s.auth_generation, generation);
+                        }
+                        assert!(AuthOperation::begin(&state, AuthMode::Login, None).is_none());
+                        let ip = crate::service::user_ip::resolve_logout_ip(&user, &status_ip);
+                        actions
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{ip}", user.username));
+                        tokio::task::yield_now().await;
+                        if fail_one_logout && user.username.ends_with('1') {
+                            anyhow::bail!("synthetic switch logout timeout");
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                *actions.lock().unwrap(),
+                [
+                    "preview-recovery-0:10.0.0.1",
+                    "preview-recovery-1:10.0.0.51",
+                    "preview-recovery-2:10.0.0.77",
+                    "preview-recovery-3:10.0.0.4",
+                ]
+            );
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(s.user_statuses[2].state, LoginState::LoggingIn);
+                assert_eq!(s.user_statuses[3].state, LoginState::LoggedOut);
+                assert_eq!(s.reconnect_targets, vec![2]);
+                assert_eq!(s.campus_auth, CampusAuthStatus::Unknown);
+                assert!(!s.suppress_auto_reconnect);
+                assert_eq!(s.auth_generation, generation);
+                if fail_one_logout {
+                    assert_eq!(s.user_statuses[1].state, LoginState::Online);
+                    assert_eq!(
+                        s.user_statuses[1].last_error,
+                        "synthetic switch logout timeout"
+                    );
+                }
+            }
+            drop(operation);
+            assert!(!state.lock().unwrap().authentication_busy());
+            assert_eq!(
+                state.lock().unwrap().auth_generation,
+                generation.wrapping_add(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_switch_cleanup_releases_the_operation_without_starting_a_login() {
+        let (state, operation, expected) = fixture();
+        let generation = state.lock().unwrap().auth_generation;
+        let mut cleanup = Box::pin(logout_all_before_login(
+            &state,
+            2,
+            &expected,
+            "http://auth.example.test",
+            "",
+            CleanupReason::AccountSwitch,
+            |_, _| std::future::pending::<anyhow::Result<()>>(),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut cleanup => panic!("synthetic logout must remain pending"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(
+            state.lock().unwrap().user_statuses[0].state,
+            LoginState::LoggingOut
+        );
+        drop(cleanup);
+        drop(operation);
+        let s = state.lock().unwrap();
+        assert!(!s.authentication_busy());
+        assert!(!s.suppress_auto_reconnect);
+        assert_eq!(s.auth_generation, generation.wrapping_add(1));
+        assert_eq!(s.user_statuses[1].state, LoginState::Online);
+        assert_eq!(s.user_statuses[2].state, LoginState::Error);
     }
 
     #[tokio::test]

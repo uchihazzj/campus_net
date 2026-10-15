@@ -355,6 +355,17 @@ fn multiple_accounts_keep_titles_left_aligned_and_session_details_visible() {
             assert!(text_rect(&out.shapes, "03:16:06").is_some());
             assert!(text_rect(&out.shapes, "256.0 GB").is_some());
             assert!(text_rect(&out.shapes, app.t().update_up_to_date).is_some());
+            assert!(text_rect(&out.shapes, app.t().btn_switch_login).is_some());
+            let (_, small) = render(
+                &mut app,
+                [420.0, 830.0],
+                light,
+                &format!(
+                    "{prefix}_switch_small_{}",
+                    if light { "light" } else { "dark" }
+                ),
+            );
+            assert!(text_rect(&small.shapes, app.t().btn_switch_login).is_some());
         }
     }
 }
