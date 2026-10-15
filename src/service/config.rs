@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::platform::secure_store;
 use crate::ui::l10n::Lang;
 
 static CONFIG_IO_LOCK: Mutex<()> = Mutex::new(());
@@ -88,37 +87,6 @@ impl Default for AppConfig {
             window_height: None,
             users: vec![],
         }
-    }
-}
-
-impl AppConfig {
-    #[allow(dead_code)]
-    pub fn get_password(&self, user: &StoredUser) -> anyhow::Result<String> {
-        secure_store::decrypt_password(&user.encrypted_password)
-    }
-
-    #[allow(dead_code)]
-    pub fn set_password(&mut self, user_idx: usize, password: &str) -> anyhow::Result<()> {
-        let encrypted = secure_store::encrypt_password(password)?;
-        if let Some(u) = self.users.get_mut(user_idx) {
-            u.encrypted_password = encrypted;
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn resolve_ip(&self, user: &StoredUser) -> Option<String> {
-        if let Some(ref ip) = user.ip {
-            if !ip.is_empty() {
-                return Some(ip.clone());
-            }
-        }
-        if let Some(ref if_name) = user.if_name {
-            if let Some(ip) = crate::core::utils::get_ip_by_if_name(if_name) {
-                return Some(ip);
-            }
-        }
-        None
     }
 }
 
@@ -344,11 +312,6 @@ pub fn read_config_with_report(path: impl AsRef<Path>) -> anyhow::Result<ConfigL
             })
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn read_config(path: impl AsRef<Path>) -> anyhow::Result<AppConfig> {
-    Ok(read_config_with_report(path)?.config)
 }
 
 pub fn write_config(path: impl AsRef<Path>, config: &AppConfig) -> anyhow::Result<()> {

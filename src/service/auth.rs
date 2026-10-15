@@ -181,14 +181,6 @@ fn mark_pending_login(s: &mut crate::service::AppState, idx: usize, ip: String) 
     s.campus_auth = crate::service::CampusAuthStatus::Unknown;
 }
 
-pub async fn do_login(state: SharedState, user_idx: usize) {
-    let Some(operation) = AuthOperation::begin(&state, AuthMode::Login, None) else {
-        return;
-    };
-    do_login_inner(state, user_idx).await;
-    drop(operation);
-}
-
 async fn do_login_inner(state: SharedState, user_idx: usize) {
     let (server, username, user, detect_ip, strict_bind, double_stack) = {
         let s = state.lock().unwrap();
@@ -208,7 +200,6 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
     };
 
     let ip = user_ip::resolve_login_ip(&user);
-    let test_before_login = false;
 
     // Guard: block login if a different local account is already confirmed online
     {
@@ -267,8 +258,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
     let mut client = SrunClient::new(&server, &username, &password, &ip)
         .set_detect_ip(detect_ip)
         .set_strict_bind(strict_bind)
-        .set_double_stack(double_stack)
-        .set_test_before_login(test_before_login);
+        .set_double_stack(double_stack);
 
     {
         let s = state.lock().unwrap();
@@ -343,8 +333,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
                         let mut retry_client = SrunClient::new(&server, &username, &password, &ip)
                             .set_detect_ip(detect_ip)
                             .set_strict_bind(strict_bind)
-                            .set_double_stack(double_stack)
-                            .set_test_before_login(test_before_login);
+                            .set_double_stack(double_stack);
                         {
                             let s = state.lock().unwrap();
                             let cfg = &s.config;
@@ -419,14 +408,6 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
         }
     }
     crate::service::request_ui_repaint();
-}
-
-pub async fn do_logout(state: SharedState, user_idx: usize) {
-    let Some(operation) = AuthOperation::begin(&state, AuthMode::Logout, None) else {
-        return;
-    };
-    do_logout_inner(state, user_idx).await;
-    drop(operation);
 }
 
 async fn do_logout_inner(state: SharedState, user_idx: usize) {
@@ -525,28 +506,6 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
         }
     }
     crate::service::request_ui_repaint();
-}
-
-#[allow(dead_code)]
-pub async fn do_login_all(state: SharedState) {
-    let count = {
-        let s = state.lock().unwrap();
-        s.config.users.len()
-    };
-    for idx in 0..count {
-        do_login(state.clone(), idx).await;
-    }
-}
-
-#[allow(dead_code)]
-pub async fn do_logout_all(state: SharedState) {
-    let count = {
-        let s = state.lock().unwrap();
-        s.config.users.len()
-    };
-    for idx in 0..count {
-        do_logout(state.clone(), idx).await;
-    }
 }
 
 /// Try users in order, stop at the first successful login.

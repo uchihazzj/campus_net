@@ -35,25 +35,6 @@ struct GitHubRelease {
     assets: Vec<GitHubAsset>,
 }
 
-/// Proxy strategy order for GitHub requests. Used in tests to verify
-/// the fallback order is correct without making real HTTP requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum GithubCheckOrder {
-    /// API check: direct first, fallback to environment proxy
-    DirectThenSystem,
-    /// Download: environment proxy first, fallback to direct
-    SystemThenDirect,
-}
-
-/// API latest check order: direct first → environment proxy fallback.
-#[allow(dead_code)]
-pub const API_CHECK_ORDER: GithubCheckOrder = GithubCheckOrder::DirectThenSystem;
-
-/// Asset download order: environment proxy first → direct fallback.
-#[allow(dead_code)]
-pub const DOWNLOAD_ORDER: GithubCheckOrder = GithubCheckOrder::SystemThenDirect;
-
 fn user_agent() -> String {
     format!(
         "campus-net-client/{} (+https://github.com/uchihazzj/campus_net)",
@@ -638,18 +619,6 @@ mod tests {
         assert!(is_newer("1.0.0", "v1.0.1"));
         assert!(!is_newer("1.0.0", "v1.0.0"));
         assert!(!is_newer("0.2.1", "0.2.1"));
-    }
-
-    // ── Proxy strategy order tests ────────────────────────
-
-    #[test]
-    fn api_check_order_is_direct_then_system() {
-        assert_eq!(API_CHECK_ORDER, GithubCheckOrder::DirectThenSystem);
-    }
-
-    #[test]
-    fn download_order_is_system_then_direct() {
-        assert_eq!(DOWNLOAD_ORDER, GithubCheckOrder::SystemThenDirect);
     }
 
     // ── Rate limit detection tests ────────────────────────

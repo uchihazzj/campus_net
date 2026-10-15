@@ -67,7 +67,6 @@ pub struct SrunClient {
     pub strict_bind: bool,
     pub retry_delay: u32,
     pub retry_times: u32,
-    pub test_before_login: bool,
     pub acid: i32,
     pub double_stack: i32,
     pub os: String,
@@ -244,11 +243,6 @@ impl SrunClient {
         self
     }
 
-    pub fn set_test_before_login(mut self, b: bool) -> Self {
-        self.test_before_login = b;
-        self
-    }
-
     pub fn normalize_server_url(url: &str) -> String {
         let url = url.trim();
         if url.is_empty() {
@@ -374,13 +368,6 @@ impl SrunClient {
     }
 
     pub async fn login(&mut self) -> anyhow::Result<()> {
-        if self.test_before_login {
-            if let Ok(delay) = crate::core::utils::tcp_ping("baidu.com:80").await {
-                tracing::info!("Network already connected, ping={}ms", delay);
-                return Ok(());
-            }
-        }
-
         if self.detect_ip {
             self.detect_ip().await?;
         }

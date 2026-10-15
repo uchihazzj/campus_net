@@ -38,21 +38,10 @@ mod windows_impl {
 
         fn RegDeleteValueW(hkey: isize, value_name: *const u16) -> i32;
         fn RegCloseKey(hkey: isize) -> i32;
-        #[allow(dead_code)]
-        fn RegQueryValueExW(
-            hkey: isize,
-            value_name: *const u16,
-            reserved: *const std::ffi::c_void,
-            dw_type: *mut u32,
-            data: *mut u8,
-            cb_data: *mut u32,
-        ) -> i32;
     }
 
     const HKEY_CURRENT_USER: isize = -2147483647i64 as isize;
     const KEY_WRITE: u32 = 0x20006;
-    #[allow(dead_code)]
-    const KEY_READ: u32 = 0x20019;
     const REG_SZ: u32 = 1;
     const REG_OPTION_NON_VOLATILE: u32 = 0;
 
@@ -150,32 +139,6 @@ mod windows_impl {
         tracing::info!("Autostart disabled");
         Ok(())
     }
-
-    #[allow(dead_code)]
-    pub fn is_autostart_enabled() -> bool {
-        let key_name = to_wide(RUN_KEY);
-        let value_name = to_wide(APP_NAME);
-
-        unsafe {
-            let mut hkey: isize = 0;
-            let ret = RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_READ, &mut hkey);
-            if ret != 0 {
-                return false;
-            }
-            let mut data_type = 0u32;
-            let mut data_size = 0u32;
-            let ret = RegQueryValueExW(
-                hkey,
-                value_name.as_ptr(),
-                std::ptr::null(),
-                &mut data_type,
-                std::ptr::null_mut(),
-                &mut data_size,
-            );
-            RegCloseKey(hkey);
-            ret == 0
-        }
-    }
 }
 
 #[cfg(not(windows))]
@@ -188,13 +151,9 @@ mod fallback_impl {
     pub fn disable_autostart() -> anyhow::Result<()> {
         Ok(())
     }
-
-    pub fn is_autostart_enabled() -> bool {
-        false
-    }
 }
 
 #[cfg(not(windows))]
-pub use fallback_impl::{disable_autostart, enable_autostart, is_autostart_enabled};
+pub use fallback_impl::{disable_autostart, enable_autostart};
 #[cfg(windows)]
 pub use windows_impl::{disable_autostart, enable_autostart};

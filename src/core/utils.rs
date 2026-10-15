@@ -1,7 +1,4 @@
-use std::{
-    net::{IpAddr, TcpStream, ToSocketAddrs},
-    time::{Duration, Instant},
-};
+use std::net::IpAddr;
 
 pub fn get_network_interfaces() -> Vec<(String, IpAddr)> {
     match if_addrs::get_if_addrs() {
@@ -83,19 +80,6 @@ pub fn ipv4_by_if_name_preferring(
         .unwrap_or(first_ip);
     tracing::debug!("[IP] if_name '{}' matched by '{}' → {}", if_name, name, ip);
     Some(ip.to_string())
-}
-
-pub async fn tcp_ping(addr: &'static str) -> anyhow::Result<u16> {
-    tokio::task::spawn_blocking(move || {
-        let sock_addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("DNS resolve failed for {}", addr))?;
-        let start = Instant::now();
-        TcpStream::connect_timeout(&sock_addr, Duration::from_secs(3))?;
-        Ok(start.elapsed().as_millis() as u16)
-    })
-    .await?
 }
 
 #[cfg(test)]
