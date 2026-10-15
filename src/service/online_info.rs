@@ -163,16 +163,25 @@ pub async fn fetch_online_user_info(
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
 
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = resp
         .bytes()
         .await
         .map_err(|e| format!("Failed to read response body: {}", e.without_url()))?;
 
-    parse_online_user_info(&body)
+    parse_online_user_info(&body, content_type.as_deref())
 }
 
-fn parse_online_user_info(bytes: &[u8]) -> Result<Option<OnlineUserInfo>, String> {
-    let body = crate::core::srun::decode_body(bytes);
+fn parse_online_user_info(
+    bytes: &[u8],
+    content_type: Option<&str>,
+) -> Result<Option<OnlineUserInfo>, String> {
+    let body =
+        crate::core::srun::decode_body(bytes, content_type).map_err(|error| error.to_string())?;
     let json_str = crate::core::jsonp::strip_jsonp(&body)
         .map_err(|_| "Invalid rad_user_info JSONP".to_string())?;
 
@@ -920,7 +929,7 @@ mod tests {
         for body in [r#"{}"#, r#"{"error":"ip_error"}"#, r#"{"error":"ok"}"#] {
             let response = format!("sdu({body})");
             assert!(
-                parse_online_user_info(response.as_bytes()).is_err(),
+                parse_online_user_info(response.as_bytes(), None).is_err(),
                 "misclassified response: {body}"
             );
         }
@@ -932,7 +941,7 @@ mod tests {
             "test-sensitive-sentinel",
             "sdu({\"private\":\"test-sensitive-sentinel\"}",
         ] {
-            let error = parse_online_user_info(body.as_bytes()).unwrap_err();
+            let error = parse_online_user_info(body.as_bytes(), None).unwrap_err();
             assert!(!error.contains("test-sensitive-sentinel"));
         }
     }
@@ -941,13 +950,26 @@ mod tests {
     fn explicit_offline_status_and_online_gbk_are_supported() {
         for error in ["not_online", "not_online_error"] {
             let body = format!(r#"sdu({{"error":"{error}"}})"#);
-            assert!(parse_online_user_info(body.as_bytes()).unwrap().is_none());
+            assert!(parse_online_user_info(body.as_bytes(), None)
+                .unwrap()
+                .is_none());
         }
         let body = r#"sdu({"error":"ok","user_name":"测试账号","online_ip":"10.0.0.1"})"#;
         let (bytes, _, had_errors) = encoding_rs::GBK.encode(body);
         assert!(!had_errors);
-        let info = parse_online_user_info(&bytes).unwrap().unwrap();
+        let info = parse_online_user_info(&bytes, None).unwrap().unwrap();
         assert_eq!(info.user_name, "测试账号");
+    }
+
+    #[test]
+    fn online_status_uses_declared_charset_without_garbling_display_fields() {
+        let body = r#"sdu({"error":"ok","user_name":"preview-user","products_name":"忙"})"#;
+        let (bytes, _, errors) = encoding_rs::GBK.encode(body);
+        assert!(!errors);
+        let info = parse_online_user_info(&bytes, Some("text/javascript; charset=gbk"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.products_name, "忙");
     }
 
     // ── match_account tests ───────────────────────────────

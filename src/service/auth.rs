@@ -7,6 +7,8 @@ use crate::service::online_info::sync_online_state;
 use crate::service::user_ip;
 use crate::service::{LoginState, SharedState};
 
+mod recovery;
+
 #[derive(Clone, Copy)]
 enum AuthMode {
     Login,
@@ -143,10 +145,17 @@ fn user_still_matches(
         .is_some_and(|user| same_user(user, username, original))
 }
 
-fn requires_logout_retry(error: &str) -> bool {
-    error
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '=')
-        .any(|part| part == "err_code=2")
+fn login_context_matches(
+    s: &crate::service::AppState,
+    generation: u64,
+    server: &str,
+    idx: usize,
+    expected: &StoredUser,
+) -> bool {
+    s.auth_busy
+        && s.auth_generation == generation
+        && s.config.server == server
+        && s.config.users.get(idx) == Some(expected)
 }
 
 fn apply_logout_failure(
@@ -182,7 +191,7 @@ fn mark_pending_login(s: &mut crate::service::AppState, idx: usize, ip: String) 
 }
 
 async fn do_login_inner(state: SharedState, user_idx: usize) {
-    let (server, username, user, detect_ip, strict_bind, double_stack) = {
+    let (server, username, user, detect_ip, strict_bind, double_stack, generation) = {
         let s = state.lock().unwrap();
         let cfg = &s.config;
         if user_idx >= cfg.users.len() {
@@ -196,6 +205,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
             cfg.detect_ip,
             cfg.strict_bind,
             cfg.double_stack,
+            s.auth_generation,
         )
     };
 
@@ -204,6 +214,9 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
     // Guard: block login if a different local account is already confirmed online
     {
         let mut s = state.lock().unwrap();
+        if !login_context_matches(&s, generation, &server, user_idx, &user) {
+            return;
+        }
         if let Some(online_idx) = login_blocking_account(&s) {
             if online_idx != user_idx && user_idx < s.config.users.len() {
                 let target_uname = s.config.users[user_idx].username.clone();
@@ -228,7 +241,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
         Ok(p) => p,
         Err(e) => {
             let mut s = state.lock().unwrap();
-            if user_idx < s.config.users.len() {
+            if login_context_matches(&s, generation, &server, user_idx, &user) {
                 let uname = s.config.users[user_idx].username.clone();
                 s.user_statuses[user_idx].state = LoginState::Error;
                 s.user_statuses[user_idx].last_error = format!("Password decrypt failed: {}", e);
@@ -242,7 +255,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
 
     {
         let mut s = state.lock().unwrap();
-        if !user_still_matches(&s.config.users, user_idx, &username, &user) {
+        if !login_context_matches(&s, generation, &server, user_idx, &user) {
             s.add_log(format!(
                 "[WARN] {}: Login cancelled because the user entry changed",
                 username
@@ -277,7 +290,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
         Ok(()) => {
             {
                 let mut s = state.lock().unwrap();
-                if user_still_matches(&s.config.users, user_idx, &username, &user) {
+                if login_context_matches(&s, generation, &server, user_idx, &user) {
                     let ip = client.client_ip.clone();
                     // Portal login succeeded but server (rad_user_info) has not
                     // yet confirmed. Do NOT mark as Online here.
@@ -302,107 +315,97 @@ async fn do_login_inner(state: SharedState, user_idx: usize) {
         }
         Err(e) => {
             let err = e.to_string();
-
-            if requires_logout_retry(&err) {
-                // Auto-logout first, then retry login once
-                {
-                    let mut s = state.lock().unwrap();
-                    s.add_log(format!(
-                        "[INFO] {}: Login failed with err_code=2, auto-logging out then retrying...",
-                        username
-                    ));
-                }
-                crate::service::request_ui_repaint();
-
-                let mut logout_client =
-                    SrunClient::new_for_logout(&server, &username, &client.client_ip, client.acid)
-                        .set_detect_ip(detect_ip)
-                        .set_strict_bind(strict_bind);
-                match logout_client.logout().await {
-                    Ok(()) => {
-                        {
-                            let mut s = state.lock().unwrap();
-                            s.add_log(format!(
-                                "[OK] {}: Auto-logout done, retrying login...",
-                                username
-                            ));
-                        }
-                        crate::service::request_ui_repaint();
-
-                        // Build fresh login client for retry
-                        let mut retry_client = SrunClient::new(&server, &username, &password, &ip)
-                            .set_detect_ip(detect_ip)
-                            .set_strict_bind(strict_bind)
-                            .set_double_stack(double_stack);
-                        {
-                            let s = state.lock().unwrap();
-                            let cfg = &s.config;
-                            retry_client = retry_client
-                                .set_n(cfg.n)
-                                .set_type(cfg.utype)
-                                .set_acid(cfg.acid)
-                                .set_os(&cfg.os)
-                                .set_name(&cfg.name)
-                                .set_retry_delay(cfg.retry_delay)
-                                .set_retry_times(cfg.retry_times);
-                        }
-
-                        match retry_client.login().await {
-                            Ok(()) => {
-                                let mut s = state.lock().unwrap();
-                                if user_still_matches(&s.config.users, user_idx, &username, &user) {
-                                    let ip = retry_client.client_ip.clone();
-                                    mark_pending_login(&mut s, user_idx, ip.clone());
-                                    s.add_log(format!(
-                                        "[OK] {}: Login retry succeeded, IP={}",
-                                        username, ip
-                                    ));
-                                }
-                                let st = state.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    sync_online_state(&st).await;
-                                });
-                            }
-                            Err(e2) => {
-                                let mut s = state.lock().unwrap();
-                                if user_still_matches(&s.config.users, user_idx, &username, &user) {
-                                    let err2 = e2.to_string();
-                                    s.user_statuses[user_idx].state = LoginState::Error;
-                                    s.user_statuses[user_idx].last_error = err2.clone();
-                                    s.add_log(format!(
-                                        "[ERROR] {}: Login retry failed - {}",
-                                        username, err2
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(logout_err) => {
-                        let mut s = state.lock().unwrap();
-                        if user_still_matches(&s.config.users, user_idx, &username, &user) {
-                            let logout_err_str = logout_err.to_string();
-                            s.user_statuses[user_idx].state = LoginState::Error;
-                            s.user_statuses[user_idx].last_error =
-                                format!("err_code=2, auto-logout also failed: {}", logout_err_str);
-                            s.add_log(format!(
-                                "[ERROR] {}: err_code=2 and auto-logout failed - {}",
-                                username, logout_err_str
-                            ));
-                        }
-                    }
-                }
-            } else {
+            {
                 let mut s = state.lock().unwrap();
-                if user_still_matches(&s.config.users, user_idx, &username, &user) {
-                    s.user_statuses[user_idx].state = LoginState::Error;
-                    s.user_statuses[user_idx].last_error = err.clone();
-                    s.add_log(format!("[ERROR] {}: Login failed - {}", username, err));
-                } else {
+                if !login_context_matches(&s, generation, &server, user_idx, &user) {
                     s.add_log(format!(
                         "[WARN] {}: Login error ignored because the user entry changed",
                         username
                     ));
+                    return;
+                }
+                s.add_log(format!(
+                    "[WARN] {}: Login failed - {}; starting all-account recovery",
+                    username, err
+                ));
+            }
+            crate::service::request_ui_repaint();
+
+            let acid = client.acid;
+            let result = recovery::recover_login_after_failure(
+                &state,
+                user_idx,
+                &user,
+                &server,
+                &client.client_ip,
+                |account, status_ip| {
+                    let server = server.clone();
+                    async move {
+                        let logout_ip = user_ip::resolve_logout_ip(&account, &status_ip);
+                        let mut logout_client = SrunClient::new_for_logout(
+                            &server,
+                            &account.username,
+                            &logout_ip,
+                            acid,
+                        )
+                        .set_detect_ip(detect_ip)
+                        .set_strict_bind(strict_bind);
+                        logout_client.logout().await
+                    }
+                },
+                || async {
+                    let retry_ip = user_ip::resolve_login_ip(&user);
+                    let mut retry_client =
+                        SrunClient::new(&server, &username, &password, &retry_ip)
+                            .set_detect_ip(detect_ip)
+                            .set_strict_bind(strict_bind)
+                            .set_double_stack(double_stack);
+                    {
+                        let s = state.lock().unwrap();
+                        let cfg = &s.config;
+                        retry_client = retry_client
+                            .set_n(cfg.n)
+                            .set_type(cfg.utype)
+                            .set_acid(cfg.acid)
+                            .set_os(&cfg.os)
+                            .set_name(&cfg.name)
+                            .set_retry_delay(cfg.retry_delay)
+                            .set_retry_times(cfg.retry_times);
+                    }
+                    retry_client.login().await?;
+                    Ok(retry_client.client_ip)
+                },
+            )
+            .await;
+            match result {
+                Ok(ip) => {
+                    let applied = {
+                        let mut s = state.lock().unwrap();
+                        if login_context_matches(&s, generation, &server, user_idx, &user) {
+                            mark_pending_login(&mut s, user_idx, ip.clone());
+                            s.add_log(format!("[OK] {}: Login recovery succeeded, IP={}, waiting for server confirmation", username, ip));
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if applied {
+                        let st = state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            sync_online_state(&st).await;
+                        });
+                    }
+                }
+                Err(retry_error) => {
+                    let mut s = state.lock().unwrap();
+                    if login_context_matches(&s, generation, &server, user_idx, &user) {
+                        let detail =
+                            format!("Login failed: {}; recovery failed: {}", err, retry_error);
+                        s.user_statuses[user_idx].state = LoginState::Error;
+                        s.user_statuses[user_idx].last_error = detail.clone();
+                        s.add_log(format!("[ERROR] {}: {}", username, detail));
+                    }
                 }
             }
         }
@@ -894,25 +897,6 @@ mod tests {
         }
         s.config.enable_ipv4_internet_probe = false;
         assert_eq!(login_blocking_account(&s), Some(0));
-    }
-
-    #[test]
-    fn logout_retry_requires_the_exact_error_code() {
-        assert!(requires_logout_retry(
-            "Login failed: err_code=2, error=login_error"
-        ));
-        for error in [
-            "err_code=20",
-            "err_code=200",
-            "other_err_code=2",
-            "err_code=2abc",
-            "",
-        ] {
-            assert!(
-                !requires_logout_retry(error),
-                "would trigger unnecessary logout: {error}"
-            );
-        }
     }
 
     #[test]

@@ -157,6 +157,7 @@ impl CampusNetApp {
                     }
                 } else if ui
                     .add_enabled(!auth_busy, egui::Button::new(t.btn_login))
+                    .on_hover_text(t.login_recovery_hint)
                     .clicked()
                 {
                     auth::spawn_login(self.state.clone(), user_idx);
@@ -239,7 +240,10 @@ impl CampusNetApp {
                         !busy && !preserve_session,
                         egui::Button::new(t.btn_login_all),
                     )
-                    .on_hover_text(t.one_click_login_hint)
+                    .on_hover_text(format!(
+                        "{}\n{}",
+                        t.one_click_login_hint, t.login_recovery_hint
+                    ))
                     .clicked()
                 {
                     let state = self.state.clone();

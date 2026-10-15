@@ -4,23 +4,44 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) fn decode_body(bytes: &[u8]) -> String {
+pub(crate) fn decode_body(bytes: &[u8], content_type: Option<&str>) -> anyhow::Result<String> {
+    let invalid_encoding = || {
+        anyhow::anyhow!(
+            "Authentication response text encoding is invalid; cannot decode server message"
+        )
+    };
+    // A BOM overrides HTTP charset and must not reach the JSONP parser.
+    if let Some((encoding, prefix_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(&bytes[prefix_len..])
+            .map(|text| text.into_owned())
+            .ok_or_else(invalid_encoding);
+    }
+    let declared_encoding = content_type.and_then(|header| {
+        header.split(';').skip(1).find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("charset") {
+                return None;
+            }
+            encoding_rs::Encoding::for_label(value.trim().trim_matches(['\'', '"']).as_bytes())
+        })
+    });
+    if let Some(text) = declared_encoding
+        .and_then(|encoding| encoding.decode_without_bom_handling_and_without_replacement(bytes))
+    {
+        return Ok(text.into_owned());
+    }
+    // Missing/unsupported headers, or a declared encoding that cannot decode:
+    // preserve the legacy UTF-8 -> GBK fallback. GBK also decodes GB18030 here.
     if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_string();
+        return Ok(s.to_string());
     }
-    // UTF-8 failed, try GBK (common for Chinese campus network servers)
-    if let Some(s) = encoding_rs::Encoding::for_label("gbk".as_bytes()).and_then(|enc| {
-        let (cow, _enc, had_errors) = enc.decode(bytes);
-        if had_errors {
-            None
-        } else {
-            Some(cow.into_owned())
-        }
-    }) {
-        return s;
+    if let Some(text) = encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes)
+    {
+        return Ok(text.into_owned());
     }
-    // Last resort: lossy UTF-8
-    String::from_utf8_lossy(bytes).into_owned()
+    // Never insert replacement glyphs into a JSON error message or log raw bytes.
+    Err(invalid_encoding())
 }
 
 const PATH_GET_CHALLENGE: &str = "/cgi-bin/get_challenge";
@@ -119,8 +140,13 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
         anyhow::bail!("Authentication server returned HTTP {}", status.as_u16());
     }
 
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
-    let body = decode_body(&bytes);
+    let body = decode_body(&bytes, content_type.as_deref())?;
     let json_str = crate::core::jsonp::strip_jsonp(&body)
         .map_err(|_| anyhow::anyhow!("Authentication server returned invalid JSONP"))?;
 
@@ -139,7 +165,7 @@ fn parse_json_response<T: for<'de> Deserialize<'de>>(json_str: &str) -> anyhow::
 }
 
 fn validate_logout_response(result: &PortalResponse) -> anyhow::Result<()> {
-    if result.error == "not_online"
+    if matches!(result.error.as_str(), "not_online" | "not_online_error")
         || result.error == "ok"
         || (result.error.is_empty() && (result.res == "ok" || result.suc_msg == "logout_ok"))
     {
@@ -601,6 +627,7 @@ mod tests {
             r#"{"error":"ok","suc_msg":"logout_ok","res":"ok"}"#,
             r#"{"res":"ok","suc_msg":"logout_ok"}"#,
             r#"{"error":"not_online","error_msg":"already offline"}"#,
+            r#"{"error":"not_online_error","error_msg":"already offline"}"#,
         ] {
             let response: PortalResponse = serde_json::from_str(json).unwrap();
             assert!(validate_logout_response(&response).is_ok());
@@ -620,9 +647,78 @@ mod tests {
     #[test]
     fn response_decoder_handles_utf8_and_gbk() {
         let body = "sdu({\"error_msg\":\"认证失败\"})";
-        assert_eq!(decode_body(body.as_bytes()), body);
+        assert_eq!(decode_body(body.as_bytes(), None).unwrap(), body);
         let (encoded, _, errors) = encoding_rs::GBK.encode(body);
         assert!(!errors);
-        assert_eq!(decode_body(&encoded), body);
+        assert_eq!(decode_body(&encoded, None).unwrap(), body);
+    }
+
+    #[test]
+    fn declared_gbk_is_used_when_its_bytes_are_also_valid_utf8() {
+        let body = "sdu({\"error_msg\":\"忙\"})";
+        let (encoded, _, errors) = encoding_rs::GBK.encode(body);
+        assert!(!errors);
+        assert!(std::str::from_utf8(&encoded).is_ok());
+        for content_type in [
+            "application/javascript; charset=gbk",
+            "text/plain; CHARSET = \"Gb2312\"",
+        ] {
+            assert_eq!(decode_body(&encoded, Some(content_type)).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn response_bom_is_removed_before_parsing_jsonp() {
+        let body = "sdu({\"error_msg\":\"认证失败\"})";
+        let bytes = [b"\xEF\xBB\xBF".as_slice(), body.as_bytes()].concat();
+        let decoded = decode_body(&bytes, Some("text/plain; charset=gbk")).unwrap();
+        assert_eq!(decoded, body);
+        assert!(crate::core::jsonp::strip_jsonp(&decoded).is_ok());
+    }
+
+    #[test]
+    fn undecodable_response_is_rejected_instead_of_displaying_replacement_text() {
+        let bytes = b"sdu({\"error_msg\":\"server-payload-marker\xFF\"})";
+        let error = decode_body(bytes, None)
+            .expect_err("invalid bytes must not reach UI as replacement glyphs");
+        assert!(!error.to_string().contains("server-payload-marker"));
+    }
+
+    #[test]
+    fn declared_gb18030_preserves_characters_outside_gbk() {
+        let body = "sdu({\"error_msg\":\"请重试😀\"})";
+        let (encoded, _, errors) = encoding_rs::GB18030.encode(body);
+        assert!(!errors);
+        assert_eq!(
+            decode_body(&encoded, Some("application/javascript; charset=gb18030")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn missing_unknown_or_unusable_charset_keeps_the_legacy_fallback() {
+        let body = "sdu({\"error_msg\":\"认证失败\"})";
+        let (encoded, _, errors) = encoding_rs::GBK.encode(body);
+        assert!(!errors);
+        for header in [
+            None,
+            Some("text/plain; charset=unknown"),
+            Some("text/plain; charset=utf-8"),
+        ] {
+            assert_eq!(decode_body(&encoded, header).unwrap(), body);
+        }
+        assert_eq!(
+            decode_body(body.as_bytes(), Some("text/plain; charset=unknown")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn json_unicode_escapes_are_decoded_into_readable_server_errors() {
+        let bytes = br#"sdu({"error_msg":"\u8ba4\u8bc1\u5931\u8d25"})"#;
+        let body = decode_body(bytes, Some("text/javascript; charset=utf-8")).unwrap();
+        let response: PortalResponse =
+            parse_json_response(crate::core::jsonp::strip_jsonp(&body).unwrap()).unwrap();
+        assert_eq!(response.error_msg, "认证失败");
     }
 }

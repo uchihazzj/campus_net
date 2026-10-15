@@ -246,6 +246,23 @@ fn collapsed_about_still_shows_available_updates() {
 }
 
 #[test]
+fn decoded_chinese_server_error_reaches_the_ui_unchanged() {
+    let mut app = fixture(Lang::Chinese, LoginState::Error);
+    let body = r#"sdu({"error_msg":"忙"})"#;
+    let (bytes, _, errors) = encoding_rs::GBK.encode(body);
+    assert!(!errors);
+    let decoded =
+        crate::core::srun::decode_body(&bytes, Some("text/javascript; charset=gbk")).unwrap();
+    let json = crate::core::jsonp::strip_jsonp(&decoded).unwrap();
+    let response: serde_json::Value = serde_json::from_str(json).unwrap();
+    let message = format!("error_msg={}", response["error_msg"].as_str().unwrap());
+    assert_eq!(message, "error_msg=忙");
+    app.state.lock().unwrap().user_statuses[0].last_error = message.clone();
+    let (_, out) = render(&mut app, [520.0, 700.0], false, "zh_server_error");
+    assert!(text_rect(&out.shapes, &message).is_some());
+}
+
+#[test]
 fn expanded_settings_keep_server_drafts_out_of_live_config() {
     let mut app = fixture(Lang::English, LoginState::LoggedOut);
     let before = serde_json::to_value(&app.state.lock().unwrap().config).unwrap();
