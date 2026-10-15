@@ -1,5 +1,4 @@
-use egui::Color32;
-
+use super::presentation::{tone_color, Tone};
 use super::CampusNetApp;
 use crate::service::UpdateStatus;
 
@@ -11,15 +10,9 @@ impl CampusNetApp {
             s.update_status.clone()
         };
 
-        let busy = matches!(
-            status,
-            UpdateStatus::Checking
-                | UpdateStatus::Downloading
-                | UpdateStatus::PreparingUpdate
-                | UpdateStatus::Restarting
-        );
+        let busy = crate::service::update_scheduler::update_busy(&status);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{} v{}",
                 t.version_label,
@@ -40,20 +33,24 @@ impl CampusNetApp {
             }
         });
 
-        ui.horizontal(|ui| match &status {
+        ui.horizontal_wrapped(|ui| match &status {
             UpdateStatus::Idle => {}
             UpdateStatus::Checking => {
-                ui.colored_label(Color32::GRAY, t.update_checking);
+                ui.spinner();
+                ui.weak(t.update_checking);
             }
             UpdateStatus::UpToDate => {
-                ui.colored_label(Color32::GREEN, t.update_up_to_date);
+                ui.colored_label(tone_color(ui, Tone::Positive), t.update_up_to_date);
             }
             UpdateStatus::Available {
                 latest,
                 release_url,
                 download_url,
             } => {
-                ui.colored_label(Color32::YELLOW, t.update_available.replace("{}", latest));
+                ui.colored_label(
+                    tone_color(ui, Tone::Warning),
+                    t.update_available.replace("{}", latest),
+                );
                 ui.add_space(4.0);
 
                 if ui.button(t.btn_auto_update).clicked() {
@@ -68,16 +65,20 @@ impl CampusNetApp {
                 ui.hyperlink_to(t.btn_open_release, release_url);
             }
             UpdateStatus::Downloading => {
-                ui.colored_label(Color32::YELLOW, t.update_downloading);
+                ui.spinner();
+                ui.colored_label(tone_color(ui, Tone::Warning), t.update_downloading);
             }
             UpdateStatus::PreparingUpdate => {
-                ui.colored_label(Color32::YELLOW, t.update_preparing);
+                ui.colored_label(tone_color(ui, Tone::Warning), t.update_preparing);
             }
             UpdateStatus::Restarting => {
-                ui.colored_label(Color32::GREEN, t.update_restarting);
+                ui.colored_label(tone_color(ui, Tone::Positive), t.update_restarting);
             }
             UpdateStatus::Failed(e) => {
-                ui.colored_label(Color32::RED, format!("{}: {}", t.update_failed, e));
+                ui.colored_label(
+                    tone_color(ui, Tone::Error),
+                    format!("{}: {}", t.update_failed, e),
+                );
             }
         });
     }

@@ -1,16 +1,18 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use egui::{Color32, RichText, ScrollArea};
+use egui::{RichText, ScrollArea};
 use tray_icon::TrayIcon;
 
-use crate::core::srun::SrunClient;
 use crate::platform::autostart;
-use crate::service::{Ipv4InternetStatus, SharedState};
-use crate::ui::l10n::{self, Lang, UiText};
+use crate::service::{
+    config::StoredUser, AuthServerStatus, Ipv4InternetStatus, SharedState, UpdateStatus,
+};
+use crate::ui::l10n::{self, UiText};
 
 mod edit_dialog;
 mod icon;
+mod presentation;
 mod settings;
 mod tray;
 mod update_ui;
@@ -18,13 +20,17 @@ mod users;
 pub(crate) mod window;
 
 pub use icon::create_window_icon;
+pub(crate) use presentation::configure_style;
+use presentation::{card_frame, connection_status, tone_color, ConnectionStatus, Tone};
 pub(crate) use tray::FORCE_QUIT;
 
 pub struct CampusNetApp {
     state: SharedState,
     _tray_icon: Option<TrayIcon>,
-    quit_requested: bool,
     window_hidden: bool,
+    pending_delete: Option<(usize, StoredUser)>,
+    server_draft: String,
+    server_original: String,
     editing_user_idx: Option<usize>,
     edit_username: String,
     edit_password: String,
@@ -34,17 +40,17 @@ pub struct CampusNetApp {
     edit_original_ip: String,
     edit_original_if_name: String,
     show_add_dialog: bool,
+    edit_error: bool,
     edit_detected_ip: Option<String>,
     edit_interfaces: Vec<(String, std::net::IpAddr)>,
     edit_network_rx: Option<crossbeam_channel::Receiver<Vec<(String, std::net::IpAddr)>>>,
-    cached_lang: Lang,
 }
 
 impl CampusNetApp {
     pub fn new(state: SharedState) -> Self {
-        let lang = {
+        let (lang, server) = {
             let s = state.lock().unwrap();
-            s.config.language
+            (s.config.language, s.config.server.clone())
         };
         let t = l10n::get_text(lang);
         let tray_icon = tray::create_tray_icon(state.clone(), &t);
@@ -69,8 +75,10 @@ impl CampusNetApp {
         Self {
             state,
             _tray_icon: tray_icon,
-            quit_requested: false,
             window_hidden: false,
+            pending_delete: None,
+            server_draft: server.clone(),
+            server_original: server,
             editing_user_idx: None,
             edit_username: String::new(),
             edit_password: String::new(),
@@ -80,109 +88,57 @@ impl CampusNetApp {
             edit_original_ip: String::new(),
             edit_original_if_name: String::new(),
             show_add_dialog: false,
+            edit_error: false,
             edit_detected_ip: None,
             edit_interfaces: Vec::new(),
             edit_network_rx: None,
-            cached_lang: lang,
         }
     }
 
-    fn t(&mut self) -> UiText {
+    fn t(&self) -> UiText {
         let lang = {
             let s = self.state.lock().unwrap();
             s.config.language
         };
-        self.cached_lang = lang;
         l10n::get_text(lang)
     }
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        ui.horizontal(|ui| {
-            ui.heading(RichText::new(t.window_title).size(20.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let (campus_ip, ipv4_internet, online_info) = {
-                    let s = self.state.lock().unwrap();
-                    (
-                        s.campus_ip.clone(),
-                        s.ipv4_internet.clone(),
-                        s.current_online_info().cloned(),
-                    )
-                };
-
-                if let Some(ref info) = online_info {
-                    ui.colored_label(
-                        Color32::GREEN,
-                        format!("{} {}", t.campus_account_label, info.user_name),
-                    );
-                }
-
-                let ip_text = campus_ip.as_deref().unwrap_or(t.campus_ipv4_none);
-                let ip_color = if campus_ip.is_some() {
-                    Color32::GREEN
+        let (
+            status,
+            campus_ip,
+            account,
+            server,
+            auth_server,
+            internet,
+            query_busy,
+            auth_busy,
+            reconnect,
+            fallback_offline,
+        ) = {
+            let s = self.state.lock().unwrap();
+            (
+                connection_status(&s),
+                s.campus_ip.clone(),
+                s.current_online_info().map(|info| info.user_name.clone()),
+                s.config.server.clone(),
+                s.auth_server.clone(),
+                s.ipv4_internet.clone(),
+                s.online_query_busy,
+                s.authentication_busy(),
+                if !s.config.auto_reconnect {
+                    t.reconnect_disabled
+                } else if s.suppress_auto_reconnect {
+                    t.reconnect_paused
                 } else {
-                    Color32::GRAY
-                };
-                ui.colored_label(ip_color, format!("{} {}", t.campus_ipv4_label, ip_text));
-
-                if ipv4_internet != Ipv4InternetStatus::Disabled {
-                    let (inet_color, inet_text) = match ipv4_internet {
-                        Ipv4InternetStatus::Reachable => {
-                            (Color32::GREEN, t.ipv4_internet_reachable)
-                        }
-                        Ipv4InternetStatus::CaptivePortal => {
-                            (Color32::YELLOW, t.ipv4_internet_captive)
-                        }
-                        Ipv4InternetStatus::Unreachable => {
-                            (Color32::RED, t.ipv4_internet_unreachable)
-                        }
-                        Ipv4InternetStatus::ProbeFailed => {
-                            (Color32::YELLOW, t.ipv4_internet_probe_failed)
-                        }
-                        Ipv4InternetStatus::Checking => (Color32::GRAY, t.ipv4_internet_checking),
-                        Ipv4InternetStatus::Disabled => (Color32::GRAY, ""),
-                    };
-                    ui.colored_label(
-                        inet_color,
-                        format!("{} {}", t.ipv4_internet_label, inet_text),
-                    );
-                }
-            });
-        });
-        ui.separator();
-
-        ui.horizontal(|ui| {
-            ui.label(t.server_label);
-            let mut server = {
-                let s = self.state.lock().unwrap();
-                s.config.server.clone()
-            };
-            let resp = ui
-                .add_enabled(
-                    !self.state.lock().unwrap().authentication_busy(),
-                    egui::TextEdit::singleline(&mut server).hint_text(t.server_hint),
-                )
-                .on_hover_text(t.server_tooltip);
-            if resp.changed() {
-                let mut s = self.state.lock().unwrap();
-                let changed = s.set_server(server.clone());
-                drop(s);
-                if changed {
-                    self.save_config();
-                }
-            }
-            if resp.lost_focus() {
-                let mut s = self.state.lock().unwrap();
-                let changed = s.set_server(SrunClient::normalize_server_url(&server));
-                drop(s);
-                if changed {
-                    self.save_config();
-                }
-            }
-            let (query_busy, auth_busy) = {
-                let s = self.state.lock().unwrap();
-                (s.online_query_busy, s.authentication_busy())
-            };
+                    t.reconnect_enabled
+                },
+                s.definitely_offline() && s.online_info_fail_count > 0,
+            )
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(RichText::new(t.window_title).size(20.0));
             if query_busy {
                 ui.spinner();
             }
@@ -199,6 +155,93 @@ impl CampusNetApp {
                 });
             }
         });
+        card_frame(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (text, tone, hint) = match status {
+                ConnectionStatus::Online => (
+                    t.campus_auth_logged_in,
+                    Tone::Positive,
+                    t.campus_auth_confirmed,
+                ),
+                ConnectionStatus::LoggingIn => {
+                    (t.status_logging_in, Tone::Warning, t.auth_busy_hint)
+                }
+                ConnectionStatus::LoggingOut => {
+                    (t.status_logging_out, Tone::Warning, t.auth_busy_hint)
+                }
+                ConnectionStatus::Pending => {
+                    (t.status_pending_confirm, Tone::Warning, t.pending_hint)
+                }
+                ConnectionStatus::Offline => (
+                    t.campus_auth_not_logged_in,
+                    Tone::Muted,
+                    t.one_click_login_hint,
+                ),
+                ConnectionStatus::Stale => (
+                    t.status_last_online,
+                    Tone::Warning,
+                    t.online_info_stale_hint,
+                ),
+                ConnectionStatus::Unknown => (t.campus_auth_unknown, Tone::Muted, t.unknown_hint),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    tone_color(ui, tone),
+                    RichText::new(format!("●  {}", text)).strong(),
+                )
+                .on_hover_text(hint);
+                if let Some(account) = account {
+                    ui.label(format!("{} {}", t.campus_account_label, account));
+                }
+            });
+            ui.small(reconnect);
+            if matches!(
+                status,
+                ConnectionStatus::Pending | ConnectionStatus::Stale | ConnectionStatus::Unknown
+            ) {
+                ui.small(hint);
+            }
+        });
+        egui::CollapsingHeader::new(t.section_details)
+            .id_salt("connection_details")
+            .show(ui, |ui| {
+                ui.label(format!(
+                    "{} {}",
+                    t.campus_auth_label,
+                    match status {
+                        ConnectionStatus::Online => t.campus_auth_logged_in,
+                        ConnectionStatus::Offline => t.campus_auth_not_logged_in,
+                        _ => t.campus_auth_unknown,
+                    }
+                ));
+                if fallback_offline {
+                    ui.weak(t.offline_fallback_hint);
+                }
+                ui.label(format!(
+                    "{} {}",
+                    t.campus_ipv4_label,
+                    campus_ip.as_deref().unwrap_or(t.campus_ipv4_none)
+                ));
+                let server_status = match auth_server {
+                    AuthServerStatus::Reachable => t.auth_server_reachable,
+                    AuthServerStatus::Unreachable => t.auth_server_unreachable,
+                    AuthServerStatus::Unknown => t.auth_server_unknown,
+                };
+                ui.label(format!(
+                    "{} {} · {}",
+                    t.auth_server_label, server_status, server
+                ));
+                let internet_text = match internet {
+                    Ipv4InternetStatus::Reachable => t.ipv4_internet_reachable,
+                    Ipv4InternetStatus::CaptivePortal => t.ipv4_internet_captive,
+                    Ipv4InternetStatus::Unreachable => t.ipv4_internet_unreachable,
+                    Ipv4InternetStatus::ProbeFailed => t.ipv4_internet_probe_failed,
+                    Ipv4InternetStatus::Checking => t.ipv4_internet_checking,
+                    Ipv4InternetStatus::Disabled => t.ipv4_internet_disabled,
+                };
+                ui.label(format!("{} {}", t.ipv4_internet_label, internet_text));
+                ui.weak(t.diagnostics_hint);
+            });
     }
 
     fn render_log(&mut self, ui: &mut egui::Ui) {
@@ -208,6 +251,60 @@ impl CampusNetApp {
 
     fn save_config(&self) {
         crate::service::config::schedule_config_save(self.state.clone());
+    }
+
+    /// Shared by the native app and offline, in-memory UI verification.
+    fn render_content(&mut self, ctx: &egui::Context) {
+        let dialog_open = self.show_add_dialog
+            || self.editing_user_idx.is_some()
+            || self.pending_delete.is_some();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(!dialog_open, |ui| {
+                        self.render_top_bar(ui);
+                        ui.add_space(4.0);
+                        self.render_user_list(ui);
+                        ui.add_space(4.0);
+                        self.render_settings(ui);
+                        self.render_log(ui);
+                        let t = self.t();
+                        let update = self.state.lock().unwrap().update_status.clone();
+                        let (notice, tone) = match &update {
+                            UpdateStatus::Available { latest, .. } => {
+                                (t.update_available.replace("{}", latest), Tone::Warning)
+                            }
+                            UpdateStatus::Failed(_) => (t.update_failed.into(), Tone::Error),
+                            UpdateStatus::Checking => (t.update_checking.into(), Tone::Muted),
+                            UpdateStatus::Downloading => {
+                                (t.update_downloading.into(), Tone::Warning)
+                            }
+                            UpdateStatus::PreparingUpdate => {
+                                (t.update_preparing.into(), Tone::Warning)
+                            }
+                            UpdateStatus::Restarting => {
+                                (t.update_restarting.into(), Tone::Positive)
+                            }
+                            _ => (format!("v{}", env!("CARGO_PKG_VERSION")), Tone::Muted),
+                        };
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("{} · {}", t.section_about, notice))
+                                .color(tone_color(ui, tone)),
+                        )
+                        .id_salt("about")
+                        .show(ui, |ui| {
+                            self.render_version_section(ui);
+                            ui.hyperlink_to(
+                                "github.com/uchihazzj/campus_net",
+                                "https://github.com/uchihazzj/campus_net",
+                            );
+                        });
+                    });
+                });
+        });
+        self.render_edit_dialog(ctx);
+        self.render_delete_dialog(ctx);
     }
 }
 
@@ -224,12 +321,8 @@ impl eframe::App for CampusNetApp {
             self.window_hidden,
         );
 
-        if self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst) {
-            tracing::info!(
-                "[MainLoop] quit_requested={}, FORCE_QUIT={} — sending Close",
-                self.quit_requested,
-                FORCE_QUIT.load(Ordering::SeqCst)
-            );
+        if FORCE_QUIT.load(Ordering::SeqCst) {
+            tracing::info!("[MainLoop] FORCE_QUIT — sending Close");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -238,29 +331,7 @@ impl eframe::App for CampusNetApp {
             self.save_config();
         }
 
-        self.render_edit_dialog(ctx);
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                self.render_top_bar(ui);
-                ui.add_space(8.0);
-                self.render_user_list(ui);
-                ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    ui.hyperlink_to(
-                        "github.com/uchihazzj/campus_net",
-                        "https://github.com/uchihazzj/campus_net",
-                    );
-                });
-                ui.add_space(4.0);
-                self.render_version_section(ui);
-                ui.add_space(8.0);
-                self.render_settings(ui);
-                ui.add_space(8.0);
-                self.render_log(ui);
-                ui.add_space(4.0);
-            });
-        });
+        self.render_content(ctx);
 
         // Resolve tray requests after rendering so an in-flight close event
         // cannot append a hide command after a request to show the window.
@@ -270,7 +341,7 @@ impl eframe::App for CampusNetApp {
             ctx,
             tray::take_show_request(),
             hide_on_close,
-            self.quit_requested || FORCE_QUIT.load(Ordering::SeqCst),
+            FORCE_QUIT.load(Ordering::SeqCst),
         ) {
             window::WindowAction::Show => {
                 self.window_hidden = false;
@@ -289,3 +360,6 @@ impl eframe::App for CampusNetApp {
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
+
+#[cfg(test)]
+mod preview_tests;

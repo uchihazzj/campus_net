@@ -1,4 +1,8 @@
-use egui::{Color32, RichText};
+use egui::RichText;
+
+use super::presentation::{
+    binding_hint, card_frame, deletion_is_current, format_duration, tone_color, Tone,
+};
 
 use super::CampusNetApp;
 use crate::core::utils::get_network_interfaces;
@@ -47,240 +51,269 @@ impl CampusNetApp {
         self.edit_original_username.clear();
         self.edit_original_ip.clear();
         self.edit_original_if_name.clear();
+        self.edit_error = false;
         self.refresh_edit_network_cache();
         self.show_add_dialog = true;
     }
 
-    fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) -> bool {
+    fn open_edit_dialog(&mut self, user_idx: usize) {
+        let user = self
+            .state
+            .lock()
+            .unwrap()
+            .config
+            .users
+            .get(user_idx)
+            .cloned();
+        if let Some(user) = user {
+            self.refresh_edit_network_cache();
+            self.editing_user_idx = Some(user_idx);
+            self.edit_username = user.username.clone();
+            self.edit_password.clear();
+            self.edit_ip = user.ip.clone().unwrap_or_default();
+            self.edit_if_name = user.if_name.clone().unwrap_or_default();
+            self.edit_original_username = user.username;
+            self.edit_original_ip = user.ip.unwrap_or_default();
+            self.edit_original_if_name = user.if_name.unwrap_or_default();
+            self.show_add_dialog = false;
+            self.edit_error = false;
+        }
+    }
+
+    fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) {
         let t = self.t();
-        let (user, state, current_ip, last_error, auth_busy, confirmed_info, stale) = {
+        let (user, status, auth_busy, confirmed_info, session_known) = {
             let s = self.state.lock().unwrap();
-            let Some(user) = s.config.users.get(user_idx) else {
-                return false;
-            };
-            let Some(us) = s.user_statuses.get(user_idx) else {
-                return false;
+            let (Some(user), Some(status)) =
+                (s.config.users.get(user_idx), s.user_statuses.get(user_idx))
+            else {
+                return;
             };
             (
                 user.clone(),
-                us.state.clone(),
-                us.current_ip.clone(),
-                us.last_error.clone(),
+                status.clone(),
                 s.authentication_busy(),
                 s.confirmed_user_info(user_idx).cloned(),
-                s.online_info_stale,
+                s.definitely_offline() || s.current_online_info().is_some(),
             )
         };
-        let mut delete_requested = false;
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        card_frame(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                match &state {
-                    LoginState::Online => {
-                        let color = if confirmed_info.is_some() {
-                            Color32::GREEN
-                        } else {
-                            Color32::GRAY
-                        };
-                        ui.colored_label(color, "●");
-                        ui.label(RichText::new(t.status_online).color(color));
-                        if confirmed_info.is_some() {
-                            ui.colored_label(Color32::GREEN, t.campus_auth_confirmed);
-                        } else {
-                            ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
+                let title_width = (ui.available_width() - 76.0).max(40.0);
+                ui.add_sized(
+                    [title_width, 24.0],
+                    egui::Label::new(RichText::new(&user.username).strong())
+                        .truncate()
+                        .halign(egui::Align::Min),
+                )
+                .on_hover_text(&user.username);
+                ui.add_enabled_ui(!auth_busy, |ui| {
+                    ui.menu_button(t.btn_more, |ui| {
+                        if ui.button(t.btn_edit).on_hover_text(t.hint_edit).clicked() {
+                            self.open_edit_dialog(user_idx);
+                            ui.close_menu();
                         }
-                    }
-                    LoginState::PendingConfirm => {
-                        ui.colored_label(Color32::YELLOW, "◐");
-                        ui.label(RichText::new(t.status_pending_confirm).color(Color32::YELLOW));
-                        if stale {
-                            ui.colored_label(Color32::GRAY, t.online_info_stale_hint);
-                        }
-                    }
-                    LoginState::LoggingIn => {
-                        ui.colored_label(Color32::YELLOW, "◐");
-                        ui.label(RichText::new(t.status_logging_in).color(Color32::YELLOW));
-                    }
-                    LoginState::LoggingOut => {
-                        ui.colored_label(Color32::YELLOW, "◐");
-                        ui.label(RichText::new(t.status_logging_out).color(Color32::YELLOW));
-                    }
-                    LoginState::LoggedOut => {
-                        ui.colored_label(Color32::GRAY, "○");
-                        ui.label(t.status_offline);
-                    }
-                    LoginState::Error => {
-                        ui.colored_label(Color32::RED, "⬤");
-                        ui.label(RichText::new(t.status_error).color(Color32::RED));
-                    }
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!auth_busy, egui::Button::new(t.btn_delete))
-                        .on_hover_text(t.hint_delete)
-                        .clicked()
-                    {
-                        delete_requested = true;
-                        return;
-                    }
-
-                    if ui
-                        .add_enabled(!auth_busy, egui::Button::new(t.btn_edit))
-                        .on_hover_text(t.hint_edit)
-                        .clicked()
-                    {
-                        let user = {
-                            let s = self.state.lock().unwrap();
-                            s.config.users.get(user_idx).cloned()
-                        };
-                        if let Some(user) = user {
-                            self.refresh_edit_network_cache();
-                            self.editing_user_idx = Some(user_idx);
-                            self.edit_username = user.username.clone();
-                            self.edit_password.clear();
-                            self.edit_ip = user.ip.clone().unwrap_or_default();
-                            self.edit_if_name = user.if_name.clone().unwrap_or_default();
-                            self.edit_original_username = user.username;
-                            self.edit_original_ip = user.ip.unwrap_or_default();
-                            self.edit_original_if_name = user.if_name.unwrap_or_default();
-                            self.show_add_dialog = false;
-                        }
-                    }
-
-                    let is_busy = auth_busy;
-
-                    if should_show_logout_button(&state) {
                         if ui
-                            .add_enabled(!is_busy, egui::Button::new(t.btn_logout))
+                            .button(RichText::new(t.btn_delete).color(tone_color(ui, Tone::Error)))
+                            .on_hover_text(t.hint_delete)
                             .clicked()
                         {
-                            auth::spawn_logout(self.state.clone(), user_idx);
+                            self.pending_delete = Some((user_idx, user.clone()));
+                            ui.close_menu();
                         }
-                    } else if ui
-                        .add_enabled(!is_busy, egui::Button::new(t.btn_login))
-                        .clicked()
-                    {
-                        auth::spawn_login(self.state.clone(), user_idx);
-                    }
+                    });
                 });
             });
-
-            ui.horizontal(|ui| {
-                ui.label(t.user_label);
-                ui.label(RichText::new(&user.username).strong());
+            let (status_text, tone, hint) = match status.state {
+                LoginState::Online if confirmed_info.is_some() => {
+                    (t.status_online, Tone::Positive, t.campus_auth_confirmed)
+                }
+                LoginState::Online => (
+                    t.status_last_online,
+                    Tone::Warning,
+                    t.online_info_stale_hint,
+                ),
+                LoginState::PendingConfirm => {
+                    (t.status_pending_confirm, Tone::Warning, t.pending_hint)
+                }
+                LoginState::LoggingIn => (t.status_logging_in, Tone::Warning, t.auth_busy_hint),
+                LoginState::LoggingOut => (t.status_logging_out, Tone::Warning, t.auth_busy_hint),
+                LoginState::LoggedOut if session_known => {
+                    (t.status_offline, Tone::Muted, t.one_click_login_hint)
+                }
+                LoginState::LoggedOut => (t.campus_auth_unknown, Tone::Muted, t.unknown_hint),
+                LoginState::Error => (t.status_error, Tone::Error, status.last_error.as_str()),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(tone_color(ui, tone), format!("●  {}", status_text))
+                    .on_hover_text(hint);
+                if should_show_logout_button(&status.state) {
+                    if ui
+                        .add_enabled(!auth_busy, egui::Button::new(t.btn_logout))
+                        .clicked()
+                    {
+                        auth::spawn_logout(self.state.clone(), user_idx);
+                    }
+                } else if ui
+                    .add_enabled(!auth_busy, egui::Button::new(t.btn_login))
+                    .clicked()
+                {
+                    auth::spawn_login(self.state.clone(), user_idx);
+                }
             });
-
-            if let Some(ref info) = confirmed_info {
-                ui.label(format!("{} {}", t.ip_label, info.online_ip));
-
-                let hours = info.sum_seconds / 3600;
-                ui.label(format!("{} {}h", t.online_duration_label, hours));
-
-                if info.remain_bytes > 0 {
+            if let Some(info) = confirmed_info {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} {}", t.ip_label, info.online_ip));
                     ui.label(format!(
                         "{} {}",
-                        t.remain_traffic_label,
-                        crate::ui::format_bytes(info.remain_bytes)
-                    ));
-                }
-
-                if !info.products_name.is_empty() {
-                    ui.colored_label(
-                        Color32::GRAY,
-                        format!("{} {}", t.plan_label, info.products_name),
-                    );
-                }
-            } else if !current_ip.is_empty() {
-                ui.label(format!("{} {}", t.ip_label, current_ip));
-            } else {
-                if let Some(ref ip) = user.ip {
-                    if !ip.is_empty() {
+                        t.online_duration_label,
+                        format_duration(info.sum_seconds)
+                    ))
+                    .on_hover_text(t.duration_hint);
+                    if info.remain_bytes > 0 {
                         ui.label(format!(
                             "{} {}",
-                            t.ip_label,
-                            t.ip_configured.replace("{}", ip)
+                            t.remain_traffic_label,
+                            crate::ui::format_bytes(info.remain_bytes)
                         ));
-                    } else if let Some(ref if_name) = user.if_name {
-                        ui.label(t.ip_interface.replace("{}", if_name));
-                    } else {
-                        ui.label(t.ip_auto_detect);
                     }
-                } else if let Some(ref if_name) = user.if_name {
-                    ui.label(t.ip_interface.replace("{}", if_name));
-                } else {
-                    ui.label(t.ip_auto_detect);
+                });
+                if !info.products_name.is_empty() {
+                    ui.weak(format!("{} {}", t.plan_label, info.products_name));
+                }
+            } else if !status.current_ip.is_empty() {
+                ui.label(format!("{} {}", t.last_ip_label, status.current_ip));
+            }
+            ui.small(binding_hint(&user, &t));
+            if user.if_name.as_deref().is_some_and(|name| !name.is_empty()) {
+                if let Some(ip) = user.ip.as_deref().filter(|ip| !ip.is_empty()) {
+                    ui.weak(format!("{} {}", t.fallback_ip_label, ip));
                 }
             }
-
-            if !last_error.is_empty() {
-                ui.colored_label(Color32::RED, format!("Error: {}", last_error));
+            if !status.last_error.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{}: {}", t.status_error, status.last_error))
+                            .color(tone_color(ui, Tone::Error)),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&status.last_error);
             }
         });
-        delete_requested
     }
 
     pub(super) fn render_user_list(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        let user_count = {
+        let (user_count, busy, preserve_session, can_logout) = {
             let s = self.state.lock().unwrap();
-            s.config.users.len()
+            (
+                s.config.users.len(),
+                s.authentication_busy(),
+                s.current_online_info().is_some()
+                    || (!s.definitely_offline()
+                        && s.user_statuses
+                            .iter()
+                            .any(|u| u.state == LoginState::PendingConfirm)),
+                s.user_statuses
+                    .iter()
+                    .any(|u| should_show_logout_button(&u.state)),
+            )
         };
-
-        let mut delete_idx = None;
-        if user_count == 0 {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(t.no_users_hint);
-                ui.add_space(20.0);
-            });
-        } else {
-            for idx in 0..user_count {
-                if self.render_user_card(ui, idx) {
-                    delete_idx = Some(idx);
-                }
-                ui.add_space(4.0);
-            }
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button(t.btn_add_user).clicked() {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("{} · {}", t.section_accounts, user_count));
+            if ui
+                .add_enabled(!busy, egui::Button::new(t.btn_add_user))
+                .clicked()
+            {
                 self.open_add_dialog();
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let any_busy = {
-                    let s = self.state.lock().unwrap();
-                    s.authentication_busy()
-                };
-
+        });
+        if user_count == 0 {
+            ui.weak(t.no_users_hint);
+        } else {
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(!any_busy, egui::Button::new(t.btn_login_all))
+                    .add_enabled(
+                        !busy && !preserve_session,
+                        egui::Button::new(t.btn_login_all),
+                    )
+                    .on_hover_text(t.one_click_login_hint)
                     .clicked()
                 {
                     let state = self.state.clone();
                     tokio::spawn(async move { auth::do_one_click_login(state).await });
                 }
                 if ui
-                    .add_enabled(!any_busy, egui::Button::new(t.btn_logout_all))
+                    .add_enabled(!busy && can_logout, egui::Button::new(t.btn_logout_all))
+                    .on_hover_text(t.one_click_logout_hint)
                     .clicked()
                 {
                     let state = self.state.clone();
                     tokio::spawn(async move { auth::do_one_click_logout(state).await });
                 }
             });
-        });
+            for idx in 0..user_count {
+                self.render_user_card(ui, idx);
+                ui.add_space(3.0);
+            }
+        }
+    }
 
-        // Keep indices stable for the entire frame; remove after every card
-        // and button has finished using its snapshot.
-        if let Some(idx) = delete_idx {
-            let removed = self.state.lock().unwrap().remove_user(idx);
+    pub(super) fn render_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some((idx, expected)) = self.pending_delete.clone() else {
+            return;
+        };
+        let t = self.t();
+        let mut open = true;
+        let mut cancel = false;
+        let mut confirm = false;
+        let (can_delete, busy) = {
+            let s = self.state.lock().unwrap();
+            (
+                deletion_is_current(&s, idx, &expected),
+                s.authentication_busy(),
+            )
+        };
+        egui::Window::new(t.delete_title)
+            .id(egui::Id::new("delete_account"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width((ctx.screen_rect().width() - 48.0).clamp(200.0, 380.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&expected.username).strong());
+                ui.label(t.delete_hint);
+                ui.horizontal_wrapped(|ui| {
+                    cancel = ui.button(t.btn_cancel).clicked();
+                    confirm = ui
+                        .add_enabled(can_delete, egui::Button::new(t.btn_delete))
+                        .clicked();
+                });
+                if !can_delete {
+                    ui.weak(if busy {
+                        t.auth_busy_hint
+                    } else {
+                        t.account_changed_hint
+                    });
+                }
+            });
+        if confirm {
+            let removed = {
+                let mut s = self.state.lock().unwrap();
+                if deletion_is_current(&s, idx, &expected) {
+                    let removed = s.remove_user(idx);
+                    if removed {
+                        s.add_log("[INFO] Removed user".into());
+                    }
+                    removed
+                } else {
+                    false
+                }
+            };
             if removed {
-                self.state
-                    .lock()
-                    .unwrap()
-                    .add_log("[INFO] Removed user".into());
                 if let Some(edit_idx) = self.editing_user_idx {
                     if edit_idx == idx {
                         self.editing_user_idx = None;
@@ -290,8 +323,12 @@ impl CampusNetApp {
                     }
                 }
                 self.save_config();
-                ui.ctx().request_repaint();
+                self.pending_delete = None;
+                ctx.request_repaint();
             }
+        }
+        if cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pending_delete = None;
         }
     }
 }

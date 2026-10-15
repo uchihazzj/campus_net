@@ -9,7 +9,7 @@ use crate::ui::l10n::UiText;
 /// with newest messages at the top and a clear button.
 pub fn render_log_panel(state: &SharedState, ui: &mut egui::Ui, t: &UiText) {
     ui.collapsing(t.section_log, |ui| {
-        let mut text: String = {
+        let text: String = {
             let s = state.lock().unwrap();
             s.log_messages
                 .iter()
@@ -23,15 +23,20 @@ pub fn render_log_panel(state: &SharedState, ui: &mut egui::Ui, t: &UiText) {
             .max_height(200.0)
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+                let mut read_only = text.as_str();
                 ui.add(
-                    egui::TextEdit::multiline(&mut text)
+                    egui::TextEdit::multiline(&mut read_only)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
-                        .interactive(false),
+                        .desired_rows(5)
+                        .frame(false),
                 );
             });
 
         ui.horizontal(|ui| {
+            if ui.button(t.btn_copy).clicked() {
+                ui.output_mut(|output| output.copied_text = text.clone());
+            }
             if ui.button(t.btn_clear).clicked() {
                 let mut s = state.lock().unwrap();
                 s.log_messages.clear();

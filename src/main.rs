@@ -411,6 +411,7 @@ fn main() -> anyhow::Result<()> {
         "Campus Net Client",
         native_options,
         Box::new(move |cc| {
+            app::configure_style(&cc.egui_ctx);
             if let Some(font_data) = load_cjk_font() {
                 let mut fonts = egui::FontDefinitions::default();
                 fonts.font_data.insert("cjk_font".to_owned(), font_data);
