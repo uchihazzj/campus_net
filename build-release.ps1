@@ -46,7 +46,18 @@ Write-Host "Toolchain: $toolchain" -ForegroundColor Cyan
 # Clean if requested
 if ($Clean) {
     Write-Host "Cleaning build artifacts..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force target -ErrorAction SilentlyContinue
+    $buildTargetPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'target'))
+    if ([System.IO.Path]::GetDirectoryName($buildTargetPath) -ne [System.IO.Path]::GetFullPath($PSScriptRoot)) {
+        throw "Build target must stay inside the project directory"
+    }
+    if (Test-Path -LiteralPath $buildTargetPath) {
+        $buildTargetItem = Get-Item -LiteralPath $buildTargetPath -Force
+        if (-not $buildTargetItem.PSIsContainer -or
+            ($buildTargetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "Refusing to clean a non-directory or linked build target"
+        }
+        Remove-Item -LiteralPath $buildTargetPath -Recurse -Force -ErrorAction Stop
+    }
 }
 
 # Build command

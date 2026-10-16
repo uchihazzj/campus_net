@@ -175,6 +175,38 @@ fn apply_ipv4_probe(
     true
 }
 
+fn finish_healthy_iteration(
+    s: &mut crate::service::AppState,
+    expected_generations: (u64, u64),
+    has_usable_ip: bool,
+) -> bool {
+    // A manual switch or a newer query can win after the cycle's decision.
+    // Validate and clear under the same lock so this cycle cannot erase its targets.
+    if s.authentication_busy()
+        || s.online_query_busy
+        || (s.auth_generation, s.online_query_generation) != expected_generations
+        || !matches!(
+            evaluate_reconnect(s, has_usable_ip),
+            ReconnectDecision::Healthy
+        )
+    {
+        return false;
+    }
+    let routing_warning = s.online_info.is_some()
+        && s.config.enable_ipv4_internet_probe
+        && s.ipv4_internet == Ipv4InternetStatus::Unreachable
+        && s.internet_fail_count >= FAILURE_THRESHOLD;
+    if routing_warning {
+        s.add_log(
+            "[WARN] Online but IPv4 unreachable — possible routing issue, not reconnecting"
+                .to_string(),
+        );
+    }
+    let changed = !s.reconnect_targets.is_empty();
+    s.reconnect_targets.clear();
+    routing_warning || changed
+}
+
 /// Run one full monitor iteration. Returns the next backoff_secs value.
 /// This is run as a separate tokio task so panics are caught by the outer loop.
 async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs: u64) -> u64 {
@@ -368,30 +400,12 @@ async fn run_monitor_iteration(state: &SharedState, interval: u64, backoff_secs:
 
     match decision {
         ReconnectDecision::Healthy => {
-            let (has_online, probe_enabled, inet, fc) = {
-                let s = state.lock().unwrap();
-                (
-                    s.online_info.is_some(),
-                    s.config.enable_ipv4_internet_probe,
-                    s.ipv4_internet.clone(),
-                    s.internet_fail_count,
-                )
-            };
-            if has_online
-                && probe_enabled
-                && matches!(inet, Ipv4InternetStatus::Unreachable)
-                && fc >= FAILURE_THRESHOLD
-            {
-                let mut s = state.lock().unwrap();
-                s.add_log(
-                    "[WARN] Online but IPv4 unreachable — possible routing issue, not reconnecting"
-                        .to_string(),
-                );
-            }
-            let mut s = state.lock().unwrap();
-            if !s.reconnect_targets.is_empty() {
-                s.reconnect_targets.clear();
-                drop(s);
+            let changed = finish_healthy_iteration(
+                &mut state.lock().unwrap(),
+                (auth_generation, completed_query_generation),
+                has_usable_ip,
+            );
+            if changed {
                 crate::service::request_ui_repaint();
             }
             interval
@@ -573,6 +587,76 @@ mod tests {
 
     fn make_state() -> AppState {
         AppState::new(AppConfig::default())
+    }
+
+    #[test]
+    fn old_healthy_cycle_preserves_a_new_manual_switch_and_its_confirmation_ip() {
+        for auth_busy in [false, true] {
+            let mut s = make_state();
+            s.config.users = ["fixture-original", "fixture-selected"]
+                .into_iter()
+                .map(|username| StoredUser {
+                    username: username.into(),
+                    encrypted_password: String::new(),
+                    ip: None,
+                    if_name: None,
+                })
+                .collect();
+            s.ensure_statuses();
+            s.campus_ip = Some("10.0.0.2".into());
+            s.campus_auth = CampusAuthStatus::LoggedIn;
+            let cycle = (s.auth_generation, s.online_query_generation);
+            assert!(matches!(
+                evaluate_reconnect(&s, true),
+                ReconnectDecision::Healthy
+            ));
+
+            // A failed old logout may retain A while the new B login awaits confirmation.
+            s.invalidate_auth_context();
+            if !auth_busy {
+                s.invalidate_auth_context();
+            }
+            s.auth_busy = auth_busy;
+            s.user_statuses[0].state = LoginState::Online;
+            s.user_statuses[0].current_ip = "10.0.0.2".into();
+            s.user_statuses[1].state = LoginState::PendingConfirm;
+            s.user_statuses[1].current_ip = "10.0.0.3".into();
+            s.reconnect_targets = vec![1];
+            assert!(!finish_healthy_iteration(&mut s, cycle, true));
+            assert_eq!(s.reconnect_targets, vec![1]);
+            assert_eq!(
+                crate::service::online_info::status_query_ip_from_interfaces(&s, &[]).as_deref(),
+                Some("10.0.0.3")
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_cleanup_rechecks_new_queries_and_keeps_current_routing_diagnostics() {
+        let mut s = make_state();
+        s.campus_ip = Some("10.0.0.2".into());
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        s.online_info = Some(crate::service::OnlineUserInfo::default());
+        s.config.enable_ipv4_internet_probe = true;
+        s.ipv4_internet = Ipv4InternetStatus::Unreachable;
+        s.internet_fail_count = FAILURE_THRESHOLD;
+        s.reconnect_targets = vec![0];
+        let cycle = (s.auth_generation, s.online_query_generation);
+        s.online_query_generation = s.online_query_generation.wrapping_add(1);
+        assert!(!finish_healthy_iteration(&mut s, cycle, true));
+        assert_eq!(s.reconnect_targets, vec![0]);
+        assert!(s.log_messages.is_empty());
+        let cycle = (s.auth_generation, s.online_query_generation);
+        s.online_query_busy = true;
+        assert!(!finish_healthy_iteration(&mut s, cycle, true));
+        s.online_query_busy = false;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        assert!(!finish_healthy_iteration(&mut s, cycle, true));
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        assert!(finish_healthy_iteration(&mut s, cycle, true));
+        assert!(s.reconnect_targets.is_empty());
+        assert_eq!(s.log_messages.len(), 1);
+        assert!(s.log_messages[0].contains("possible routing issue"));
     }
 
     #[test]

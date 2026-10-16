@@ -42,6 +42,15 @@ pub fn update_busy(status: &UpdateStatus) -> bool {
     )
 }
 
+/// The restart phase and authentication/diagnostics must reserve AppState
+/// under the same lock. Downloads themselves do not block normal networking.
+pub(crate) fn restart_pending(status: &UpdateStatus) -> bool {
+    matches!(
+        status,
+        UpdateStatus::PreparingUpdate | UpdateStatus::Restarting
+    )
+}
+
 /// Perform one update check, update AppState accordingly.
 pub fn try_begin_update_check(state: &SharedState) -> bool {
     let mut s = state.lock().unwrap();

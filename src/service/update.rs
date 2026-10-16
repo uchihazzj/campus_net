@@ -287,6 +287,18 @@ fn fail_update(state: &SharedState, message: String) {
     crate::service::request_ui_repaint();
 }
 
+fn prepare_update_restart(s: &mut crate::service::AppState) -> Result<(), String> {
+    if s.authentication_busy() || s.diagnostics.running() {
+        return Err("Cannot restart for update while authentication or diagnostics are active; finish them and retry the update".to_string());
+    }
+    if s.update_status != UpdateStatus::Downloading {
+        return Err("Update download no longer owns its state".to_string());
+    }
+    s.update_status = UpdateStatus::PreparingUpdate;
+    s.add_log("[INFO] Generating updater script...".to_string());
+    Ok(())
+}
+
 /// Download the latest exe from GitHub, generate updater script, launch it, and exit.
 pub async fn perform_update(state: SharedState, version: String, download_url: String) {
     let clean_ver = version.trim_start_matches('v');
@@ -373,10 +385,13 @@ pub async fn perform_update(state: SharedState, version: String, download_url: S
     }
 
     // ── Step 2: Generate updater script ──────────────────
-    {
+    let preparation = {
         let mut s = state.lock().unwrap();
-        s.update_status = UpdateStatus::PreparingUpdate;
-        s.add_log("[INFO] Generating updater script...".to_string());
+        prepare_update_restart(&mut s)
+    };
+    if let Err(error) = preparation {
+        fail_update(&state, error);
+        return;
     }
     crate::service::request_ui_repaint();
 
@@ -566,6 +581,31 @@ try {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_preparation_waits_for_auth_and_diagnostic_restoration() {
+        use crate::service::diagnostics::{FunctionalPhase, RunStatus};
+        for (auth_busy, phase) in [
+            (true, FunctionalPhase::None),
+            (false, FunctionalPhase::Testing),
+            (true, FunctionalPhase::Restoring),
+        ] {
+            let mut s = crate::service::AppState::new(Default::default());
+            s.update_status = UpdateStatus::Downloading;
+            s.auth_busy = auth_busy;
+            s.diagnostics.phase = phase;
+            if phase != FunctionalPhase::None {
+                s.diagnostics.status = RunStatus::Running;
+            }
+            assert!(prepare_update_restart(&mut s).is_err());
+            assert_eq!(s.update_status, UpdateStatus::Downloading);
+            assert!(s.log_messages.is_empty());
+            s.auth_busy = false;
+            s.diagnostics.status = RunStatus::Completed;
+            assert!(prepare_update_restart(&mut s).is_ok());
+            assert_eq!(s.update_status, UpdateStatus::PreparingUpdate);
+        }
+    }
 
     #[test]
     fn update_replaces_the_actual_executable_when_renamed() {

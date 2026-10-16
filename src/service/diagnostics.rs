@@ -101,6 +101,7 @@ impl DiagnosticState {
 pub fn can_start(s: &AppState) -> bool {
     !s.diagnostics.running()
         && !s.authentication_busy()
+        && !super::update_scheduler::restart_pending(&s.update_status)
         && !s
             .online_sessions
             .iter()

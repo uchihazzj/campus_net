@@ -109,6 +109,9 @@ fn build_http_client(strict_bind: bool, ip: &str) -> anyhow::Result<reqwest::Cli
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
+        // Login URLs contain credential-derived fields. Keep redirect support,
+        // but never copy that URL into a redirected request's Referer header.
+        .referer(false)
         .no_proxy();
 
     if strict_bind && !ip.is_empty() {
@@ -274,20 +277,18 @@ impl SrunClient {
         if url.is_empty() {
             return String::new();
         }
-        let with_scheme = if !url.starts_with("http://") && !url.starts_with("https://") {
-            format!("http://{}", url)
-        } else {
+        let with_scheme = if url.contains("://") {
             url.to_string()
-        };
-        if let Some(pos) = with_scheme
-            .get(8..)
-            .and_then(|s| s.find('/'))
-            .map(|p| p + 8)
-        {
-            with_scheme[..pos].to_string()
         } else {
-            with_scheme
+            format!("http://{}", url)
+        };
+        if let Ok(parsed) = reqwest::Url::parse(&with_scheme) {
+            if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() {
+                return parsed.origin().ascii_serialization();
+            }
         }
+        // Leave invalid input for the existing caller validation/error path.
+        with_scheme
     }
 
     pub async fn detect_ip(&mut self) -> anyhow::Result<()> {
@@ -603,6 +604,50 @@ struct PortalResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_server_normalization_keeps_only_the_http_origin() {
+        for (input, expected) in [
+            ("10.0.0.55", "http://10.0.0.55"),
+            ("http://10.0.0.55?ac_id=8", "http://10.0.0.55"),
+            ("http://10.0.0.55#login", "http://10.0.0.55"),
+            ("http://a/", "http://a"),
+            (
+                "auth.example.test:8800/path?ac_id=8#login",
+                "http://auth.example.test:8800",
+            ),
+            (
+                "https://auth.example.test:8443/path",
+                "https://auth.example.test:8443",
+            ),
+            ("HTTP://auth.example.test/path", "http://auth.example.test"),
+            (
+                "http://[2001:db8::1]:8800/path?ac_id=8",
+                "http://[2001:db8::1]:8800",
+            ),
+        ] {
+            let origin = SrunClient::normalize_server_url(input);
+            assert_eq!(origin, expected, "input: {input}");
+            let request = reqwest::Client::new()
+                .get(format!("{origin}{PATH_GET_CHALLENGE}"))
+                .build()
+                .unwrap();
+            assert_eq!(request.url().path(), PATH_GET_CHALLENGE);
+            assert!(request.url().query().is_none());
+            assert!(request.url().fragment().is_none());
+        }
+    }
+
+    #[test]
+    fn authentication_clients_do_not_forward_sensitive_urls_as_referers() {
+        // Inspect the real client configuration without opening a connection.
+        // The pinned reqwest version exposes its automatic Referer flag in Debug.
+        assert!(format!("{:?}", reqwest::Client::new()).contains("referer: true"));
+        for strict_bind in [false, true] {
+            let client = build_http_client(strict_bind, "10.0.0.2").unwrap();
+            assert!(!format!("{client:?}").contains("referer: true"));
+        }
+    }
 
     #[test]
     fn reject_empty_and_short_challenges() {

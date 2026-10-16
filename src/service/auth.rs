@@ -32,6 +32,7 @@ impl AuthOperation {
         let mut s = state.lock().unwrap();
         s.ensure_statuses();
         if s.authentication_busy()
+            || crate::service::update_scheduler::restart_pending(&s.update_status)
             || expected.is_some_and(|(idx, user, generation)| {
                 s.config.users.get(idx) != Some(user) || s.auth_generation != generation
             })
@@ -317,6 +318,22 @@ pub(crate) fn login_will_switch_account(s: &crate::service::AppState, user_idx: 
         && login_blocking_account(s).is_some_and(|online_idx| online_idx != user_idx)
 }
 
+fn logout_client(
+    server: &str,
+    account: &StoredUser,
+    status_ip: &str,
+    acid: i32,
+    detect_ip: bool,
+    strict_bind: bool,
+) -> SrunClient {
+    let ip = user_ip::resolve_logout_ip(account, status_ip);
+    SrunClient::new_for_logout(server, &account.username, &ip, acid)
+        // A known session can outlive a DHCP/route change. Logout must target
+        // that session; assisted detection is still available for fallback IPs.
+        .set_detect_ip(detect_ip && status_ip.is_empty())
+        .set_strict_bind(strict_bind)
+}
+
 async fn logout_for_login_cleanup(
     server: String,
     account: StoredUser,
@@ -325,10 +342,7 @@ async fn logout_for_login_cleanup(
     detect_ip: bool,
     strict_bind: bool,
 ) -> anyhow::Result<()> {
-    let ip = user_ip::resolve_logout_ip(&account, &status_ip);
-    SrunClient::new_for_logout(&server, &account.username, &ip, acid)
-        .set_detect_ip(detect_ip)
-        .set_strict_bind(strict_bind)
+    logout_client(&server, &account, &status_ip, acid, detect_ip, strict_bind)
         .logout()
         .await
 }
@@ -645,7 +659,7 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
         )
     };
 
-    let ip = user_ip::resolve_logout_ip(&user, &status_ip);
+    let mut client = logout_client(&server, &user, &status_ip, acid, detect_ip, strict_bind);
 
     {
         let mut s = state.lock().unwrap();
@@ -664,10 +678,6 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
     crate::service::request_ui_repaint();
 
     auth_event(&state, user_idx, AuthEvent::LogoutStart, None);
-    let mut client = SrunClient::new_for_logout(&server, &username, &ip, acid)
-        .set_detect_ip(detect_ip)
-        .set_strict_bind(strict_bind);
-
     match client.logout().await {
         Ok(()) => {
             auth_event(&state, user_idx, AuthEvent::LogoutOk, None);
@@ -983,6 +993,76 @@ mod tests {
 
     fn state() -> SharedState {
         Arc::new(Mutex::new(AppState::new(AppConfig::default())))
+    }
+
+    #[test]
+    fn updater_restart_blocks_new_authentication_without_changing_reconnect_policy() {
+        use crate::service::UpdateStatus;
+        for status in [UpdateStatus::PreparingUpdate, UpdateStatus::Restarting] {
+            for mode in [
+                AuthMode::Login,
+                AuthMode::Logout,
+                AuthMode::Auto,
+                AuthMode::Diagnostic,
+            ] {
+                let state = state();
+                {
+                    let mut s = state.lock().unwrap();
+                    s.update_status = status.clone();
+                    s.campus_ip = Some("10.0.0.2".into());
+                    s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+                }
+                assert!(AuthOperation::begin(&state, mode, None).is_none());
+                let s = state.lock().unwrap();
+                assert!(!s.auth_busy);
+                assert_eq!(s.auth_generation, 0);
+                assert!(!s.suppress_auto_reconnect);
+            }
+        }
+        // The download itself can coexist with regular auth/reconnect work.
+        let state = state();
+        state.lock().unwrap().update_status = UpdateStatus::Downloading;
+        let owner = AuthOperation::begin(&state, AuthMode::Login, None).unwrap();
+        drop(owner);
+        assert!(!state.lock().unwrap().auth_busy);
+    }
+
+    #[test]
+    fn logout_keeps_the_original_session_ip_when_route_detection_is_enabled() {
+        let user = StoredUser {
+            username: "fixture-logout".into(),
+            encrypted_password: String::new(),
+            ip: Some("10.0.0.3".into()),
+            if_name: None,
+        };
+        for strict_bind in [false, true] {
+            let client = logout_client("http://10.0.0.55", &user, "10.0.0.2", 8, true, strict_bind);
+            assert_eq!(client.ip, "10.0.0.2");
+            assert_eq!(client.client_ip, "10.0.0.2");
+            assert!(
+                !client.detect_ip,
+                "route discovery must not overwrite the original session"
+            );
+            assert_eq!(client.strict_bind, strict_bind);
+        }
+        let fallback = logout_client("http://10.0.0.55", &user, "", 8, true, false);
+        assert_eq!(fallback.client_ip, "10.0.0.3");
+        assert!(
+            fallback.detect_ip,
+            "keep assisted detection without a known session"
+        );
+        let disabled = logout_client("http://10.0.0.55", &user, "", 8, false, false);
+        assert!(!disabled.detect_ip);
+        assert!(
+            SrunClient::new(
+                "http://10.0.0.55",
+                "fixture-login",
+                "fixture-password",
+                "10.0.0.3"
+            )
+            .set_detect_ip(true)
+            .detect_ip
+        );
     }
 
     fn switch_state() -> SharedState {

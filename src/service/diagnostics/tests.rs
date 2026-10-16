@@ -41,6 +41,21 @@ pub(in crate::service::diagnostics) fn fixture() -> SharedState {
     Arc::new(Mutex::new(s))
 }
 
+#[test]
+fn update_restart_defers_diagnostics_but_downloading_does_not_disable_them() {
+    use crate::service::UpdateStatus;
+    for status in [UpdateStatus::PreparingUpdate, UpdateStatus::Restarting] {
+        let state = fixture();
+        state.lock().unwrap().update_status = status;
+        assert!(!can_start(&state.lock().unwrap()));
+        assert!(claim(&state).is_none());
+        assert!(!state.lock().unwrap().diagnostics.running());
+    }
+    let state = fixture();
+    state.lock().unwrap().update_status = UpdateStatus::Downloading;
+    assert!(claim(&state).is_some());
+}
+
 fn auth_snapshot(state: &SharedState) -> String {
     let s = state.lock().unwrap();
     format!(

@@ -18,6 +18,8 @@ cargo build --release --locked --target-dir target/build
 
 也可使用仓库根目录的 `build-release.ps1`，其默认输出为 `target\release\campus-net-client.exe`；使用前确认该路径没有正在运行的客户端。
 
+`-Clean` 只清理脚本所在项目的绝对 `target` 路径，与调用时所在目录无关；遇到链接目录会停止，避免误删其他位置的文件。
+
 ## 验证
 
 ```powershell
@@ -43,6 +45,8 @@ try {
 ## 维护约定
 
 UI 渲染线程不执行网络、文件或慢速网卡查询；不要持有共享状态锁跨越 `.await` 或慢速操作。后台状态变更后请求重绘，迟到结果需要校验认证和查询上下文。
+
+监控的 Healthy 收尾与请求结果一样，需要同锁核对认证代次、查询代次和当前状态，再清理重连目标。认证 HTTP 客户端保留正常重定向兼容，但关闭 [reqwest 自动 Referer](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html#method.referer)，避免把原登录 URL 中的凭据派生参数传给重定向目标。更新进入准备重启阶段，与认证及诊断的开始共用 AppState 锁互斥；下载阶段不阻止认证。
 
 账号在线 IP 的实现位于 `src/service/online_sessions/` 及同名模块，独立于校园网认证与重连。使用 [scraper 0.24 的 HTML 解析与选择器](https://docs.rs/scraper/0.24.0/scraper/) 识别服务端表格，并为各账号创建独立的 [reqwest 0.12 内存 Cookie 存储](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html#method.cookie_store)；这也是增加 HTML 解析依赖、启用现有 HTTP 库 Cookie 功能的原因。测试注入合成响应，不访问真实服务或读取运行配置。
 
