@@ -76,13 +76,34 @@ fn any_usable_user_ip(
 /// - Respects `auto_reconnect` config flag and `suppress_auto_reconnect`
 ///   (set on manual logout, cleared on manual login).
 fn evaluate_reconnect(s: &crate::service::AppState, has_usable_ip: bool) -> ReconnectDecision {
+    evaluate_reconnect_owned(s, has_usable_ip, false)
+}
+
+/// The functional test already owns the authentication lock. All normal policy
+/// checks still apply; only that owner's busy flag is ignored.
+pub(crate) fn diagnostic_reconnect_needed(s: &crate::service::AppState, generation: u64) -> bool {
+    s.auth_busy
+        && s.auth_generation == generation
+        && s.diagnostics.running()
+        && s.diagnostics.mode == crate::service::diagnostics::DiagnosticMode::Functional
+        && matches!(
+            evaluate_reconnect_owned(s, true, true),
+            ReconnectDecision::Reconnect
+        )
+}
+
+fn evaluate_reconnect_owned(
+    s: &crate::service::AppState,
+    has_usable_ip: bool,
+    owns_auth: bool,
+) -> ReconnectDecision {
     if !s.config.auto_reconnect {
         return ReconnectDecision::Wait;
     }
     if s.suppress_auto_reconnect {
         return ReconnectDecision::Wait;
     }
-    if s.authentication_busy() || s.online_query_busy {
+    if (s.authentication_busy() && !owns_auth) || s.online_query_busy {
         return ReconnectDecision::Wait;
     }
     if s.campus_ip.is_none() && !has_usable_ip {

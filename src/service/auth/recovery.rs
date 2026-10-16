@@ -120,6 +120,16 @@ where
     };
     crate::service::request_ui_repaint();
 
+    crate::service::diagnostics::auth_event(
+        state,
+        target_idx,
+        match reason {
+            CleanupReason::LoginFailure => crate::service::diagnostics::AuthEvent::RecoveryStart,
+            CleanupReason::AccountSwitch => crate::service::diagnostics::AuthEvent::SwitchCleanup,
+        },
+        None,
+    );
+
     let mut failures = 0;
     for (idx, user) in users.iter().enumerate() {
         let previous = {
@@ -142,6 +152,20 @@ where
         };
         crate::service::request_ui_repaint();
         let result = logout(user.clone(), status_ips[idx].clone()).await;
+        crate::service::diagnostics::auth_event(
+            state,
+            idx,
+            if result.is_ok() {
+                crate::service::diagnostics::AuthEvent::RecoveryLogoutOk
+            } else {
+                crate::service::diagnostics::AuthEvent::RecoveryLogoutFailed
+            },
+            result
+                .as_ref()
+                .err()
+                .map(|error| error.to_string())
+                .as_deref(),
+        );
         {
             let mut s = state.lock().unwrap();
             if !context_matches(&s, generation, &users, server) {
@@ -554,5 +578,40 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("context changed"));
+    }
+
+    #[tokio::test]
+    async fn functional_trace_observes_real_cleanup_order_without_transport_or_payloads() {
+        use crate::service::diagnostics::{DiagnosticMode, FunctionalPhase, RunStatus};
+        let (state, _operation, expected) = fixture();
+        {
+            let mut s = state.lock().unwrap();
+            s.diagnostics.mode = DiagnosticMode::Functional;
+            s.diagnostics.status = RunStatus::Running;
+            s.diagnostics.phase = FunctionalPhase::Testing;
+        }
+        let result = recover_login_after_failure(
+            &state,
+            2,
+            &expected,
+            "http://auth.example.test",
+            "10.0.0.99",
+            |_, _| async { Err(anyhow::anyhow!("err_code=2 PRIVATE-PAYLOAD")) },
+            || async { Ok("10.0.0.99".into()) },
+        )
+        .await;
+        assert!(result.is_ok());
+        let s = state.lock().unwrap();
+        let events: Vec<_> = s.diagnostics.report.lines().collect();
+        assert!(events[0].contains("A3 recovery_all_accounts_begin"));
+        for index in 0..4 {
+            assert!(events[index + 1].contains(&format!(
+                "A{} cleanup_account_failed category=server_rejected err_code=2",
+                index + 1
+            )));
+        }
+        assert!(!s.diagnostics.report.contains("PRIVATE-PAYLOAD"));
+        assert!(!s.diagnostics.report.contains("preview-recovery"));
+        assert!(!s.diagnostics.report.contains("10.0.0."));
     }
 }

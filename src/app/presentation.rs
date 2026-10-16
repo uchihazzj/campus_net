@@ -49,6 +49,19 @@ pub(super) fn connection_status(s: &AppState) -> ConnectionStatus {
     }
 }
 
+pub(super) fn current_campus_ipv4(s: &AppState) -> Option<std::net::Ipv4Addr> {
+    let campus_ipv4 = |value: &str| {
+        value
+            .trim()
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .filter(|ip| ip.octets()[0] == 10)
+    };
+    s.current_online_info()
+        .and_then(|info| campus_ipv4(&info.online_ip))
+        .or_else(|| s.campus_ip.as_deref().and_then(campus_ipv4))
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Tone {
     Positive,
@@ -211,6 +224,41 @@ mod tests {
         assert!(binding_hint(&u, &t).contains("10.0.0.99"));
         u.ip = None;
         assert_eq!(binding_hint(&u, &t), t.ip_auto_detect);
+    }
+
+    #[test]
+    fn summary_ip_prefers_confirmed_session_and_ignores_stale_session() {
+        let mut s = AppState::new(AppConfig::default());
+        s.campus_ip = Some("10.0.0.2".into());
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        s.online_info = Some(OnlineUserInfo {
+            online_ip: "10.0.0.3".into(),
+            ..Default::default()
+        });
+        assert_eq!(current_campus_ipv4(&s).unwrap().to_string(), "10.0.0.3");
+        s.online_info_stale = true;
+        assert_eq!(current_campus_ipv4(&s).unwrap().to_string(), "10.0.0.2");
+        s.online_info_stale = false;
+        s.campus_auth = CampusAuthStatus::NotLoggedIn;
+        assert_eq!(current_campus_ipv4(&s).unwrap().to_string(), "10.0.0.2");
+        s.campus_ip = None;
+        assert_eq!(current_campus_ipv4(&s), None);
+    }
+
+    #[test]
+    fn summary_ip_excludes_proxy_addresses_and_invalid_ipv4() {
+        let mut s = AppState::new(AppConfig::default());
+        s.campus_ip = Some(" 10.0.0.2 ".into());
+        s.campus_auth = CampusAuthStatus::LoggedIn;
+        for value in ["198.18.0.1", "192.168.0.1", "10.0.0.999", "::1", ""] {
+            s.online_info = Some(OnlineUserInfo {
+                online_ip: value.into(),
+                ..Default::default()
+            });
+            assert_eq!(current_campus_ipv4(&s).unwrap().to_string(), "10.0.0.2");
+        }
+        s.campus_ip = Some("198.18.0.1".into());
+        assert_eq!(current_campus_ipv4(&s), None);
     }
 
     #[test]

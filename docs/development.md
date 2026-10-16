@@ -44,6 +44,10 @@ try {
 
 UI 渲染线程不执行网络、文件或慢速网卡查询；不要持有共享状态锁跨越 `.await` 或慢速操作。后台状态变更后请求重绘，迟到结果需要校验认证和查询上下文。
 
+账号在线 IP 的实现位于 `src/service/online_sessions/` 及同名模块，独立于校园网认证与重连。使用 [scraper 0.24 的 HTML 解析与选择器](https://docs.rs/scraper/0.24.0/scraper/) 识别服务端表格，并为各账号创建独立的 [reqwest 0.12 内存 Cookie 存储](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html#method.cookie_store)；这也是增加 HTML 解析依赖、启用现有 HTTP 库 Cookie 功能的原因。测试注入合成响应，不访问真实服务或读取运行配置。
+
+手动诊断位于 `src/service/diagnostics/` 及同名模块，只由设置按钮启动。默认只读模式复用自服务的请求白名单和解析器，不调用认证或恢复函数。显式完整测试由 `functional.rs` 协调，通过 `auth::DiagnosticSession` 整轮占用现有认证操作锁，复用真实登录、登出、恢复和重连判定代码；预检保存可恢复的会话身份，再测试并在退出路径上尝试恢复。网络步骤通过 [Tokio select 的取消语义](https://docs.rs/tokio/1/tokio/macro.select.html#cancellation-safety) 丢弃未完成请求，恢复步骤有独立预算且不响应测试取消，恢复任务自身异常也按恢复失败处理。完整模式认证期间不等待磁盘：先完成恢复尝试并释放认证锁，再后台保存；只读模式逐项保存。每次写入独占临时文件，提交时校验原子运行序号，避免迟到写入覆盖新报告。认证事件只在完整测试内采集受控分类与数字代码，不复制原始错误或运行日志。测试注入合成后端、认证回调及临时报告路径，覆盖取消、超时、上下文变化、任务异常、恢复失败、磁盘等待不阻塞恢复、迟到写入和脱敏，不运行真实网络或认证测试。
+
 配置、日志、缓存、诊断和发布二进制属于运行产物，不提交真实账号或凭据。协议兼容点包括 `get_challenge`、`srun_portal`、`rad_user_info?callback=sdu`，以及学校相关的 `acid`、`n`、`type`、`double_stack` 参数。
 
 ## 发布流程

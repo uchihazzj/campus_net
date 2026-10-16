@@ -97,6 +97,14 @@ impl CampusNetApp {
                     };
 
                     let mut changed = false;
+                    let (mut sessions_enabled, mut sessions_interval) = {
+                        let s = self.state.lock().unwrap();
+                        (
+                            s.config.enable_online_sessions,
+                            s.config.online_sessions_interval_mins,
+                        )
+                    };
+                    let mut sessions_changed = false;
                     ui.label(t.section_app_options);
                     changed |= ui
                         .checkbox(&mut auto_reconnect, t.opt_auto_reconnect)
@@ -121,6 +129,22 @@ impl CampusNetApp {
                                     .suffix(format!(" {}", t.seconds_unit)),
                             )
                             .changed();
+                    });
+                    sessions_changed |= ui
+                        .checkbox(&mut sessions_enabled, t.enable_online_sessions)
+                        .on_hover_text(t.online_sessions_hint)
+                        .changed();
+                    ui.add_enabled_ui(sessions_enabled, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(t.online_sessions_interval);
+                            sessions_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut sessions_interval)
+                                        .range(1..=1440)
+                                        .suffix(format!(" {}", t.minutes_unit)),
+                                )
+                                .changed();
+                        });
                     });
                     ui.horizontal_wrapped(|ui| {
                         ui.label(t.label_language);
@@ -255,8 +279,183 @@ impl CampusNetApp {
                             });
                         }
                     }
+                    if sessions_changed {
+                        {
+                            let mut s = self.state.lock().unwrap();
+                            if s.config.enable_online_sessions != sessions_enabled {
+                                s.online_sessions.fill(Default::default());
+                            }
+                            s.config.enable_online_sessions = sessions_enabled;
+                            s.config.online_sessions_interval_mins =
+                                sessions_interval.clamp(1, 1440);
+                        }
+                        self.save_config();
+                    }
                 });
+                ui.separator();
+                self.render_diagnostics(ui);
             });
+    }
+
+    pub(super) fn render_diagnostics(&mut self, ui: &mut egui::Ui) {
+        use crate::service::diagnostics::{
+            self, DiagnosticMode, FunctionalPhase, RunStatus, SaveStatus,
+        };
+        let t = self.t();
+        let (diagnostic, can_start, accounts) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.diagnostics.clone(),
+                diagnostics::can_start(&s),
+                s.config
+                    .users
+                    .iter()
+                    .map(|user| user.username.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        ui.strong(t.diagnostic_title);
+        let mut mode = diagnostic.mode;
+        let mut selected = diagnostic
+            .selected_account
+            .min(accounts.len().saturating_sub(1));
+        ui.add_enabled_ui(!diagnostic.running(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t.diagnostic_mode);
+                egui::ComboBox::from_id_salt("diagnostic_mode")
+                    .selected_text(if mode == DiagnosticMode::ReadOnly {
+                        t.diagnostic_readonly
+                    } else {
+                        t.diagnostic_functional
+                    })
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut mode,
+                            DiagnosticMode::ReadOnly,
+                            t.diagnostic_readonly,
+                        );
+                        ui.selectable_value(
+                            &mut mode,
+                            DiagnosticMode::Functional,
+                            t.diagnostic_functional,
+                        );
+                    });
+            });
+            if mode == DiagnosticMode::Functional {
+                ui.label(t.diagnostic_account);
+                egui::ComboBox::from_id_salt("diagnostic_test_account")
+                    .selected_text(accounts.get(selected).map(String::as_str).unwrap_or("—"))
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        for (index, username) in accounts.iter().enumerate() {
+                            ui.selectable_value(&mut selected, index, username);
+                        }
+                    });
+            }
+        });
+        if mode != diagnostic.mode || selected != diagnostic.selected_account {
+            let mut s = self.state.lock().unwrap();
+            if !s.diagnostics.running() {
+                s.diagnostics.mode = mode;
+                s.diagnostics.selected_account = selected;
+            }
+        }
+        if mode == DiagnosticMode::ReadOnly {
+            ui.small(t.diagnostic_scope);
+        } else {
+            ui.colored_label(ui.visuals().warn_fg_color, t.diagnostic_full_hint);
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    can_start && (mode == DiagnosticMode::ReadOnly || !accounts.is_empty()),
+                    egui::Button::new(if mode == DiagnosticMode::ReadOnly {
+                        t.diagnostic_start
+                    } else {
+                        t.diagnostic_full_start
+                    }),
+                )
+                .clicked()
+            {
+                diagnostics::start(self.state.clone());
+            }
+            if diagnostic.running()
+                && diagnostic.phase != FunctionalPhase::Restoring
+                && ui
+                    .button(if mode == DiagnosticMode::Functional {
+                        t.diagnostic_cancel_restore
+                    } else {
+                        t.btn_cancel
+                    })
+                    .clicked()
+            {
+                diagnostics::cancel(&self.state);
+            }
+            if !diagnostic.report.is_empty() && ui.button(t.diagnostic_copy).clicked() {
+                // egui's normal clipboard output; no OS process or file I/O here.
+                ui.output_mut(|output| output.copied_text = diagnostic.report.clone());
+            }
+        });
+        match diagnostic.status {
+            RunStatus::Running => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.label(if diagnostic.phase == FunctionalPhase::Restoring {
+                        t.diagnostic_restoring
+                    } else {
+                        t.diagnostic_running
+                    });
+                });
+            }
+            RunStatus::Completed => {
+                ui.label(t.diagnostic_done);
+            }
+            RunStatus::Idle => {}
+            RunStatus::RestoreFailed => {
+                ui.colored_label(ui.visuals().error_fg_color, t.diagnostic_restore_failed);
+            }
+            _ => {
+                ui.label(t.diagnostic_stopped);
+            }
+        }
+        if !can_start && !diagnostic.running() {
+            ui.weak(t.diagnostic_wait);
+        }
+        match diagnostic.save_status {
+            SaveStatus::Pending if diagnostic.running() && mode == DiagnosticMode::Functional => {
+                ui.small(t.diagnostic_full_memory);
+            }
+            SaveStatus::Pending if !diagnostic.running() => {
+                ui.small(t.diagnostic_saving);
+            }
+            SaveStatus::Saved => {
+                ui.small(t.diagnostic_saved);
+                ui.small(crate::path::diagnostic_path().display().to_string());
+            }
+            SaveStatus::Failed => {
+                ui.colored_label(ui.visuals().error_fg_color, t.diagnostic_save_failed);
+            }
+            _ => {}
+        }
+        if !diagnostic.report.is_empty() {
+            egui::CollapsingHeader::new(t.diagnostic_details)
+                .id_salt("diagnostic_report")
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            let mut read_only = diagnostic.report.as_str();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut read_only)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width())
+                                    .desired_rows(5)
+                                    .frame(false),
+                            );
+                        });
+                });
+        }
     }
 }
 

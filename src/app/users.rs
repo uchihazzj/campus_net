@@ -6,7 +6,59 @@ use super::presentation::{
 
 use super::CampusNetApp;
 use crate::core::utils::get_network_interfaces;
+use crate::service::online_sessions::{AccountSessions, QueryError, QueryStatus};
 use crate::service::{auth, LoginState};
+
+fn render_online_ips(
+    ui: &mut egui::Ui,
+    entry: &AccountSessions,
+    enabled: bool,
+    t: &crate::ui::l10n::UiText,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t.online_ips_label)
+            .on_hover_text(t.online_sessions_hint);
+        if !enabled {
+            ui.weak(t.online_ips_disabled);
+            return;
+        }
+        if let Some(ips) = &entry.ips {
+            if ips.is_empty() {
+                ui.weak(t.online_ips_empty);
+            } else {
+                for ip in ips {
+                    ui.monospace(ip.to_string());
+                }
+            }
+            if entry.status != QueryStatus::Ready {
+                ui.weak(t.online_ips_cached);
+            }
+            if !entry.updated_at.is_empty() {
+                ui.small(format!("{} {}", t.online_ips_updated, entry.updated_at));
+            }
+        }
+        match entry.status {
+            QueryStatus::NotLoaded => {
+                ui.weak(t.online_ips_pending);
+            }
+            QueryStatus::Loading => {
+                ui.spinner();
+                ui.small(t.online_ips_loading);
+            }
+            QueryStatus::Ready => {}
+            QueryStatus::Failed(error) => {
+                let text = match error {
+                    QueryError::NotConfigured => t.online_ips_config_error,
+                    QueryError::Credentials | QueryError::Authentication => t.online_ips_auth_error,
+                    QueryError::Network => t.online_ips_network_error,
+                    QueryError::Interrupted => t.online_ips_interrupted,
+                    _ => t.online_ips_data_error,
+                };
+                ui.colored_label(tone_color(ui, Tone::Warning), text);
+            }
+        }
+    });
+}
 
 impl CampusNetApp {
     pub(super) fn refresh_edit_network_cache(&mut self) {
@@ -82,7 +134,16 @@ impl CampusNetApp {
 
     fn render_user_card(&mut self, ui: &mut egui::Ui, user_idx: usize) {
         let t = self.t();
-        let (user, status, auth_busy, confirmed_info, session_known, switching) = {
+        let (
+            user,
+            status,
+            auth_busy,
+            confirmed_info,
+            session_known,
+            switching,
+            sessions,
+            sessions_enabled,
+        ) = {
             let s = self.state.lock().unwrap();
             let (Some(user), Some(status)) =
                 (s.config.users.get(user_idx), s.user_statuses.get(user_idx))
@@ -96,6 +157,8 @@ impl CampusNetApp {
                 s.confirmed_user_info(user_idx).cloned(),
                 s.definitely_offline() || s.current_online_info().is_some(),
                 auth::login_will_switch_account(&s, user_idx),
+                s.online_sessions.get(user_idx).cloned().unwrap_or_default(),
+                s.config.enable_online_sessions,
             )
         };
         let login_hint = if switching {
@@ -188,6 +251,7 @@ impl CampusNetApp {
                     .on_hover_text(hint);
                 ui.small(binding_hint(&user, &t));
             });
+            render_online_ips(ui, &sessions, sessions_enabled, &t);
             if let Some(info) = confirmed_info {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{} {}", t.ip_label, info.online_ip));

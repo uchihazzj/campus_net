@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::core::srun::SrunClient;
 use crate::platform::secure_store;
 use crate::service::config::StoredUser;
+use crate::service::diagnostics::{auth_event, AuthEvent};
 use crate::service::online_info::sync_online_state;
 use crate::service::user_ip;
 use crate::service::{LoginState, SharedState};
@@ -14,6 +15,7 @@ enum AuthMode {
     Login,
     Logout,
     Auto,
+    Diagnostic,
 }
 
 struct AuthOperation {
@@ -43,7 +45,7 @@ impl AuthOperation {
         match mode {
             AuthMode::Login => s.suppress_auto_reconnect = false,
             AuthMode::Logout => s.suppress_auto_reconnect = true,
-            AuthMode::Auto => {}
+            AuthMode::Auto | AuthMode::Diagnostic => {}
         }
         let previous_states = s
             .user_statuses
@@ -54,6 +56,136 @@ impl AuthOperation {
             state: state.clone(),
             previous_states,
         })
+    }
+}
+
+/// One owner for the entire manual test, including restoration. Normal UI,
+/// monitor and status tasks keep using the existing auth_busy/generation gates.
+pub(crate) struct DiagnosticSession {
+    operation: AuthOperation,
+    generation: u64,
+    server: String,
+    users: Vec<StoredUser>,
+    paused: bool,
+    targets: Vec<usize>,
+}
+
+impl DiagnosticSession {
+    pub(crate) fn begin(state: &SharedState) -> Option<Self> {
+        {
+            let s = state.lock().unwrap();
+            if !s.diagnostics.running()
+                || s.diagnostics.mode != crate::service::diagnostics::DiagnosticMode::Functional
+            {
+                return None;
+            }
+        }
+        let operation = AuthOperation::begin(state, AuthMode::Diagnostic, None)?;
+        let s = state.lock().unwrap();
+        Some(Self {
+            operation,
+            generation: s.auth_generation,
+            server: s.config.server.clone(),
+            users: s.config.users.clone(),
+            paused: s.suppress_auto_reconnect,
+            targets: s.reconnect_targets.clone(),
+        })
+    }
+
+    pub(crate) fn current(&self) -> bool {
+        let s = self.operation.state.lock().unwrap();
+        self.context_matches(&s)
+    }
+
+    fn context_matches(&self, s: &crate::service::AppState) -> bool {
+        s.auth_busy
+            && s.auth_generation == self.generation
+            && s.config.server == self.server
+            && s.config.users == self.users
+    }
+
+    pub(crate) async fn login(&self, index: usize, reconnect: bool) -> Result<(), String> {
+        if !self.current() {
+            return Err("context_changed".into());
+        }
+        self.operation.state.lock().unwrap().suppress_auto_reconnect = false;
+        if reconnect {
+            let s = self.operation.state.lock().unwrap();
+            if !crate::service::monitor::diagnostic_reconnect_needed(&s, self.generation) {
+                return Err("reconnect_policy_wait".into());
+            }
+        }
+        // Tests explicitly log out their own session; never use the account-card
+        // shortcut that logs out every configured account on a successful switch.
+        do_login_inner(self.operation.state.clone(), index, false).await;
+        let s = self.operation.state.lock().unwrap();
+        match s.user_statuses.get(index) {
+            Some(status)
+                if matches!(
+                    status.state,
+                    LoginState::Online | LoginState::PendingConfirm
+                ) =>
+            {
+                Ok(())
+            }
+            Some(status) => Err(status.last_error.clone()),
+            None => Err("context_changed".into()),
+        }
+    }
+
+    pub(crate) async fn logout(&self, index: usize) -> Result<(), String> {
+        if !self.current() {
+            return Err("context_changed".into());
+        }
+        do_logout_inner(self.operation.state.clone(), index).await;
+        let s = self.operation.state.lock().unwrap();
+        match s.user_statuses.get(index) {
+            Some(status) if status.state == LoginState::LoggedOut => Ok(()),
+            Some(status) => Err(status.last_error.clone()),
+            None => Err("context_changed".into()),
+        }
+    }
+
+    pub(crate) fn apply_confirmation(&self, info: Option<crate::service::OnlineUserInfo>) -> bool {
+        let mut s = self.operation.state.lock().unwrap();
+        if !self.context_matches(&s) {
+            return false;
+        }
+        if let Some(info) = info {
+            let matched =
+                crate::service::online_info::match_account(&info.user_name, &s.config.users);
+            crate::service::online_info::apply_match_result(
+                &matched,
+                &mut s.user_statuses,
+                &info.user_name,
+                &info.online_ip,
+            );
+            s.auth_server = crate::service::AuthServerStatus::Reachable;
+            s.campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+            s.online_info_stale = false;
+            s.online_info_fail_count = 0;
+            s.online_info = Some(info);
+        } else {
+            crate::service::online_info::apply_server_offline(&mut s);
+        }
+        drop(s);
+        crate::service::request_ui_repaint();
+        true
+    }
+}
+
+impl Drop for DiagnosticSession {
+    fn drop(&mut self) {
+        let mut s = self
+            .operation
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        s.suppress_auto_reconnect = self.paused;
+        if s.diagnostics.status != crate::service::diagnostics::RunStatus::RestoreFailed {
+            s.reconnect_targets = self.targets.clone();
+        }
+        // AuthOperation is dropped next and releases/invalidate the owner.
     }
 }
 
@@ -337,6 +469,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
     }
     crate::service::request_ui_repaint();
 
+    auth_event(&state, user_idx, AuthEvent::LoginStart, None);
     let mut client = SrunClient::new(&server, &username, &password, &ip)
         .set_detect_ip(detect_ip)
         .set_strict_bind(strict_bind)
@@ -357,6 +490,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
 
     match client.login().await {
         Ok(()) => {
+            auth_event(&state, user_idx, AuthEvent::LoginAccepted, None);
             {
                 let mut s = state.lock().unwrap();
                 if login_context_matches(&s, generation, &server, user_idx, &user) {
@@ -384,6 +518,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
         }
         Err(e) => {
             let err = e.to_string();
+            auth_event(&state, user_idx, AuthEvent::LoginFailed, Some(&err));
             {
                 let mut s = state.lock().unwrap();
                 if !login_context_matches(&s, generation, &server, user_idx, &user) {
@@ -418,6 +553,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
                     )
                 },
                 || async {
+                    auth_event(&state, user_idx, AuthEvent::RecoveryRetry, None);
                     let retry_ip = user_ip::resolve_login_ip(&user);
                     let mut retry_client =
                         SrunClient::new(&server, &username, &password, &retry_ip)
@@ -443,6 +579,7 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
             .await;
             match result {
                 Ok(ip) => {
+                    auth_event(&state, user_idx, AuthEvent::RecoverySucceeded, None);
                     let applied = {
                         let mut s = state.lock().unwrap();
                         if login_context_matches(&s, generation, &server, user_idx, &user) {
@@ -462,6 +599,12 @@ async fn do_login_inner(state: SharedState, user_idx: usize, allow_account_switc
                     }
                 }
                 Err(retry_error) => {
+                    auth_event(
+                        &state,
+                        user_idx,
+                        AuthEvent::RecoveryFailed,
+                        Some(&retry_error.to_string()),
+                    );
                     let mut s = state.lock().unwrap();
                     if login_context_matches(&s, generation, &server, user_idx, &user) {
                         let detail =
@@ -520,12 +663,14 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
     }
     crate::service::request_ui_repaint();
 
+    auth_event(&state, user_idx, AuthEvent::LogoutStart, None);
     let mut client = SrunClient::new_for_logout(&server, &username, &ip, acid)
         .set_detect_ip(detect_ip)
         .set_strict_bind(strict_bind);
 
     match client.logout().await {
         Ok(()) => {
+            auth_event(&state, user_idx, AuthEvent::LogoutOk, None);
             {
                 let mut s = state.lock().unwrap();
                 if user_still_matches(&s.config.users, user_idx, &username, &user) {
@@ -558,6 +703,12 @@ async fn do_logout_inner(state: SharedState, user_idx: usize) {
             });
         }
         Err(e) => {
+            auth_event(
+                &state,
+                user_idx,
+                AuthEvent::LogoutFailed,
+                Some(&e.to_string()),
+            );
             let mut s = state.lock().unwrap();
             if user_still_matches(&s.config.users, user_idx, &username, &user) {
                 let err = e.to_string();
@@ -1189,5 +1340,108 @@ mod tests {
             Some((0, &user, generation.wrapping_add(2)))
         )
         .is_some());
+    }
+
+    #[test]
+    fn functional_owner_blocks_other_auth_and_reuses_the_real_reconnect_policy() {
+        use crate::service::diagnostics::{DiagnosticMode, FunctionalPhase, RunStatus};
+        let state = state();
+        assert!(DiagnosticSession::begin(&state).is_none());
+        {
+            let mut s = state.lock().unwrap();
+            s.diagnostics.mode = DiagnosticMode::Functional;
+            s.diagnostics.status = RunStatus::Running;
+            s.diagnostics.phase = FunctionalPhase::Testing;
+            s.suppress_auto_reconnect = true;
+        }
+        let owner = DiagnosticSession::begin(&state).unwrap();
+        assert!(AuthOperation::begin(&state, AuthMode::Login, None).is_none());
+        assert!(AuthOperation::begin(&state, AuthMode::Logout, None).is_none());
+        {
+            let mut s = state.lock().unwrap();
+            s.campus_auth = crate::service::CampusAuthStatus::NotLoggedIn;
+            s.suppress_auto_reconnect = false;
+            assert!(!crate::service::monitor::reconnect_needed(&s, true));
+            assert!(crate::service::monitor::diagnostic_reconnect_needed(
+                &s,
+                owner.generation
+            ));
+            s.config.auto_reconnect = false;
+            assert!(!crate::service::monitor::diagnostic_reconnect_needed(
+                &s,
+                owner.generation
+            ));
+        }
+        drop(owner);
+        assert!(!state.lock().unwrap().auth_busy);
+        assert!(state.lock().unwrap().suppress_auto_reconnect);
+    }
+
+    #[test]
+    fn diagnostic_confirmation_cannot_update_a_changed_auth_context() {
+        use crate::service::diagnostics::{DiagnosticMode, RunStatus};
+        let state = state();
+        {
+            let mut s = state.lock().unwrap();
+            s.diagnostics.mode = DiagnosticMode::Functional;
+            s.diagnostics.status = RunStatus::Running;
+        }
+        let owner = DiagnosticSession::begin(&state).unwrap();
+        state.lock().unwrap().invalidate_auth_context();
+        assert!(!owner.apply_confirmation(None));
+        assert_ne!(
+            state.lock().unwrap().campus_auth,
+            crate::service::CampusAuthStatus::NotLoggedIn
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_login_cannot_take_the_account_switch_cleanup_shortcut() {
+        use crate::service::diagnostics::{DiagnosticMode, FunctionalPhase, RunStatus};
+        let state = state();
+        let user = StoredUser {
+            username: "fixture-A".into(),
+            encrypted_password: "not-valid-base64!".into(),
+            ip: Some("10.0.0.2".into()),
+            if_name: None,
+        };
+        // Even if the admission policy regresses, credentials reject locally,
+        // before any transport or interface enumeration can be reached.
+        assert!(secure_store::decrypt_password(&user.encrypted_password).is_err());
+        {
+            let mut s = state.lock().unwrap();
+            s.config.users = vec![
+                user.clone(),
+                StoredUser {
+                    username: "fixture-B".into(),
+                    ..user
+                },
+            ];
+            s.ensure_statuses();
+            s.user_statuses[1].state = LoginState::Online;
+            s.online_info = Some(crate::service::OnlineUserInfo {
+                user_name: "fixture-B".into(),
+                online_ip: "10.0.0.2".into(),
+                error: "ok".into(),
+                ..Default::default()
+            });
+            s.campus_auth = crate::service::CampusAuthStatus::LoggedIn;
+            s.diagnostics.mode = DiagnosticMode::Functional;
+            s.diagnostics.status = RunStatus::Running;
+            s.diagnostics.phase = FunctionalPhase::Testing;
+        }
+        let owner = DiagnosticSession::begin(&state).unwrap();
+        let error = owner.login(0, false).await.unwrap_err();
+        assert!(error.contains("Another account is already online"));
+        assert_eq!(
+            state.lock().unwrap().user_statuses[1].state,
+            LoginState::Online
+        );
+        assert!(!state
+            .lock()
+            .unwrap()
+            .diagnostics
+            .report
+            .contains("switch_all_accounts_begin"));
     }
 }

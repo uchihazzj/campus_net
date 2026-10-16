@@ -164,6 +164,10 @@ fn status_previews_preserve_authentication_and_fit_small_windows() {
                 };
                 let status = text_rect(&out.shapes, expected).expect("main status must be visible");
                 assert!(
+                    text_rect(&out.shapes, &format!("{} 10.0.0.42", t.campus_ip_label)).is_some(),
+                    "campus IP must be visible in the main status card"
+                );
+                assert!(
                     status.right() <= size[0] && status.bottom() <= size[1],
                     "{status_name}: {status:?}"
                 );
@@ -442,12 +446,270 @@ fn expanded_settings_keep_server_drafts_out_of_live_config() {
     let invalid = text_rect(&out.shapes, t.server_invalid_hint).unwrap();
     assert!(ctx.screen_rect().contains_rect(invalid));
     assert!(text_rect(&out.shapes, t.section_auth_params).is_some());
+    assert!(text_rect(&out.shapes, t.enable_online_sessions).is_some());
+    assert!(text_rect(&out.shapes, t.online_sessions_interval).is_some());
+    assert!(text_rect(&out.shapes, "5 min").is_some());
     assert_eq!(
         serde_json::to_value(&app.state.lock().unwrap().config).unwrap(),
         before
     );
     assert!(!app.state.lock().unwrap().config_save_pending);
     export_preview(&ctx, &out, size, "en_settings_small");
+}
+
+#[test]
+fn account_online_ips_include_other_devices_and_preserve_failed_results() {
+    use crate::service::online_sessions::{QueryError, QueryStatus};
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        let mut app = fixture(lang, LoginState::Online);
+        {
+            let mut s = app.state.lock().unwrap();
+            let mut other = s.config.users[0].clone();
+            other.username = "preview-other-device-account".into();
+            s.config.users.push(other);
+            s.ensure_statuses();
+            s.online_sessions[0].ips = Some(vec![
+                "10.0.0.42".parse().unwrap(),
+                "10.0.0.77".parse().unwrap(),
+            ]);
+            s.online_sessions[0].status = QueryStatus::Ready;
+            s.online_sessions[0].updated_at = "09:30".into();
+            s.online_sessions[1].ips = Some(vec!["10.0.0.88".parse().unwrap()]);
+            s.online_sessions[1].status = QueryStatus::Failed(QueryError::Network);
+            s.online_sessions[1].updated_at = "09:25".into();
+        }
+        let t = app.t();
+        let (_, out) = render(
+            &mut app,
+            [520.0, 900.0],
+            false,
+            &format!("{prefix}_account_online_ips"),
+        );
+        for text in [
+            "10.0.0.77",
+            "10.0.0.88",
+            t.online_ips_cached,
+            t.online_ips_network_error,
+            t.status_offline,
+        ] {
+            assert!(
+                text_rect(&out.shapes, text).is_some(),
+                "account IP display missing: {text}"
+            );
+        }
+        {
+            let mut s = app.state.lock().unwrap();
+            s.online_sessions[0].ips = Some(Vec::new());
+            s.online_sessions[0].status = QueryStatus::Ready;
+            s.online_sessions[1].ips = None;
+            s.online_sessions[1].status = QueryStatus::Loading;
+        }
+        let (_, out) = render(
+            &mut app,
+            [420.0, 900.0],
+            true,
+            &format!("{prefix}_account_ips_empty_loading"),
+        );
+        assert!(text_rect(&out.shapes, t.online_ips_empty).is_some());
+        assert!(text_rect(&out.shapes, t.online_ips_loading).is_some());
+    }
+}
+
+#[test]
+fn diagnostic_report_copies_without_running_network_or_changing_config() {
+    use crate::service::diagnostics::{RunStatus, SaveStatus};
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        let mut app = fixture(lang, LoginState::Online);
+        let report = "CampusNetClient diagnostic schema=1 app=preview\nPASS gateway_bound authenticated account=A1 source_matches=true ms=5\nWARN internet_bound_msft unexpected_response http=200 ms=8\nPASS A1 self_service list_parsed count=2 source_present=true ms=12\nend outcome=completed issues=1 skipped=0 total_ms=25\n";
+        {
+            let mut s = app.state.lock().unwrap();
+            s.diagnostics.status = RunStatus::Completed;
+            s.diagnostics.save_status = SaveStatus::Saved;
+            s.diagnostics.report = report.into();
+        }
+        let before = serde_json::to_value(&app.state.lock().unwrap().config).unwrap();
+        let ctx = context(false);
+        let size = [420.0, 650.0];
+        let t = app.t();
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = FullOutput::default();
+        let mut click = pos2(0.0, 0.0);
+        let mut copied = String::new();
+        for frame in 0..9 {
+            if frame == 2 || frame == 5 {
+                let label = if frame == 2 {
+                    t.diagnostic_details
+                } else {
+                    t.diagnostic_copy
+                };
+                click = text_rect(&out.shapes, label).unwrap().center();
+            }
+            let events = if matches!(frame, 2 | 3 | 5 | 6) {
+                vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2 || frame == 5,
+                        modifiers: Default::default(),
+                    },
+                ]
+            } else {
+                vec![egui::Event::PointerGone]
+            };
+            out = ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(size[0], size[1]))),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.render_diagnostics(ui));
+                },
+            );
+            if !out.platform_output.copied_text.is_empty() {
+                copied = out.platform_output.copied_text.clone();
+            }
+            textures.append(std::mem::take(&mut out.textures_delta));
+        }
+        assert_eq!(copied, report);
+        for label in [
+            t.diagnostic_start,
+            t.diagnostic_copy,
+            t.diagnostic_done,
+            t.diagnostic_details,
+        ] {
+            let rect = text_rect(&out.shapes, label).unwrap();
+            assert!(ctx.screen_rect().contains_rect(rect), "{label}: {rect:?}");
+        }
+        let s = app.state.lock().unwrap();
+        assert_eq!(serde_json::to_value(&s.config).unwrap(), before);
+        assert!(s.diagnostics.status == RunStatus::Completed);
+        assert_eq!(s.auth_generation, 0);
+        assert!(!s.auth_busy && !s.config_save_pending && !s.online_query_busy);
+        drop(s);
+        out.textures_delta = textures;
+        export_preview(&ctx, &out, size, &format!("{prefix}_diagnostic_report"));
+    }
+}
+
+#[test]
+fn diagnostic_running_and_save_failure_controls_fit_a_small_window() {
+    use crate::service::diagnostics::{RunStatus, SaveStatus};
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        for (name, status, save) in [
+            ("running", RunStatus::Running, SaveStatus::Saved),
+            ("save_failed", RunStatus::Cancelled, SaveStatus::Failed),
+        ] {
+            let mut app = fixture(lang, LoginState::Online);
+            {
+                let mut s = app.state.lock().unwrap();
+                s.diagnostics.status = status;
+                s.diagnostics.save_status = save;
+                s.diagnostics.report = "Fixture partial report\n".into();
+            }
+            let ctx = context(false);
+            let size = [420.0, 400.0];
+            let t = app.t();
+            let mut textures = egui::TexturesDelta::default();
+            let mut out = FullOutput::default();
+            for frame in 0..5 {
+                out = ctx.run(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(size[0], size[1]),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.render_diagnostics(ui));
+                    },
+                );
+                textures.append(std::mem::take(&mut out.textures_delta));
+            }
+            let label = if status == RunStatus::Running {
+                t.btn_cancel
+            } else {
+                t.diagnostic_save_failed
+            };
+            assert!(ctx
+                .screen_rect()
+                .contains_rect(text_rect(&out.shapes, label).unwrap()));
+            assert!(ctx
+                .screen_rect()
+                .contains_rect(text_rect(&out.shapes, t.diagnostic_copy).unwrap()));
+            out.textures_delta = textures;
+            export_preview(&ctx, &out, size, &format!("{prefix}_diagnostic_{name}"));
+        }
+    }
+}
+
+#[test]
+fn functional_test_warning_account_and_restore_status_are_visible_without_starting_auth() {
+    use crate::service::diagnostics::{DiagnosticMode, FunctionalPhase, RunStatus};
+    for (lang, prefix) in [(Lang::Chinese, "zh"), (Lang::English, "en")] {
+        for restoring in [false, true] {
+            let mut app = fixture(lang, LoginState::Online);
+            {
+                let mut s = app.state.lock().unwrap();
+                s.diagnostics.mode = DiagnosticMode::Functional;
+                if restoring {
+                    s.diagnostics.status = RunStatus::Running;
+                    s.diagnostics.phase = FunctionalPhase::Restoring;
+                }
+            }
+            let ctx = context(false);
+            let size = [420.0, 650.0];
+            let t = app.t();
+            let mut textures = egui::TexturesDelta::default();
+            let mut out = FullOutput::default();
+            for frame in 0..5 {
+                out = ctx.run(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            pos2(0.0, 0.0),
+                            vec2(size[0], size[1]),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.render_diagnostics(ui));
+                    },
+                );
+                textures.append(std::mem::take(&mut out.textures_delta));
+            }
+            for label in [
+                t.diagnostic_account,
+                t.diagnostic_full_hint,
+                t.diagnostic_full_start,
+            ] {
+                assert!(
+                    ctx.screen_rect()
+                        .contains_rect(text_rect(&out.shapes, label).unwrap()),
+                    "{label}"
+                );
+            }
+            if restoring {
+                assert!(text_rect(&out.shapes, t.diagnostic_restoring).is_some());
+                assert!(text_rect(&out.shapes, t.diagnostic_cancel_restore).is_none());
+            }
+            assert!(!app.state.lock().unwrap().auth_busy);
+            out.textures_delta = textures;
+            export_preview(
+                &ctx,
+                &out,
+                size,
+                &format!(
+                    "{prefix}_functional_{}",
+                    if restoring { "restoring" } else { "ready" }
+                ),
+            );
+        }
+    }
 }
 
 /// Optional export for offline rasterization of actual egui triangles and atlas.

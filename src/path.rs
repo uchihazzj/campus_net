@@ -15,6 +15,11 @@ pub fn log_path() -> PathBuf {
     app_data_dir().join("app.log")
 }
 
+/// One compact, manually requested report; independent of CWD and the exe path.
+pub fn diagnostic_path() -> PathBuf {
+    app_data_dir().join("diagnostic-latest.txt")
+}
+
 /// Returns the directory containing the current executable, if available.
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()

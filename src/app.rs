@@ -19,7 +19,9 @@ pub(crate) mod window;
 
 pub use icon::create_window_icon;
 pub(crate) use presentation::configure_style;
-use presentation::{card_frame, connection_status, tone_color, ConnectionStatus, Tone};
+use presentation::{
+    card_frame, connection_status, current_campus_ipv4, tone_color, ConnectionStatus, Tone,
+};
 pub(crate) use tray::FORCE_QUIT;
 
 pub struct CampusNetApp {
@@ -107,6 +109,7 @@ impl CampusNetApp {
             status,
             campus_ip,
             account,
+            current_ip,
             server,
             auth_server,
             internet,
@@ -120,6 +123,7 @@ impl CampusNetApp {
                 connection_status(&s),
                 s.campus_ip.clone(),
                 s.current_online_info().map(|info| info.user_name.clone()),
+                current_campus_ipv4(&s),
                 s.config.server.clone(),
                 s.auth_server.clone(),
                 s.ipv4_internet.clone(),
@@ -199,6 +203,14 @@ impl CampusNetApp {
                 )
                 .on_hover_text(account);
             }
+            ui.label(format!(
+                "{} {}",
+                t.campus_ip_label,
+                current_ip
+                    .map(|ip| ip.to_string())
+                    .as_deref()
+                    .unwrap_or(t.campus_ipv4_none)
+            ));
             ui.small(reconnect);
             if matches!(
                 status,

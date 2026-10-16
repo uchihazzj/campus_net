@@ -451,7 +451,7 @@ pub(crate) fn status_query_ip_from_interfaces(
 }
 
 /// Preserve the active account before the authoritative offline result demotes it.
-fn apply_server_offline(s: &mut crate::service::AppState) {
+pub(super) fn apply_server_offline(s: &mut crate::service::AppState) {
     let active: Vec<usize> = s
         .user_statuses
         .iter()
@@ -942,6 +942,7 @@ pub fn spawn_startup_tasks(state: SharedState) {
         // ──
 
         // ── Phase 5: Start periodic monitor ────────────
+        crate::service::online_sessions::spawn_scheduler(state.clone());
         crate::service::monitor::spawn_monitor(state);
     });
 }

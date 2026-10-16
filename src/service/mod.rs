@@ -25,9 +25,11 @@ pub fn request_ui_repaint() {
 pub mod auth;
 pub mod config;
 pub mod detection;
+pub mod diagnostics;
 pub mod http_client;
 pub mod monitor;
 pub mod online_info;
+pub mod online_sessions;
 pub mod update;
 pub mod update_scheduler;
 pub mod user_ip;
@@ -124,6 +126,9 @@ pub struct AppState {
     /// True when rad_user_info query has failed at least once since last success.
     /// The last online_info is preserved but may not reflect current server state.
     pub online_info_stale: bool,
+    pub online_sessions: Vec<online_sessions::AccountSessions>,
+    pub online_sessions_sequence: u64,
+    pub diagnostics: diagnostics::DiagnosticState,
     /// True after user manually logs out. Suppresses auto-reconnect until user
     /// manually logs in. Not persisted to config — runtime-only.
     pub suppress_auto_reconnect: bool,
@@ -159,6 +164,9 @@ impl AppState {
             online_info: None,
             online_info_fail_count: 0,
             online_info_stale: false,
+            online_sessions: vec![online_sessions::AccountSessions::default(); user_count],
+            online_sessions_sequence: 0,
+            diagnostics: diagnostics::DiagnosticState::default(),
             suppress_auto_reconnect: false,
             auth_busy: false,
             auth_generation: 0,
@@ -182,6 +190,8 @@ impl AppState {
         while self.user_statuses.len() < self.config.users.len() {
             self.user_statuses.push(UserStatus::new());
         }
+        self.online_sessions
+            .resize_with(self.config.users.len(), Default::default);
     }
 
     pub fn authentication_busy(&self) -> bool {
@@ -208,6 +218,7 @@ impl AppState {
         self.config.server = server;
         self.invalidate_auth_context();
         if !same_endpoint {
+            self.online_sessions.fill(Default::default());
             self.user_statuses = vec![UserStatus::new(); self.config.users.len()];
             self.invalidate_online_info();
             self.auth_server = AuthServerStatus::Unknown;
@@ -280,6 +291,7 @@ impl AppState {
         self.config.users[idx] = user;
         self.ensure_statuses();
         self.user_statuses[idx] = UserStatus::new();
+        self.online_sessions[idx] = Default::default();
         self.reconnect_targets.retain(|&i| i != idx);
         self.invalidate_auth_context();
     }
@@ -292,6 +304,9 @@ impl AppState {
         self.invalidate_user_online_info(idx);
         self.config.users.remove(idx);
         self.user_statuses.remove(idx);
+        self.online_sessions.remove(idx);
+        // A removal shifts indices, including any in-flight self-service query.
+        self.online_sessions.fill(Default::default());
         self.reconnect_targets.retain(|&i| i != idx);
         for target in &mut self.reconnect_targets {
             if *target > idx {
