@@ -396,7 +396,11 @@ fn main() -> anyhow::Result<()> {
     // Build window icon
     let icon_data = app::create_window_icon();
 
+    let window_state = state.clone();
     let native_options = eframe::NativeOptions {
+        event_loop_builder: Some(Box::new(move |builder| {
+            app::install_window_restore_hook(builder, window_state);
+        })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([window_w, window_h])
             .with_min_inner_size(app::window::MIN_SIZE)
@@ -411,6 +415,7 @@ fn main() -> anyhow::Result<()> {
         "Campus Net Client",
         native_options,
         Box::new(move |cc| {
+            app::capture_main_hwnd(cc);
             app::configure_style(&cc.egui_ctx);
             if let Some(font_data) = load_cjk_font() {
                 let mut fonts = egui::FontDefinitions::default();

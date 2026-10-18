@@ -22,6 +22,8 @@ pub(crate) use presentation::configure_style;
 use presentation::{
     card_frame, connection_status, current_campus_ipv4, tone_color, ConnectionStatus, Tone,
 };
+pub(crate) use tray::capture_main_hwnd;
+pub(crate) use tray::install_window_restore_hook;
 pub(crate) use tray::FORCE_QUIT;
 
 pub struct CampusNetApp {
@@ -306,8 +308,8 @@ impl CampusNetApp {
 }
 
 impl eframe::App for CampusNetApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        tray::capture_main_hwnd();
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        tray::capture_main_hwnd(frame);
         crate::service::set_egui_ctx(ctx.clone());
         self.poll_edit_network_cache();
 
@@ -334,15 +336,20 @@ impl eframe::App for CampusNetApp {
         // cannot append a hide command after a request to show the window.
         let hide_on_close =
             self.state.lock().unwrap().config.minimize_to_tray && self._tray_icon.is_some();
+        let restore_size = {
+            let s = self.state.lock().unwrap();
+            window::startup_size(s.config.window_width, s.config.window_height)
+        };
         match window::apply_visibility(
             ctx,
             tray::take_show_request(),
             hide_on_close,
             FORCE_QUIT.load(Ordering::SeqCst),
+            restore_size,
         ) {
             window::WindowAction::Show => {
                 self.window_hidden = false;
-                tray::show_window();
+                tray::show_window(restore_size);
             }
             window::WindowAction::Hide => {
                 self.window_hidden = true;

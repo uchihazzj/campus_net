@@ -46,6 +46,10 @@ try {
 
 UI 渲染线程不执行网络、文件或慢速网卡查询；不要持有共享状态锁跨越 `.await` 或慢速操作。后台状态变更后请求重绘，迟到结果需要校验认证和查询上下文。
 
+托盘显示请求通过私有 Windows 消息交给 UI 线程，在绘制前校验实际客户区尺寸，避免窗口客户区为零时只依赖重绘。主窗口句柄直接从 eframe 获取，不按标题枚举桌面窗口。为安装消息钩子，Windows 目标显式引用 eframe 已使用的同一版本 winit，不增加新的依赖包或版本。消息钩子读取配置使用 `try_lock`，竞争或锁异常时使用默认尺寸，并通过原生失效区域请求重绘。
+
+尺寸修复使用窗口自己的 DPI，并通过 [AdjustWindowRectExForDpi](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-adjustwindowrectexfordpi) 计算包含边框的大小；只在实际最小化时调用 `SW_RESTORE`，防止普通显示操作取消最大化。最大化时单独校验 `WINDOWPLACEMENT` 的普通恢复尺寸，修复异常值时保留位置、可见性和最大化状态。egui 显示命令同时保留退出优先、显示优先于旧关闭事件的规则。离线测试覆盖零尺寸、缩放和窗口状态，并创建始终隐藏的临时 Win32 窗口验证普通及最大化时的恢复尺寸，不枚举或操作正在运行的客户端。
+
 监控的 Healthy 收尾与请求结果一样，需要同锁核对认证代次、查询代次和当前状态，再清理重连目标。认证 HTTP 客户端保留正常重定向兼容，但关闭 [reqwest 自动 Referer](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html#method.referer)，避免把原登录 URL 中的凭据派生参数传给重定向目标。更新进入准备重启阶段，与认证及诊断的开始共用 AppState 锁互斥；下载阶段不阻止认证。
 
 账号在线 IP 的实现位于 `src/service/online_sessions/` 及同名模块，独立于校园网认证与重连。使用 [scraper 0.24 的 HTML 解析与选择器](https://docs.rs/scraper/0.24.0/scraper/) 识别服务端表格，并为各账号创建独立的 [reqwest 0.12 内存 Cookie 存储](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html#method.cookie_store)；这也是增加 HTML 解析依赖、启用现有 HTTP 库 Cookie 功能的原因。测试注入合成响应，不访问真实服务或读取运行配置。

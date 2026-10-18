@@ -15,6 +15,7 @@ pub(super) fn apply_visibility(
     show_requested: bool,
     hide_on_close: bool,
     force_quit: bool,
+    restore_size: [f32; 2],
 ) -> WindowAction {
     if force_quit {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -27,6 +28,21 @@ pub(super) fn apply_visibility(
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         if ctx.input(|i| i.viewport().minimized == Some(true)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
+        let collapsed = ctx.input(|i| {
+            let viewport = i.viewport();
+            viewport.minimized != Some(true)
+                && viewport.maximized != Some(true)
+                && viewport.fullscreen != Some(true)
+                && viewport
+                    .inner_rect
+                    .is_some_and(|rect| !valid_size([rect.width(), rect.height()]))
+        });
+        if collapsed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_SIZE.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                startup_size(Some(restore_size[0]), Some(restore_size[1])).into(),
+            ));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         return WindowAction::Show;
@@ -58,6 +74,28 @@ pub(crate) fn startup_size(width: Option<f32>, height: Option<f32>) -> [f32; 2] 
     } else {
         DEFAULT_SIZE
     }
+}
+
+/// Native recovery uses the window's DPI, not a stale egui viewport snapshot.
+/// None means keep a healthy client size, or the HWND/DPI could not be read.
+pub(super) fn native_recovery_size(
+    client_size: [i32; 2],
+    dpi: u32,
+    restore_size: [f32; 2],
+) -> Option<[i32; 2]> {
+    if dpi == 0 {
+        return None;
+    }
+    let scale = dpi as f32 / 96.0;
+    if valid_size([client_size[0] as f32 / scale, client_size[1] as f32 / scale]) {
+        return None;
+    }
+    let size = startup_size(Some(restore_size[0]), Some(restore_size[1]));
+    let pixels = size.map(|side| (side * scale).round());
+    pixels
+        .iter()
+        .all(|side| *side >= 1.0 && *side < i32::MAX as f32)
+        .then(|| pixels.map(|side| side as i32))
 }
 
 /// Keep only usable normal-window geometry. Hidden, minimized and maximized
@@ -97,7 +135,7 @@ mod tests {
             viewport.events.push(egui::ViewportEvent::Close);
         }
         ctx.run(input, |ctx| {
-            apply_visibility(ctx, true, true, force_quit);
+            apply_visibility(ctx, true, true, force_quit, DEFAULT_SIZE);
         })
     }
 
@@ -140,6 +178,79 @@ mod tests {
         assert!(!commands
             .iter()
             .any(|cmd| matches!(cmd, egui::ViewportCommand::CancelClose)));
+    }
+
+    #[test]
+    fn show_repairs_a_collapsed_running_window_with_the_last_normal_size() {
+        for size in [[0.0, 0.0], [2.4, 2.4], [100.0, 5.0]] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            viewport.inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into()));
+            viewport.minimized = Some(false);
+            viewport.maximized = Some(false);
+            let output = ctx.run(input, |ctx| {
+                apply_visibility(ctx, true, true, false, [800.0, 600.0]);
+            });
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.iter().any(|cmd|
+                matches!(cmd, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(800.0, 600.0))
+            ), "collapsed client {size:?} must get a usable size");
+        }
+    }
+
+    #[test]
+    fn show_preserves_normal_maximized_fullscreen_and_minimized_geometry() {
+        for (size, minimized, maximized, fullscreen) in [
+            (Some([800.0, 600.0]), false, false, false),
+            (Some([2.4, 2.4]), false, true, false),
+            (Some([2.4, 2.4]), false, false, true),
+            (None, true, false, false),
+            (None, false, false, false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            viewport.inner_rect =
+                size.map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size.into()));
+            viewport.minimized = Some(minimized);
+            viewport.maximized = Some(maximized);
+            viewport.fullscreen = Some(fullscreen);
+            let output = ctx.run(input, |ctx| {
+                apply_visibility(ctx, true, true, false, DEFAULT_SIZE);
+            });
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(
+                    cmd,
+                    egui::ViewportCommand::InnerSize(_) | egui::ViewportCommand::MinInnerSize(_)
+                )));
+        }
+    }
+
+    #[test]
+    fn native_recovery_scales_saved_or_default_size_to_window_dpi() {
+        assert_eq!(
+            native_recovery_size([0, 0], 120, [800.0, 600.0]),
+            Some([1000, 750])
+        );
+        assert_eq!(
+            native_recovery_size([3, 3], 120, [2.4, f32::NAN]),
+            Some([650, 438])
+        );
+        assert_eq!(native_recovery_size([0, 0], 0, DEFAULT_SIZE), None);
+    }
+
+    #[test]
+    fn native_recovery_preserves_healthy_sizes_at_each_dpi() {
+        for dpi in [96, 120, 144, 192] {
+            let scale = dpi as f32 / 96.0;
+            for size in [MIN_SIZE, DEFAULT_SIZE, [800.0, 600.0]] {
+                let pixels = size.map(|side| (side * scale).round() as i32);
+                assert_eq!(native_recovery_size(pixels, dpi, DEFAULT_SIZE), None);
+            }
+        }
     }
 
     #[test]
